@@ -24,7 +24,6 @@ public:
     asio::awaitable<udp::endpoint> send_binding_request() {
         // Create STUN Binding Request
         std::vector<uint8_t> transaction_id(12, 0x00);
-        asio::steady_timer timer(co_await asio::this_coro::executor);
         std::generate(transaction_id.begin(), transaction_id.end(), []() { return rand() % 256; });
 
         StunMessage request(STUN_BINDING_REQUEST, transaction_id);
@@ -57,6 +56,7 @@ public:
         udp::endpoint sender_endpoint;
 
         // Set a timeout
+        asio::steady_timer timer(co_await asio::this_coro::executor);
         timer.expires_after(std::chrono::seconds(2));
 
         // Await either receive or timeout

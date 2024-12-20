@@ -78,16 +78,20 @@ void IceAgent::set_signaling_client(std::shared_ptr<SignalingClient> signaling_c
 void IceAgent::log(LogLevel level, const std::string& message) {
     if (level >= log_level_) {
         switch (level) {
+            case LogLevel::DEBUG:
+                std::cout << "[DEBUG] ";
+                break;
             case LogLevel::INFO:
-                std::cout << "[INFO] " << message << std::endl;
+                std::cout << "[INFO] ";
                 break;
             case LogLevel::WARNING:
-                std::cout << "[WARNING] " << message << std::endl;
+                std::cout << "[WARNING] ";
                 break;
             case LogLevel::ERROR:
-                std::cerr << "[ERROR] " << message << std::endl;
+                std::cout << "[ERROR] ";
                 break;
         }
+        std::cout << message << std::endl;
     }
 }
 
@@ -181,6 +185,13 @@ void IceAgent::send_data(const std::vector<uint8_t>& data) {
 // Add remote candidate received via signaling
 void IceAgent::add_remote_candidate(const Candidate& candidate) {
     remote_candidates_.push_back(candidate);
+	 log(LogLevel::INFO, "Added remote candidate: " + candidate.type + " - " +
+     candidate.endpoint.address().to_string() + ":" + std::to_string(candidate.endpoint.port()));
+
+    // Notify via callback
+    if (on_candidate_) {
+        on_candidate_(candidate);
+    }
     for (const auto& local : local_candidates_) {
         CandidatePair pair(io_context_);
         pair.local_candidate = local;
@@ -220,35 +231,15 @@ void IceAgent::sort_candidate_pairs() {
 
 // Transition ICE state
 bool IceAgent::transition_to_state(IceConnectionState new_state) {
-        switch (current_state_) {
-            case IceConnectionState::New:
-                if (new_state != IceConnectionState::Gathering) return false;
-                break;
-            case IceConnectionState::Gathering:
-                if (new_state != IceConnectionState::Checking && new_state != IceConnectionState::Failed) return false;
-                break;
-            case IceConnectionState::Checking:
-                if (new_state != IceConnectionState::Connected && new_state != IceConnectionState::Failed) return false;
-                break;
-            case IceConnectionState::Connected:
-                if (new_state != IceConnectionState::Disconnected) return false;
-                break;
-            case IceConnectionState::Disconnected:
-                return false; // 이미 Disconnected 상태에서는 다른 상태로 전환 불가
-            case IceConnectionState::Failed:
-                if (new_state != IceConnectionState::Disconnected) return false;
-                break;
-            case IceConnectionState::Reconnecting:
-                if (new_state != IceConnectionState::Connected && new_state != IceConnectionState::Failed) return false;
-                break;
-        }
-
+    if (current_state_ != new_state) {
         current_state_ = new_state;
-        if (state_callback_) {
-            state_callback_(current_state_);
+        if (on_state_change_) {
+            on_state_change_(new_state);
         }
-        std::cout << "[IceAgent] State updated to: " << state_to_string(current_state_) << std::endl;
+        log(LogLevel::INFO, "ICE state transitioned to " + std::to_string(static_cast<int>(new_state)));
         return true;
+    }
+    return false;
 }
 
 // NAT Type Inference Logic
@@ -417,7 +408,7 @@ awaitable<void> IceAgent::perform_turn_refresh() {
 // Start Keep-Alive messages
 awaitable<void> IceAgent::perform_keep_alive() {
     while (current_state_ == IceConnectionState::Connected) {
-        // Set the timer for the keep-alive interval, e.g., 30 seconds
+        // Keep-Alive interval (e.g., 30 seconds)
         keep_alive_timer_.expires_after(std::chrono::seconds(30));
         co_await keep_alive_timer_.async_wait(asio::use_awaitable);
 
@@ -771,17 +762,29 @@ awaitable<void> IceAgent::perform_connectivity_checks() {
 	}
 
     // After all checks
-    bool any_succeeded = false;
+    bool any_connected = false;
     for (const auto& pair : candidate_pairs_) {
-        if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
-            any_succeeded = true;
+        if (pair.local_candidate.type.empty() || pair.remote_candidate.type.empty()) {
+            continue;
+        }
+        if (pair.local_candidate.type == "host" && pair.remote_candidate.type == "host") {
+            any_connected = true;
+            break;
+        }
+        if (pair.local_candidate.type == "srflx" && pair.remote_candidate.type == "srflx") {
+            any_connected = true;
+            break;
+        }
+        if (pair.local_candidate.type == "relay" && pair.remote_candidate.type == "relay") {
+            any_connected = true;
             break;
         }
     }
-	
-    if (any_succeeded) {
+
+    if (any_connected) {
         transition_to_state(IceConnectionState::Connected);
-    } else {
+    }
+    else {
         log(LogLevel::ERROR, "No valid candidate pairs found after connectivity checks.");
         transition_to_state(IceConnectionState::Failed);
     }

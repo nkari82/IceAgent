@@ -4,34 +4,19 @@
 #define TURN_UTILS_HPP
 
 #include "turn_message.hpp"
+#include "crypt.hpp"
 #include "stun_utils.hpp"
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <cstring>
+#include <asio.hpp>
 #include <stdexcept>
+#include <vector>
 
 namespace TurnUtils {
 
-// Calculate HMAC-SHA1 for MESSAGE-INTEGRITY (same as StunUtils)
-std::vector<uint8_t> calculate_message_integrity(const TurnMessage& msg, const std::string& key) {
+// Calculate HMAC-SHA1 for MESSAGE-INTEGRITY
+std::vector<uint8_t> calculate_message_integrity(const Turn::TurnMessage& msg, const std::string& key) {
     std::vector<uint8_t> serialized = msg.serialize();
-    // Append key
-    std::vector<uint8_t> data(serialized.begin(), serialized.end());
-    data.insert(data.end(), key.begin(), key.end());
-
-    unsigned char* result;
-    unsigned int len = SHA_DIGEST_LENGTH;
-    std::vector<uint8_t> hmac_result(SHA_DIGEST_LENGTH);
-
-    HMAC_CTX* ctx = HMAC_CTX_new();
-    if (!ctx) throw std::runtime_error("Failed to create HMAC_CTX.");
-
-    HMAC_Init_ex(ctx, key.data(), key.size(), EVP_sha1(), NULL);
-    HMAC_Update(ctx, serialized.data(), serialized.size());
-    HMAC_Final(ctx, hmac_result.data(), &len);
-    HMAC_CTX_free(ctx);
-
-    return hmac_result;
+    // Calculate HMAC-SHA1 over the serialized message
+    return Crypt::hmac_sha1(key, serialized);
 }
 
 // Construct XOR-RELAYED-ADDRESS attribute

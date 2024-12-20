@@ -39,7 +39,12 @@ add_executable(ice_agent
 )
 
 # Link Asio and OpenSSL
-target_link_libraries(ice_agent PRIVATE Asio::asio OpenSSL::SSL OpenSSL::Crypto)
+if(OPENSSL_FOUND)
+    target_include_directories(ice_agent PRIVATE ${OPENSSL_INCLUDE_DIR})
+    target_link_libraries(ice_agent PRIVATE Asio::asio  OpenSSL::SSL OpenSSL::Crypto)
+else
+	target_link_libraries(ice_agent PRIVATE Asio::asio)
+endif()
 
 # Add nlohmann/json as a header-only library
 target_include_directories(ice_agent PRIVATE external/nlohmann/include)

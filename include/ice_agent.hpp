@@ -65,7 +65,7 @@ enum class NatType {
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
     uint64_t priority;
-    std::string type;
+    std::string type; // "host", "srflx", "relay"
     std::string foundation;
     int component_id;
     std::string transport;
