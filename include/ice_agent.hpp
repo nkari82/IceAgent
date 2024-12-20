@@ -123,7 +123,7 @@ public:
     void log(LogLevel level, const std::string& message);
 
     // NAT Type Detection
-    awaitable<void> detect_nat_type();
+    awaitable<NatType> detect_nat_type();
 	
     awaitable<void> start();
     void send_data(const std::vector<uint8_t>& data);
@@ -151,7 +151,6 @@ private:
     DataCallback data_callback_;
 	NatTypeCallback on_nat_type_detected_;
     LogLevel log_level_;
-	NatType detected_nat_type_ = NatType::Unknown; // Store detected NAT type
     std::shared_ptr<SignalingClient> signaling_client_;
 	std::vector<std::shared_ptr<StunClient>> stun_clients_;
 	
@@ -191,12 +190,6 @@ private:
 
     // TURN Allocate Response 파싱
     Candidate parse_turn_allocate_response(const std::vector<uint8_t>& response, size_t length) const;
-
-    // STUN Binding Request 생성
-    std::vector<uint8_t> create_stun_binding_request(const CandidatePair& pair) const;
-
-    // STUN Binding Response 파싱
-    asio::ip::udp::endpoint parse_stun_binding_response(const std::vector<uint8_t>& response, size_t length) const;
 
     // NAT 우회 전략 적용
     awaitable<void> apply_nat_traversal_strategy(NatType nat_type);

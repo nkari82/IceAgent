@@ -75,13 +75,19 @@ awaitable<void> IceAgent::start() {
     }
 
     try {
-		co_await detect_nat_type();
+		// Step 1: Detect NAT Type
+        NatType nat_type = co_await detect_nat_type();
+
+        // Notify via callback
+        if (on_nat_type_detected_) {
+            on_nat_type_detected_(nat_type);
+        }
 		
         co_await gather_candidates();
 
         // NAT 탐지 및 우회 전략 적용
         log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(detected_nat_type_));
-        co_await apply_nat_traversal_strategy(detected_nat_type_);
+        co_await apply_nat_traversal_strategy(nat_type);
 
         if (!transition_to_state(IceConnectionState::Checking)) {
             co_return;
@@ -263,7 +269,7 @@ awaitable<void> IceAgent::gather_host_candidates() {
     asio::ip::udp::endpoint stun_endpoint = *results.begin();
 
     // Send STUN Binding Request and await response
-    Endpoint mapped_endpoint;
+    asio::ip::udp::endpoint mapped_endpoint;
     try {
         co_await stun_client_->send_binding_request(stun_endpoint, mapped_endpoint);
 		    
@@ -366,176 +372,31 @@ Candidate IceAgent::parse_turn_allocate_response(const std::vector<uint8_t>& res
     return relay_candidate;
 }
 
-// Create STUN Binding Request
-std::vector<uint8_t> IceAgent::create_stun_binding_request(const CandidatePair& pair) const {
-    std::vector<uint8_t> request(20, 0);
-    // Message Type: Binding Request (0x0001)
-    request[0] = 0x00;
-    request[1] = 0x01;
-
-    // Message Length: 0 (no attributes)
-    request[2] = 0x00;
-    request[3] = 0x00;
-
-    // Magic Cookie: 0x2112A442
-    request[4] = 0x21;
-    request[5] = 0x12;
-    request[6] = 0xA4;
-    request[7] = 0x42;
-
-    // Transaction ID: 12 bytes 랜덤값
-    for (int i = 8; i < 20; ++i) {
-        request[i] = static_cast<uint8_t>(rand() % 256);
-    }
-
-    return request;
-}
-
-struct StunAttribute {
-    uint16_t type;
-    uint16_t length;
-    std::vector<uint8_t> value;
-};
-
-std::vector<StunAttribute> parse_stun_attributes(const std::vector<uint8_t>& response, size_t length) const {
-    std::vector<StunAttribute> attributes;
-    size_t offset = 20; // 헤더 이후부터 시작
-
-    while (offset + 4 <= length) {
-        StunAttribute attr;
-        attr.type = (response[offset] << 8) | response[offset + 1];
-        attr.length = (response[offset + 2] << 8) | response[offset + 3];
-        offset += 4;
-
-        if (offset + attr.length > length) {
-            throw std::runtime_error("STUN attribute length mismatch");
-        }
-
-        attr.value.insert(attr.value.end(), response.begin() + offset, response.begin() + offset + attr.length);
-        attributes.push_back(attr);
-        offset += attr.length;
-
-        // Attribute padding: STUN attributes are padded to 4-byte boundaries
-        if (attr.length % 4 != 0) {
-            offset += (4 - (attr.length % 4));
-        }
-    }
-
-    return attributes;
-}
-// Parse STUN Binding Response
-asio::ip::udp::endpoint IceAgent::parse_stun_binding_response(const std::vector<uint8_t>& response, size_t length) const {
-    // STUN 메시지 파싱 (RFC 5389)
-    if (length < 20) {
-        throw std::runtime_error("STUN response too short");
-    }
-
-    // Check message type
-    uint16_t message_type = (response[0] << 8) | response[1];
-    if (message_type != 0x0101) { // Binding Success Response
-        throw std::runtime_error("Invalid STUN message type");
-    }
-
-    // Check magic cookie
-    uint32_t magic_cookie = (response[4] << 24) | (response[5] << 16) | (response[6] << 8) | response[7];
-    if (magic_cookie != 0x2112A442) {
-        throw std::runtime_error("Invalid magic cookie");
-    }
-
-    // Parse attributes
-    std::vector<StunAttribute> attributes = parse_stun_attributes(response, length);
-
-    asio::ip::udp::endpoint mapped_endpoint(asio::ip::address_v4::any(), 0);
-
-    for (const auto& attr : attributes) {
-        if (attr.type == 0x0001) { // MAPPED-ADDRESS
-            if (attr.length >= 8) {
-                uint8_t family = attr.value[1];
-                uint16_t port = (attr.value[2] << 8) | attr.value[3];
-                std::string ip = std::to_string(attr.value[4]) + "." +
-                                 std::to_string(attr.value[5]) + "." +
-                                 std::to_string(attr.value[6]) + "." +
-                                 std::to_string(attr.value[7]);
-                mapped_endpoint = asio::ip::udp::endpoint(asio::ip::address::from_string(ip), port);
-                break;
-            }
-        } else if (attr.type == 0x0020) { // XOR-MAPPED-ADDRESS
-            if (attr.length >= 8) {
-                uint8_t family = attr.value[1];
-                uint16_t xport = (attr.value[2] << 8) | attr.value[3];
-                uint32_t xaddr = (attr.value[4] << 24) | (attr.value[5] << 16) |
-                                 (attr.value[6] << 8) | attr.value[7];
-                uint32_t magic_cookie = 0x2112A442;
-                uint16_t port = xport ^ ((magic_cookie >> 16) & 0xFFFF);
-                uint32_t addr = xaddr ^ magic_cookie;
-                asio::ip::address_v4::bytes_type addr_bytes;
-                addr_bytes[0] = (addr >> 24) & 0xFF;
-                addr_bytes[1] = (addr >> 16) & 0xFF;
-                addr_bytes[2] = (addr >> 8) & 0xFF;
-                addr_bytes[3] = addr & 0xFF;
-                asio::ip::address_v4 ip_addr(addr_bytes);
-                mapped_endpoint = asio::ip::udp::endpoint(ip_addr, port);
-                break;
-            }
-        }
-        // 추가적인 속성 파싱 가능
-    }
-
-    if (mapped_endpoint.address() == asio::ip::address_v4::any()) {
-        throw std::runtime_error("MAPPED-ADDRESS not found in STUN response");
-    }
-
-    return mapped_endpoint;
-}
-
 // Detect NAT Type using STUN
-awaitable<void> IceAgent::detect_nat_type() {
-    log(LogLevel::INFO, "Starting NAT type detection...");
+awaitable<NatType> IceAgent::detect_nat_type() {
+   log(LogLevel::INFO, "Starting NAT type detection...");
 
     // Gather mapped endpoints by sending STUN Binding Requests to all STUN servers
     std::vector<asio::ip::udp::endpoint> mapped_endpoints;
     for (auto& stun_client : stun_clients_) {
-        // Assume stun_client has a member 'stun_server_' representing its server
-        // Modify StunClient to store its STUN server if not already
-        // Here, we assume stun_client has a method to get its server
-        // Otherwise, adjust accordingly
-        // For this example, we'll pass the server endpoint during send_binding_request
-
-        // Parse STUN server address and port
-        std::string server = stun_client->stun_server_; // You may need to add a getter or store it differently
-        // Assuming server is in "host:port" format
-        size_t colon_pos = server.find(':');
-        if (colon_pos == std::string::npos) {
-            log(LogLevel::WARNING, "Invalid STUN server format: " + server);
-            continue;
-        }
-
-        std::string host = server.substr(0, colon_pos);
-        std::string port_str = server.substr(colon_pos + 1);
-        uint16_t port = static_cast<uint16_t>(std::stoi(port_str));
-
-        asio::ip::udp::resolver resolver(io_context_);
-        asio::ip::udp::resolver::results_type results = co_await resolver.async_resolve(asio::ip::udp::v4(), host, std::to_string(port), asio::use_awaitable);
-        asio::ip::udp::endpoint stun_endpoint = *results.begin();
-
         // Send STUN Binding Request and await response
         asio::ip::udp::endpoint mapped_endpoint;
         try {
-            co_await stun_client->send_binding_request(stun_endpoint, mapped_endpoint);
+            co_await stun_client->send_binding_request(mapped_endpoint);
             mapped_endpoints.push_back(mapped_endpoint);
-            log(LogLevel::INFO, "Received mapped endpoint from " + stun_endpoint.address().to_string() + ": " + mapped_endpoint.address().to_string() + ":" + std::to_string(mapped_endpoint.port()));
+            log(LogLevel::INFO, "Received mapped endpoint from " + stun_client->get_server() + ": " +
+                mapped_endpoint.address().to_string() + ":" + std::to_string(mapped_endpoint.port()));
         } catch (const std::exception& ex) {
-            log(LogLevel::WARNING, "Failed to gather host candidate from " + stun_endpoint.address().to_string() + ": " + ex.what());
+            log(LogLevel::WARNING, "Failed to gather host candidate from " + stun_client->get_server() + ": " + ex.what());
         }
     }
 
     // Infer NAT type based on mapped_endpoints
-    detected_nat_type_ = infer_nat_type(mapped_endpoints);
-    if (on_nat_type_detected_) {
-        on_nat_type_detected_(detected_nat_type_);
-    }
+    NatType nat_type = infer_nat_type(mapped_endpoints);
 
-    log(LogLevel::INFO, "NAT type detection completed: " + std::to_string(static_cast<int>(detected_nat_type_)));
+    log(LogLevel::INFO, "NAT type detected: " + std::to_string(static_cast<int>(nat_type)));
+
+    co_return nat_type;
 }
 
 // Apply NAT traversal strategy based on detected NAT type
@@ -569,7 +430,20 @@ awaitable<void> IceAgent::apply_nat_traversal_strategy(NatType nat_type) {
 void IceAgent::keep_alive() {
     asio::co_spawn(io_context_, [this]() -> awaitable<void> {
         while (current_state_ == IceConnectionState::Connected) {
-            std::vector<uint8_t> keep_alive_request = create_stun_binding_request(selected_pair_);
+            std::vector<uint8_t> keep_alive_request(20, 0);
+			// Message Type: Binding Request (0x0001)
+			keep_alive_request[0] = 0x00;
+			keep_alive_request[1] = 0x01;
+
+			// Message Length: 0 (no attributes)
+			keep_alive_request[2] = 0x00;
+			keep_alive_request[3] = 0x00;
+
+			// Magic Cookie: 0x2112A442
+			keep_alive_request[4] = 0x21;
+			keep_alive_request[5] = 0x12;
+			keep_alive_request[6] = 0xA4;
+			keep_alive_request[7] = 0x42;
             try {
                 co_await socket_.async_send_to(asio::buffer(keep_alive_request), selected_pair_.remote_candidate.endpoint, asio::use_awaitable);
                 log(LogLevel::INFO, "Sent Keep-Alive message.");
@@ -745,7 +619,16 @@ awaitable<void> IceAgent::udp_hole_punching() {
 
         // Validate pair using common strategy
         co_await validate_pair_with_strategy(pair, [this](const CandidatePair& p) {
-            return create_stun_binding_request(p); // STUN Binding Request
+			// Message Type: Binding Request (0x0001)
+			std::vector<uint8_t> request(20, 0);
+			request[0] = 0x00; request[1] = 0x01;
+
+			// Message Length: 0 (no attributes)
+			request[2] = 0x00; request[3] = 0x00;
+
+			// Magic Cookie: 0x2112A442
+			request[4] = 0x21; request[5] = 0x12; request[6] = 0xA4; request[7] = 0x42;
+            return request; // STUN Binding Request
         });
 
         if (pair.state == CandidatePairState::Succeeded) {
