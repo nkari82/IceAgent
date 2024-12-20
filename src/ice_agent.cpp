@@ -9,9 +9,15 @@
 // Constructor
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server)
-    : io_context_(io_context), socket_(io_context, asio::ip::udp::v4()), role_(role), mode_(mode),
-      stun_server1_(stun_server1), stun_server2_(stun_server2), turn_server_(turn_server),
-      current_state_(IceConnectionState::New), keep_alive_timer_(io_context),
+    : io_context_(io_context), 
+	  socket_(io_context, asio::ip::udp::v4()), 
+	  role_(role), 
+	  mode_(mode),
+      stun_server1_(stun_server1), 
+	  stun_server2_(stun_server2), 
+	  turn_server_(turn_server),
+      current_state_(IceConnectionState::New), 
+	  keep_alive_timer_(io_context),
       log_level_(LogLevel::INFO) {}
 
 // Setters
@@ -159,7 +165,10 @@ bool IceAgent::transition_to_state(IceConnectionState new_state) {
 awaitable<void> IceAgent::gather_candidates() {
     // Gather local candidates
     co_await gather_local_candidates();
-
+	
+	// Gather STUN candidates
+	co_await gather_host_candidates();
+	
     // Gather TURN candidates
     co_await gather_turn_candidates();
 }
@@ -187,6 +196,40 @@ awaitable<void> IceAgent::gather_local_candidates() {
         log(LogLevel::INFO, "Local Candidate gathered: " + candidate.endpoint.address().to_string() + ":" + std::to_string(candidate.endpoint.port()));
     }
     co_return;
+}
+
+// Gather Host Candidates using StunClient
+awaitable<void> IceAgent::gather_host_candidates() {
+    // Define STUN server endpoint (stun_server1_)
+    asio::ip::udp::resolver resolver(io_context_);
+    auto results = co_await resolver.async_resolve(asio::ip::udp::v4(), stun_server1_, "3478", asio::use_awaitable);
+    asio::ip::udp::endpoint stun_endpoint = *results.begin();
+
+    // Send STUN Binding Request and await response
+    Endpoint mapped_endpoint;
+    try {
+        co_await stun_client_->send_binding_request(stun_endpoint, mapped_endpoint);
+		    
+		Candidate host_candidate;
+		host_candidate.endpoint = mapped_endpoint;
+		host_candidate.priority = 1000; // 예시 우선순위, 실제 계산 필요
+		host_candidate.type = "host";
+		host_candidate.foundation = "HOST1";
+		host_candidate.component_id = 1;
+		host_candidate.transport = "UDP";
+
+		local_candidates_.push_back(host_candidate);
+		log(LogLevel::INFO, "Added local host candidate: " + mapped_endpoint.address().to_string() + ":" + std::to_string(mapped_endpoint.port()));
+
+		// Candidate Pair 생성 (Remote Candidate는 추후 추가)
+		CandidatePair pair(io_context_);
+		pair.local_candidate = host_candidate;
+		
+		// remote_candidate는 추후 remote_candidates_에서 추가
+		candidate_pairs_.push_back(pair);
+    } catch (const std::exception& ex) {
+        log(LogLevel::WARNING, "Failed to gather host candidate: " + std::string(ex.what()));
+    }
 }
 
 // Gather TURN relay candidates
@@ -396,8 +439,14 @@ NatType IceAgent::detect_nat_type() {
         asio::ip::udp::endpoint stun_server = *endpoints.begin();
 
         // Send STUN Binding Request
+		
         std::vector<uint8_t> request = create_stun_binding_request(*candidate_pairs_.begin());
         co_await socket_.async_send_to(asio::buffer(request), stun_server, asio::use_awaitable);
+		
+		/*
+		Endpoint mapped_endpoint;
+		co_await stun_client_->send_binding_request(*candidate_pairs_.begin(), mapped_endpoint);
+		*/
         log(LogLevel::INFO, "Sent STUN Binding Request to " + stun_server.address().to_string() + ":" + std::to_string(stun_server.port()));
 
         // Receive STUN Binding Response
@@ -471,7 +520,7 @@ awaitable<void> IceAgent::apply_nat_traversal_strategy(NatType nat_type) {
 }
 
 // Start Keep-Alive messages
-void IceAgent::start_keep_alive() {
+void IceAgent::keep_alive() {
     asio::co_spawn(io_context_, [this]() -> awaitable<void> {
         while (current_state_ == IceConnectionState::Connected) {
             std::vector<uint8_t> keep_alive_request = create_stun_binding_request(selected_pair_);

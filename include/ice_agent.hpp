@@ -12,6 +12,8 @@
 #include <functional>
 #include <memory>
 #include <unordered_set>
+#include "stun_client.hpp" // StunClient 포함
+#include "message.hpp"     // Message 클래스 포함
 
 // JSON 라이브러리 사용
 using json = nlohmann::json;
@@ -64,6 +66,9 @@ struct Candidate {
     std::string foundation;
     int component_id;
     std::string transport;
+	double rtt = 0.0;
+    int packet_loss = 0;
+    double bandwidth = 0.0;
 };
 
 // Candidate Pair 상태 정의
@@ -115,7 +120,7 @@ public:
     awaitable<void> start();
     void send_data(const std::vector<uint8_t>& data);
     void add_remote_candidate(const Candidate& candidate);
-
+	
     // ICE Restart 관련
     void send_restart_signal();
     void on_receive_restart_signal();
@@ -137,7 +142,8 @@ private:
     DataCallback data_callback_;
     LogLevel log_level_;
     std::shared_ptr<SignalingClient> signaling_client_;
-
+    std::shared_ptr<StunClient> stun_client_;
+	
     // 재시도 및 타임아웃 설정
     int max_retries_ = 3;           // 최대 재시도 횟수
     int pair_timeout_seconds_ = 5;  // Candidate Pair 검증 타임아웃
@@ -166,6 +172,9 @@ private:
     // TURN Candidate 수집
     awaitable<void> gather_turn_candidates();
 
+    // STUN Candidate 수집
+    awaitable<void> gather_host_candidates();
+	
     // TURN Allocate Request 생성
     std::vector<uint8_t> create_turn_allocate_request() const;
 
@@ -184,11 +193,12 @@ private:
     // NAT 우회 전략 적용
     awaitable<void> apply_nat_traversal_strategy(NatType nat_type);
 
-    // Keep-Alive 메시지 시작
-    void start_keep_alive();
+    // Methods
+    awaitable<void> gather_candidates();
+    awaitable<void> connectivity_check();
 
-    // 데이터 수신 시작
-    void start_data_receive();
+    awaitable<void> keep_alive();
+    awaitable<void> start_data_receive();
 
     // ICE Restart
     awaitable<void> restart_ice();
