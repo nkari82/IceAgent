@@ -22,15 +22,23 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
     current_state_(IceConnectionState::New), 
 	keep_alive_timer_(io_context),
     log_level_(LogLevel::INFO) {
-	// Initialize StunClients for each STUN server
+   // Initialize StunClients for each STUN server
     for (const auto& server : stun_servers_) {
-        auto stun_client = std::make_shared<StunClient>(io_context_);
+        auto stun_client = std::make_shared<StunClient>(io_context_, server.substr(0, server.find(':')), 
+                                                       static_cast<uint16_t>(std::stoi(server.substr(server.find(':') + 1))), 
+                                                       ""); // Provide key if MESSAGE-INTEGRITY is used
         stun_clients_.push_back(stun_client);
-    }	  
-	
-	// Initialize TurnClient if TURN server is provided
+    }
+
+    // Initialize TurnClient if TURN server is provided
     if (!turn_server_.empty()) {
-        turn_client_ = std::make_shared<TurnClient>(io_context_, turn_server_, turn_username_, turn_password_);
+        size_t colon_pos = turn_server_.find(':');
+        if (colon_pos == std::string::npos) {
+            throw std::invalid_argument("Invalid TURN server address.");
+        }
+        std::string host = turn_server_.substr(0, colon_pos);
+        uint16_t port = static_cast<uint16_t>(std::stoi(turn_server_.substr(colon_pos + 1)));
+        turn_client_ = std::make_shared<TurnClient>(io_context_, host, port, turn_username_, turn_password_);
     }
 }
 
@@ -199,10 +207,14 @@ uint64_t IceAgent::calculate_priority(const Candidate& local, const Candidate& r
 
 // Sort candidate pairs based on priority
 void IceAgent::sort_candidate_pairs() {
-    std::sort(candidate_pairs_.begin(), candidate_pairs_.end(),
-              [](const CandidatePair& a, const CandidatePair& b) {
-                  return a.priority > b.priority;
-              });
+    std::sort(candidate_pairs_.begin(), candidate_pairs_.end(), [&](const CandidatePair& a, const CandidatePair& b) {
+        // Higher priority first
+        if (a.local_candidate.priority != b.local_candidate.priority) {
+            return a.local_candidate.priority > b.local_candidate.priority;
+        }
+        // Lower RTT first
+        return a.rtt < b.rtt;
+    });
 }
 
 // Transition ICE state
@@ -359,61 +371,23 @@ awaitable<NatType> IceAgent::detect_nat_type() {
     co_return nat_type;
 }
 
-// Apply NAT traversal strategy based on detected NAT type
-awaitable<void> IceAgent::apply_nat_traversal_strategy(NatType nat_type) {
-    switch (nat_type) {
-        case NatType::OpenInternet:
-        case NatType::FullCone:
-            log(LogLevel::INFO, "NAT Type: Open Internet or Full Cone NAT. Attempting Direct P2P Connection.");
-            co_await direct_p2p_connection();
-            break;
-
-        case NatType::RestrictedCone:
-        case NatType::PortRestrictedCone:
-            log(LogLevel::INFO, "NAT Type: Restricted Cone NAT. Attempting UDP Hole Punching.");
-            co_await udp_hole_punching();
-            break;
-
-        case NatType::Symmetric:
-            log(LogLevel::INFO, "NAT Type: Symmetric NAT. Using TURN Relay Connection.");
-            co_await turn_relay_connection();
-            break;
-
-        default:
-            log(LogLevel::WARNING, "NAT Type: Unknown. Falling back to TURN Relay Connection.");
-            co_await turn_relay_connection();
-            break;
+awaitable<void> IceAgent::refresh_turn_allocation() {
+    if (!turn_client_ || !turn_client_->is_allocated()) {
+        co_return;
     }
+
+    while (current_state_ == IceConnectionState::Connected) {
+        co_await turn_client_->refresh_allocation();
+        log(LogLevel::INFO, "Refreshed TURN allocation.");
+        keep_alive_timer_.expires_after(std::chrono::seconds(300)); // Refresh every 5 minutes
+        co_await keep_alive_timer_.async_wait(asio::use_awaitable);
+    }
+
+    co_return;
 }
 
 // Start Keep-Alive messages
-void IceAgent::keep_alive() {
-    asio::co_spawn(io_context_, [this]() -> awaitable<void> {
-        while (current_state_ == IceConnectionState::Connected) {
-            std::vector<uint8_t> keep_alive_request(20, 0);
-			// Message Type: Binding Request (0x0001)
-			keep_alive_request[0] = 0x00;
-			keep_alive_request[1] = 0x01;
-
-			// Message Length: 0 (no attributes)
-			keep_alive_request[2] = 0x00;
-			keep_alive_request[3] = 0x00;
-
-			// Magic Cookie: 0x2112A442
-			keep_alive_request[4] = 0x21;
-			keep_alive_request[5] = 0x12;
-			keep_alive_request[6] = 0xA4;
-			keep_alive_request[7] = 0x42;
-            try {
-                co_await socket_.async_send_to(asio::buffer(keep_alive_request), selected_pair_.remote_candidate.endpoint, asio::use_awaitable);
-                log(LogLevel::INFO, "Sent Keep-Alive message.");
-            } catch (const std::exception& ex) {
-                log(LogLevel::ERROR, "Failed to send Keep-Alive message: " + std::string(ex.what()));
-            }
-
-            co_await asio::steady_timer(io_context_, std::chrono::seconds(15)).async_wait(asio::use_awaitable);
-        }
-    }, asio::detached);
+awaitable<void> IceAgent::start_keep_alive() {
 }
 
 // Start receiving data
@@ -468,58 +442,6 @@ void IceAgent::signal_ready_to_punch(const CandidatePair& pair) {
     }
 }
 
-// Validate Candidate Pair with strategy
-awaitable<void> IceAgent::validate_pair_with_strategy(CandidatePair& pair, std::function<std::vector<uint8_t>(const CandidatePair&)> create_request) {
-    while (pair.retry_count < max_retries_) {
-        try {
-            // Set timeout
-            pair.timeout_timer.expires_after(std::chrono::seconds(pair_timeout_seconds_));
-            log(LogLevel::INFO, "Validating pair: " + pair.local_candidate.endpoint.address().to_string() + ":" +
-                                       std::to_string(pair.local_candidate.endpoint.port()) + " <-> " +
-                                       pair.remote_candidate.endpoint.address().to_string() + ":" +
-                                       std::to_string(pair.remote_candidate.endpoint.port()));
-
-            // Create and send request
-            auto request = create_request(pair);
-            co_await socket_.async_send_to(asio::buffer(request), pair.remote_candidate.endpoint, asio::use_awaitable);
-
-            // Wait for response or timeout
-            std::vector<uint8_t> response(1024);
-            asio::ip::udp::endpoint sender_endpoint;
-            co_await (socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable) ||
-                      pair.timeout_timer.async_wait(asio::use_awaitable));
-
-            // Check if response is from expected endpoint
-            if (sender_endpoint == pair.remote_candidate.endpoint) {
-                pair.state = CandidatePairState::Succeeded;
-                log(LogLevel::INFO, "Connection succeeded for: " +
-                                       pair.local_candidate.endpoint.address().to_string() + ":" +
-                                       std::to_string(pair.local_candidate.endpoint.port()) + " <-> " +
-                                       pair.remote_candidate.endpoint.address().to_string() + ":" +
-                                       std::to_string(pair.remote_candidate.endpoint.port()));
-                co_return;
-            }
-        } catch (const std::exception& ex) {
-            // Retry on failure
-            pair.retry_count++;
-            pair.state = CandidatePairState::Failed;
-            log(LogLevel::WARNING, "Retry " + std::to_string(pair.retry_count) + " for: " +
-                                        pair.local_candidate.endpoint.address().to_string() + ":" +
-                                        std::to_string(pair.local_candidate.endpoint.port()) + " <-> " +
-                                        pair.remote_candidate.endpoint.address().to_string() + ":" +
-                                        std::to_string(pair.remote_candidate.endpoint.port()) + " (" + ex.what() + ")");
-
-            if (pair.retry_count >= max_retries_) {
-                log(LogLevel::ERROR, "Max retries reached for: " +
-                                         pair.local_candidate.endpoint.address().to_string() + ":" +
-                                         std::to_string(pair.local_candidate.endpoint.port()) + " <-> " +
-                                         pair.remote_candidate.endpoint.address().to_string() + ":" +
-                                         std::to_string(pair.remote_candidate.endpoint.port()));
-            }
-        }
-    }
-}
-
 // Gather Relay Candidates via TurnClient
 awaitable<void> IceAgent::gather_relay_candidates() {
     if (!turn_client_) {
@@ -565,14 +487,26 @@ awaitable<void> IceAgent::gather_relay_candidates() {
 awaitable<void> IceAgent::gather_srflx_candidates() {
     log(LogLevel::INFO, "Gathering server reflexive (srflx) candidates...");
 
-    for (auto& stun_client : stun_clients_) {
-        asio::ip::udp::endpoint mapped_endpoint;
+    for (auto& stun_server : stun_servers_) {
+        // Parse server_host and server_port from stun_server string
+        size_t colon_pos = stun_server.find(':');
+        if (colon_pos == std::string::npos) {
+            log(LogLevel::WARNING, "Invalid STUN server address: " + stun_server);
+            continue;
+        }
+        std::string host = stun_server.substr(0, colon_pos);
+        uint16_t port = static_cast<uint16_t>(std::stoi(stun_server.substr(colon_pos + 1)));
+
+        auto stun_client = std::make_shared<StunClient>(io_context_, host, port, "secret_key"); // Replace "secret_key" with actual key if needed
+        stun_clients_.push_back(stun_client);
+
         try {
-            co_await stun_client->send_binding_request(mapped_endpoint);
+            udp::endpoint mapped_endpoint = co_await stun_client->send_binding_request();
+
             // Create srflx candidate
             Candidate srflx_candidate;
             srflx_candidate.endpoint = mapped_endpoint;
-            srflx_candidate.priority = 800; // Lower priority than host candidates
+            srflx_candidate.priority = 800; // Lower than host candidates
             srflx_candidate.type = "srflx";
             srflx_candidate.foundation = "SRFLX1";
             srflx_candidate.component_id = 1;
@@ -594,7 +528,7 @@ awaitable<void> IceAgent::gather_srflx_candidates() {
             // remote_candidate will be added when remote candidates are received
             candidate_pairs_.push_back(pair);
         } catch (const std::exception& ex) {
-            log(LogLevel::WARNING, "Failed to gather srflx candidate from " + stun_client->get_server() + ": " + ex.what());
+            log(LogLevel::WARNING, "Failed to gather srflx candidate from " + stun_server + ": " + ex.what());
         }
     }
 
@@ -604,205 +538,215 @@ awaitable<void> IceAgent::gather_srflx_candidates() {
 // Connectivity check
 awaitable<void> IceAgent::perform_connectivity_checks() {
     log(LogLevel::INFO, "Performing connectivity checks...");
+
     for (auto& pair : candidate_pairs_) {
         if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
-            continue; // 이미 성공한 Pair는 건너뜀
+            continue; // 이미 성공했거나 지명된 경우 건너뜁니다.
         }
 
-        // 전략에 따라 검증 수행
-        if (pair.local_candidate.type == "host" && pair.remote_candidate.type == "host") {
-            co_await udp_hole_punching();
-        } else if (pair.local_candidate.type == "relay") {
-            co_await turn_relay_connection();
-        }
+        // IceMode에 따른 로직 분기
+        if (mode_ == IceMode::Full) {
+            // Full ICE 모드에서는 모든 후보 쌍에 대해 연결성 검사를 수행합니다.
+            try {
+                if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "prflx") {
+                    // 직접 연결성 검사 (STUN Binding Request)
+                    StunMessage connectivity_check(STUN_BINDING_REQUEST, pair.local_candidate.endpoint);
+                    std::vector<uint8_t> serialized_check = connectivity_check.serialize();
+                    co_await socket_.async_send_to(asio::buffer(serialized_check), pair.remote_candidate.endpoint, asio::use_awaitable);
 
-        // QoS 데이터 수집 (RTT 측정)
+                    log(LogLevel::INFO, "Sent STUN Binding Request to " +
+                        pair.remote_candidate.endpoint.address().to_string() + ":" +
+                        std::to_string(pair.remote_candidate.endpoint.port()));
+
+                    // 응답 대기 및 처리
+                    asio::steady_timer timer(io_context_);
+                    timer.expires_after(std::chrono::seconds(2));
+
+                    std::vector<uint8_t> recv_buffer(2048);
+                    udp::endpoint sender_endpoint;
+
+                    using namespace asio::experimental::awaitable_operators;
+                    auto [ec, bytes_transferred] = co_await (
+                        socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable)
+                        || timer.async_wait(asio::use_awaitable)
+                    );
+
+                    if (ec == asio::error::operation_aborted) {
+                        throw std::runtime_error("Connectivity check timed out.");
+                    } else if (ec) {
+                        throw std::runtime_error("Connectivity check failed: " + ec.message());
+                    }
+
+                    recv_buffer.resize(bytes_transferred);
+                    StunMessage response = StunMessage::parse(recv_buffer);
+
+                    // 응답 검증
+                    if (response.get_type() != STUN_BINDING_RESPONSE_SUCCESS) {
+                        throw std::runtime_error("Invalid STUN Binding Response type.");
+                    }
+
+                    // Transaction ID 검증
+                    if (response.get_transaction_id() != connectivity_check.get_transaction_id()) {
+                        throw std::runtime_error("STUN Transaction ID mismatch.");
+                    }
+
+                    // 후보 쌍 업데이트
+                    pair.state = CandidatePairState::Succeeded;
+                    pair.is_nominated = true;
+                    selected_pair_ = pair;
+                    log(LogLevel::INFO, "Connectivity established with " +
+                        pair.remote_candidate.endpoint.address().to_string() + ":" +
+                        std::to_string(pair.remote_candidate.endpoint.port()));
+                    transition_to_state(IceConnectionState::Connected);
+                }
+                else if (pair.remote_candidate.type == "relay") {
+                    // Relay 기반 연결성 검사 (TURN Send)
+                    std::vector<uint8_t> data = { 'D', 'A', 'T', 'A' };
+                    co_await socket_.async_send_to(asio::buffer(data), pair.remote_candidate.endpoint, asio::use_awaitable);
+                    log(LogLevel::INFO, "Sent data via TURN relay to " +
+                        pair.remote_candidate.endpoint.address().to_string() + ":" +
+                        std::to_string(pair.remote_candidate.endpoint.port()));
+
+                    // 응답 대기
+                    std::vector<uint8_t> recv_buffer(2048);
+                    udp::endpoint sender_endpoint;
+                    size_t len = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
+                    recv_buffer.resize(len);
+
+                    if (len > 0) {
+                        pair.state = CandidatePairState::Succeeded;
+                        pair.is_nominated = true;
+                        selected_pair_ = pair;
+                        log(LogLevel::INFO, "Relay-based connectivity established with " +
+                            pair.remote_candidate.endpoint.address().to_string() + ":" +
+                            std::to_string(pair.remote_candidate.endpoint.port()));
+                        transition_to_state(IceConnectionState::Connected);
+                        co_return;
+                    }
+                }
+            } catch (const std::exception& ex) {
+                log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
+                pair.state = CandidatePairState::Failed;
+                continue;
+            }
+        }
+        else if (mode_ == IceMode::Lite) {
+            // Lite ICE 모드에서는 주로 Controller 역할을 수행하는 피어가 연결성 검사를 주도합니다.
+            // Controlled 역할을 수행하는 피어는 응답만 처리합니다.
+
+            if (role_ == IceRole::Controller) {
+                // Controller는 연결성 검사를 주도적으로 수행합니다.
+                try {
+                    if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "prflx") {
+                        // 직접 연결성 검사 (STUN Binding Request)
+                        StunMessage connectivity_check(STUN_BINDING_REQUEST, pair.local_candidate.endpoint);
+                        std::vector<uint8_t> serialized_check = connectivity_check.serialize();
+                        co_await socket_.async_send_to(asio::buffer(serialized_check), pair.remote_candidate.endpoint, asio::use_awaitable);
+
+                        log(LogLevel::INFO, "Sent STUN Binding Request to " +
+                            pair.remote_candidate.endpoint.address().to_string() + ":" +
+                            std::to_string(pair.remote_candidate.endpoint.port()));
+
+                        // 응답 대기 및 처리
+                        asio::steady_timer timer(io_context_);
+                        timer.expires_after(std::chrono::seconds(2));
+
+                        std::vector<uint8_t> recv_buffer(2048);
+                        udp::endpoint sender_endpoint;
+
+                        using namespace asio::experimental::awaitable_operators;
+                        auto [ec, bytes_transferred] = co_await (
+                            socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable)
+                            || timer.async_wait(asio::use_awaitable)
+                        );
+
+                        if (ec == asio::error::operation_aborted) {
+                            throw std::runtime_error("Connectivity check timed out.");
+                        } else if (ec) {
+                            throw std::runtime_error("Connectivity check failed: " + ec.message());
+                        }
+
+                        recv_buffer.resize(bytes_transferred);
+                        StunMessage response = StunMessage::parse(recv_buffer);
+
+                        // 응답 검증
+                        if (response.get_type() != STUN_BINDING_RESPONSE_SUCCESS) {
+                            throw std::runtime_error("Invalid STUN Binding Response type.");
+                        }
+
+                        // Transaction ID 검증
+                        if (response.get_transaction_id() != connectivity_check.get_transaction_id()) {
+                            throw std::runtime_error("STUN Transaction ID mismatch.");
+                        }
+
+                        // 후보 쌍 업데이트
+                        pair.state = CandidatePairState::Succeeded;
+                        pair.is_nominated = true;
+                        selected_pair_ = pair;
+                        log(LogLevel::INFO, "Connectivity established with " +
+                            pair.remote_candidate.endpoint.address().to_string() + ":" +
+                            std::to_string(pair.remote_candidate.endpoint.port()));
+                        transition_to_state(IceConnectionState::Connected);
+                    }
+                    else if (pair.remote_candidate.type == "relay") {
+                        // Relay 기반 연결성 검사 (TURN Send)
+                        std::vector<uint8_t> data = { 'D', 'A', 'T', 'A' };
+                        co_await socket_.async_send_to(asio::buffer(data), pair.remote_candidate.endpoint, asio::use_awaitable);
+                        log(LogLevel::INFO, "Sent data via TURN relay to " +
+                            pair.remote_candidate.endpoint.address().to_string() + ":" +
+                            std::to_string(pair.remote_candidate.endpoint.port()));
+
+                        // 응답 대기
+                        std::vector<uint8_t> recv_buffer(2048);
+                        udp::endpoint sender_endpoint;
+                        size_t len = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
+                        recv_buffer.resize(len);
+
+                        if (len > 0) {
+                            pair.state = CandidatePairState::Succeeded;
+                            pair.is_nominated = true;
+                            selected_pair_ = pair;
+                            log(LogLevel::INFO, "Relay-based connectivity established with " +
+                                pair.remote_candidate.endpoint.address().to_string() + ":" +
+                                std::to_string(pair.remote_candidate.endpoint.port()));
+                            transition_to_state(IceConnectionState::Connected);
+                            co_return;
+                        }
+                    }
+                } catch (const std::exception& ex) {
+                    log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
+                    pair.state = CandidatePairState::Failed;
+                    continue;
+                }
+            }
+            else if (role_ == IceRole::Controlled) {
+                // Controlled 역할에서는 주로 응답만 처리합니다.
+                // 연결성 검사 로직을 구현할 필요가 없습니다.
+                log(LogLevel::INFO, "IceMode::Lite - Controlled role: Skipping connectivity checks.");
+                break; // Controlled 피어는 더 이상 검사할 필요가 없으므로 루프를 종료합니다.
+            }
+        }
+		
+		// QoS 데이터 수집 (RTT 측정)
         co_await measure_rtt(pair);
-    }
-
+	}
+	
     // QoS 기반 우선순위 재조정
     adjust_priority_based_on_qos();
 
-    // ICE Lite 모드일 경우, 모든 Pair를 검사하지 않고 최적 Pair를 선택
-    if (mode_ == IceMode::Lite) {
-        for (auto& pair : candidate_pairs_) {
-            if (pair.state == CandidatePairState::Succeeded) {
-                pair.is_nominated = true;
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return;
-            }
+    // After all checks
+    bool any_succeeded = false;
+    for (const auto& pair : candidate_pairs_) {
+        if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
+            any_succeeded = true;
+            break;
         }
+    }
+	
+    if (any_succeeded) {
+        transition_to_state(IceConnectionState::Connected);
     } else {
-        // 기존 Full ICE 모드의 연결 상태 확인
-        if (selected_pair_.is_nominated) {
-            log(LogLevel::INFO, "ICE Connection Established.");
-        } else {
-            log(LogLevel::ERROR, "ICE Connection Failed.");
-            transition_to_state(IceConnectionState::Failed);
-        }
+        log(LogLevel::ERROR, "No valid candidate pairs found after connectivity checks.");
+        transition_to_state(IceConnectionState::Failed);
     }
-}
-
-// UDP Hole Punching implementation
-awaitable<void> IceAgent::udp_hole_punching() {
-    log(LogLevel::INFO, "[NAT Traversal] Starting UDP Hole Punching...");
-
-    for (auto& pair : candidate_pairs_) {
-        if (pair.state != CandidatePairState::Waiting || pair.local_candidate.type != "host" || pair.remote_candidate.type != "host") {
-            continue; // Skip non-host or already validated pairs
-        }
-
-        pair.state = CandidatePairState::InProgress;
-
-        // Signal ready to punch via signaling server
-        signal_ready_to_punch(pair);
-
-        // Validate pair using common strategy
-        co_await validate_pair_with_strategy(pair, [this](const CandidatePair& p) {
-			// Message Type: Binding Request (0x0001)
-			std::vector<uint8_t> request(20, 0);
-			request[0] = 0x00; request[1] = 0x01;
-
-			// Message Length: 0 (no attributes)
-			request[2] = 0x00; request[3] = 0x00;
-
-			// Magic Cookie: 0x2112A442
-			request[4] = 0x21; request[5] = 0x12; request[6] = 0xA4; request[7] = 0x42;
-            return request; // STUN Binding Request
-        });
-
-        if (pair.state == CandidatePairState::Succeeded) {
-            if (role_ == IceRole::Controller) {
-                pair.is_nominated = true;
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return; // Stop after nominating the first successful pair
-            } else if (role_ == IceRole::Controlled) {
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return;
-            }
-        }
-    }
-
-    log(LogLevel::ERROR, "[UDP Hole Punching] All pairs failed.");
-}
-
-// Direct P2P Connection implementation
-awaitable<void> IceAgent::direct_p2p_connection() {
-    log(LogLevel::INFO, "[NAT Traversal] Attempting Direct P2P Connection...");
-
-    for (auto& pair : candidate_pairs_) {
-        if (pair.state != CandidatePairState::Waiting || pair.local_candidate.type != "host" || pair.remote_candidate.type != "host") {
-            continue; // Skip non-host or already validated pairs
-        }
-
-        pair.state = CandidatePairState::InProgress;
-
-        // Validate pair using common strategy
-        co_await validate_pair_with_strategy(pair, [this](const CandidatePair& p) {
-            return create_stun_binding_request(p); // STUN Binding Request
-        });
-
-        if (pair.state == CandidatePairState::Succeeded) {
-            if (role_ == IceRole::Controller) {
-                pair.is_nominated = true;
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return; // Stop after nominating the first successful pair
-            } else if (role_ == IceRole::Controlled) {
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return;
-            }
-        }
-    }
-
-    log(LogLevel::ERROR, "[Direct P2P] All pairs failed.");
-}
-
-// TURN Relay Connection implementation
-awaitable<void> IceAgent::turn_relay_connection() {
-    log(LogLevel::INFO, "[NAT Traversal] Using TURN Relay Connection...");
-
-    for (auto& pair : candidate_pairs_) {
-        if (pair.local_candidate.type != "relay" || pair.state != CandidatePairState::Waiting) {
-            continue; // Skip non-relay or already validated pairs
-        }
-
-        pair.state = CandidatePairState::InProgress;
-
-        // Validate pair using common strategy
-        co_await validate_pair_with_strategy(pair, [this](const CandidatePair& p) {
-            return create_turn_allocate_request(); // TURN Allocate Request
-        });
-
-        if (pair.state == CandidatePairState::Succeeded) {
-            if (role_ == IceRole::Controller) {
-                pair.is_nominated = true;
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return; // Stop after nominating the first successful pair
-            } else if (role_ == IceRole::Controlled) {
-                selected_pair_ = pair;
-                transition_to_state(IceConnectionState::Connected);
-                co_return;
-            }
-        }
-    }
-
-    log(LogLevel::ERROR, "[TURN Relay] All pairs failed.");
-}
-
-awaitable<void> IceAgent::measure_rtt(CandidatePair& pair) {
-    try {
-        auto start_time = std::chrono::steady_clock::now();
-
-        // STUN Binding Request 전송
-        std::vector<uint8_t> request = create_stun_binding_request(pair);
-        co_await socket_.async_send_to(asio::buffer(request), pair.remote_candidate.endpoint, asio::use_awaitable);
-
-        // 응답 대기 (타임아웃 설정)
-        std::vector<uint8_t> response(1024);
-        asio::ip::udp::endpoint sender_endpoint;
-        asio::steady_timer timer(io_context_);
-        timer.expires_after(std::chrono::seconds(pair_timeout_seconds_));
-        bool timeout = false;
-
-        co_await (
-            socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable) ||
-            timer.async_wait([&](const asio::error_code& ec) { if (!ec) timeout = true; })
-        );
-
-        if (timeout || sender_endpoint != pair.remote_candidate.endpoint) {
-            throw std::runtime_error("RTT Measurement Failed");
-        }
-
-        auto end_time = std::chrono::steady_clock::now();
-        pair.rtt = std::chrono::duration<double, std::milli>(end_time - start_time).count(); // RTT in milliseconds
-        log(LogLevel::INFO, "RTT for pair " + pair.local_candidate.endpoint.address().to_string() + ":" + 
-                                   std::to_string(pair.local_candidate.endpoint.port()) + " <-> " + 
-                                   pair.remote_candidate.endpoint.address().to_string() + ":" + 
-                                   std::to_string(pair.remote_candidate.endpoint.port()) + " = " + 
-                                   std::to_string(pair.rtt) + " ms");
-    } catch (const std::exception& ex) {
-        log(LogLevel::WARNING, "RTT measurement failed: " + std::string(ex.what()));
-        pair.rtt = std::numeric_limits<double>::max(); // 최악의 RTT 값 설정
-    }
-}
-
-void IceAgent::adjust_priority_based_on_qos() {
-    for (auto& pair : candidate_pairs_) {
-        // 예제: RTT가 낮을수록 우선순위를 높게 설정
-        // 실제 RFC 8445의 우선순위 계산을 따릅니다.
-        if (pair.rtt < std::numeric_limits<double>::max()) {
-            pair.priority = static_cast<uint64_t>(10000 / pair.rtt); // 단순한 예제
-        } else {
-            pair.priority = 0; // 실패한 Pair는 낮은 우선순위
-        }
-    }
-
-    // 우선순위 기반으로 정렬
-    sort_candidate_pairs();
 }

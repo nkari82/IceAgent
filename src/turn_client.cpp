@@ -203,6 +203,93 @@ awaitable<asio::ip::udp::endpoint> TurnClient::receive_allocate_response() {
     co_return allocated_endpoint;
 }
 
+/*
+asio::awaitable<void> TurnClient::refresh_allocation() {
+    // Create TURN Refresh Request
+    std::vector<uint8_t> transaction_id(12, 0x00);
+    std::generate(transaction_id.begin(), transaction_id.end(), []() { return rand() % 256; });
+
+    TurnMessage request(TURN_REFRESH, transaction_id);
+    // No specific attributes needed for refresh
+
+    // Add MESSAGE-INTEGRITY
+    std::vector<uint8_t> message_integrity = TurnUtils::calculate_message_integrity(request, password_);
+    request.add_attribute(STUN_ATTR_MESSAGE_INTEGRITY, message_integrity);
+
+    // Add FINGERPRINT
+    uint32_t fingerprint = StunUtils::calculate_fingerprint(request);
+    std::vector<uint8_t> fingerprint_attr = {
+        static_cast<uint8_t>((fingerprint >> 24) & 0xFF),
+        static_cast<uint8_t>((fingerprint >> 16) & 0xFF),
+        static_cast<uint8_t>((fingerprint >> 8) & 0xFF),
+        static_cast<uint8_t>(fingerprint & 0xFF)
+    };
+    request.add_attribute(STUN_ATTR_FINGERPRINT, fingerprint_attr);
+
+    std::vector<uint8_t> serialized_request = request.serialize();
+
+    // Send Refresh Request
+    co_await socket_.async_send_to(asio::buffer(serialized_request), server_endpoint_, asio::use_awaitable);
+
+    // Prepare to receive response
+    std::vector<uint8_t> recv_buffer(2048);
+    udp::endpoint sender_endpoint;
+
+    // Set a timeout
+    asio::steady_timer timer(co_await asio::this_coro::executor);
+    timer.expires_after(std::chrono::seconds(5));
+
+    // Await either receive or timeout
+    using namespace asio::experimental::awaitable_operators;
+    auto [ec, bytes_transferred] = co_await (
+        socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable)
+        || timer.async_wait(asio::use_awaitable)
+    );
+
+    if (ec == asio::error::operation_aborted) {
+        throw std::runtime_error("TURN Refresh Request timed out.");
+    } else if (ec) {
+        throw std::runtime_error("TURN Refresh Request failed: " + ec.message());
+    }
+
+    recv_buffer.resize(bytes_transferred);
+    TurnMessage response = TurnMessage::parse(recv_buffer);
+
+    // Validate response
+    if (response.get_type() != TURN_REFRESH_RESPONSE_SUCCESS) {
+        throw std::runtime_error("Invalid TURN Refresh Response type.");
+    }
+
+    // Validate Transaction ID
+    if (response.get_transaction_id() != transaction_id) {
+        throw std::runtime_error("TURN Transaction ID mismatch.");
+    }
+
+    // Validate MESSAGE-INTEGRITY
+    auto attrs = response.get_attributes();
+    bool mi_found = false;
+    std::vector<uint8_t> received_mi;
+    for (const auto& attr : attrs) {
+        if (attr.type == STUN_ATTR_MESSAGE_INTEGRITY) {
+            received_mi = attr.value;
+            mi_found = true;
+            break;
+        }
+    }
+    if (!mi_found) {
+        throw std::runtime_error("TURN MESSAGE-INTEGRITY attribute missing.");
+    }
+
+    std::vector<uint8_t> calculated_mi = TurnUtils::calculate_message_integrity(response, password_);
+    if (received_mi.size() != calculated_mi.size() || !std::equal(received_mi.begin(), received_mi.end(), calculated_mi.begin())) {
+        throw std::runtime_error("TURN MESSAGE-INTEGRITY validation failed.");
+    }
+
+    // Successful refresh
+    co_return;
+}
+*/
+
 // Helper method to authenticate TURN messages
 void TurnClient::authenticate_message(Message& message) {
     // Implement MESSAGE-INTEGRITY based on TURN authentication

@@ -190,14 +190,11 @@ private:
 	
 	awaitable<void> gather_srflx_candidates();
 	
-    // NAT 우회 전략 적용
-    awaitable<void> apply_nat_traversal_strategy(NatType nat_type);
-
     // Methods
     awaitable<void> gather_candidates();
     awaitable<void> perform_connectivity_checks();
 
-    awaitable<void> keep_alive();
+    awaitable<void> start_keep_alive();
     awaitable<void> start_data_receive();
 
     // ICE Restart
@@ -206,20 +203,6 @@ private:
     // 시그널링 서버를 통해 Hole Punching 동기화 신호 전송
     void signal_ready_to_punch(const CandidatePair& pair);
 
-    // 검증 및 전략 통합 함수
-    awaitable<void> validate_pair_with_strategy(CandidatePair& pair, std::function<std::vector<uint8_t>(const CandidatePair&)> create_request);
-
-    // NAT Traversal 전략 함수
-    awaitable<void> udp_hole_punching();
-    awaitable<void> direct_p2p_connection();
-    awaitable<void> turn_relay_connection();
-	
-	// RTT 측정 관련
-    awaitable<void> measure_rtt(CandidatePair& pair);
-	
-	// QoS 기반 우선순위 재조정
-    void adjust_priority_based_on_qos();
-	
 	// NAT Type Detection Helpers
     NatType infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints);
 };
