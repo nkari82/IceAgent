@@ -8,7 +8,10 @@
 
 // Constructor
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
-                   const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server)
+                   const std::vector<std::string>& stun_servers, 
+				   const std::string& turn_server,
+				   const std::string& turn_username, 
+				   const std::string& turn_password)
     : io_context_(io_context), 
 	socket_(io_context, asio::ip::udp::v4()), 
 	role_(role), 
@@ -24,6 +27,11 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
         auto stun_client = std::make_shared<StunClient>(io_context_);
         stun_clients_.push_back(stun_client);
     }	  
+	
+	// Initialize TurnClient if TURN server is provided
+    if (!turn_server_.empty()) {
+        turn_client_ = std::make_shared<TurnClient>(io_context_, turn_server_, turn_username_, turn_password_);
+    }
 }
 
 // Setters
@@ -83,10 +91,23 @@ awaitable<void> IceAgent::start() {
             on_nat_type_detected_(nat_type);
         }
 		
+		// Step 2: Gather Candidates
         co_await gather_candidates();
 
+        // Step 3: NAT Traversal Strategies (e.g., UDP Hole Punching, TURN Relay)
+        // Depending on NAT type, decide whether to gather relay candidates
+        if (nat_type == NatType::Symmetric || nat_type == NatType::SymmetricUDPFirewall) {
+            if (turn_client_) {
+                log(LogLevel::INFO, "Gathering relay candidates via TURN...");
+                co_await gather_relay_candidates();
+            } else {
+                log(LogLevel::WARNING, "Symmetric NAT detected but TURN server not configured.");
+            }
+        }
+
+
         // NAT 탐지 및 우회 전략 적용
-        log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(detected_nat_type_));
+        log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
         co_await apply_nat_traversal_strategy(nat_type);
 
         if (!transition_to_state(IceConnectionState::Checking)) {
@@ -94,7 +115,7 @@ awaitable<void> IceAgent::start() {
         }
 
         sort_candidate_pairs();
-        co_await connectivity_check();
+        co_await perform_connectivity_checks();
 
         if (selected_pair_.is_nominated) {
             if (transition_to_state(IceConnectionState::Connected)) {
@@ -137,7 +158,7 @@ void IceAgent::add_remote_candidate(const Candidate& candidate) {
         pair.priority = calculate_priority(local, candidate);
         candidate_pairs_.push_back(pair);
     }
-    asio::co_spawn(io_context_, connectivity_check(), asio::detached);
+    asio::co_spawn(io_context_, perform_connectivity_checks(), asio::detached);
 }
 
 // Convert NatType to string
@@ -560,9 +581,50 @@ awaitable<void> IceAgent::validate_pair_with_strategy(CandidatePair& pair, std::
     }
 }
 
+// Gather Relay Candidates via TurnClient
+awaitable<void> IceAgent::gather_relay_candidates() {
+    if (!turn_client_) {
+        log(LogLevel::ERROR, "TurnClient not initialized.");
+        co_return;
+    }
+
+    try {
+        // Allocate a relay endpoint
+        asio::ip::udp::endpoint relay_endpoint = co_await turn_client_->allocate_relay();
+        log(LogLevel::INFO, "Allocated relay endpoint: " + relay_endpoint.address().to_string() + ":" + std::to_string(relay_endpoint.port()));
+
+        // Create Relay Candidate
+        Candidate relay_candidate;
+        relay_candidate.endpoint = relay_endpoint;
+        relay_candidate.priority = 900; // Lower priority than host candidates
+        relay_candidate.type = "relay";
+        relay_candidate.foundation = "RELAY1";
+        relay_candidate.component_id = 1;
+        relay_candidate.transport = "UDP";
+
+        local_candidates_.push_back(relay_candidate);
+        log(LogLevel::INFO, "Added local relay candidate: " + relay_endpoint.address().to_string() + ":" + std::to_string(relay_endpoint.port()));
+
+        // Create Candidate Pair with Relay Candidate
+        CandidatePair pair(io_context_);
+        pair.local_candidate = relay_candidate;
+        // remote_candidate will be added when remote candidates are received
+        candidate_pairs_.push_back(pair);
+
+        // Notify about the new relay candidate via callback
+        if (on_candidate_) {
+            on_candidate_(relay_candidate);
+        }
+    } catch (const std::exception& ex) {
+        log(LogLevel::ERROR, "Failed to allocate relay via TURN: " + std::string(ex.what()));
+    }
+
+    co_return;
+}
+
 // Connectivity check
-awaitable<void> IceAgent::connectivity_check() {
-    log(LogLevel::INFO, "Starting connectivity check...");
+awaitable<void> IceAgent::perform_connectivity_checks() {
+    log(LogLevel::INFO, "Performing connectivity checks...");
     for (auto& pair : candidate_pairs_) {
         if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
             continue; // 이미 성공한 Pair는 건너뜀

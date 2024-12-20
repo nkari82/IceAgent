@@ -111,7 +111,10 @@ public:
 	using NatTypeCallback = std::function<void(NatType)>;
 
 	IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
-             const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server);
+             const std::vector<std::string>& stun_servers, 
+			 const std::string& turn_server, 
+			 const std::string& turn_username, 
+			 const std::string& turn_password);
 
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
@@ -182,6 +185,9 @@ private:
     // TURN Candidate 수집
     awaitable<void> gather_turn_candidates();
 
+	// TURN related
+    awaitable<void> gather_relay_candidates();
+	
     // STUN Candidate 수집
     awaitable<void> gather_host_candidates();
 	
@@ -196,7 +202,7 @@ private:
 
     // Methods
     awaitable<void> gather_candidates();
-    awaitable<void> connectivity_check();
+    awaitable<void> perform_connectivity_checks();
 
     awaitable<void> keep_alive();
     awaitable<void> start_data_receive();
