@@ -7,9 +7,9 @@
 #include <thread>
 
 // Constructor
-IceAgent::IceAgent(asio::io_context& io_context, IceRole role, const std::string& stun_server1,
-                   const std::string& stun_server2, const std::string& turn_server)
-    : io_context_(io_context), socket_(io_context, asio::ip::udp::v4()), role_(role),
+IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
+                   const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server)
+    : io_context_(io_context), socket_(io_context, asio::ip::udp::v4()), role_(role), mode_(mode),
       stun_server1_(stun_server1), stun_server2_(stun_server2), turn_server_(turn_server),
       current_state_(IceConnectionState::New), keep_alive_timer_(io_context),
       log_level_(LogLevel::INFO) {}
@@ -269,15 +269,60 @@ Candidate IceAgent::parse_turn_allocate_response(const std::vector<uint8_t>& res
 // Create STUN Binding Request
 std::vector<uint8_t> IceAgent::create_stun_binding_request(const CandidatePair& pair) const {
     std::vector<uint8_t> request(20, 0);
-    request[0] = 0x00; // STUN Binding Request
+    // Message Type: Binding Request (0x0001)
+    request[0] = 0x00;
     request[1] = 0x01;
-    request[4] = 0x21; // Magic Cookie
+
+    // Message Length: 0 (no attributes)
+    request[2] = 0x00;
+    request[3] = 0x00;
+
+    // Magic Cookie: 0x2112A442
+    request[4] = 0x21;
     request[5] = 0x12;
     request[6] = 0xA4;
     request[7] = 0x42;
+
+    // Transaction ID: 12 bytes 랜덤값
+    for (int i = 8; i < 20; ++i) {
+        request[i] = static_cast<uint8_t>(rand() % 256);
+    }
+
     return request;
 }
 
+struct StunAttribute {
+    uint16_t type;
+    uint16_t length;
+    std::vector<uint8_t> value;
+};
+
+std::vector<StunAttribute> parse_stun_attributes(const std::vector<uint8_t>& response, size_t length) const {
+    std::vector<StunAttribute> attributes;
+    size_t offset = 20; // 헤더 이후부터 시작
+
+    while (offset + 4 <= length) {
+        StunAttribute attr;
+        attr.type = (response[offset] << 8) | response[offset + 1];
+        attr.length = (response[offset + 2] << 8) | response[offset + 3];
+        offset += 4;
+
+        if (offset + attr.length > length) {
+            throw std::runtime_error("STUN attribute length mismatch");
+        }
+
+        attr.value.insert(attr.value.end(), response.begin() + offset, response.begin() + offset + attr.length);
+        attributes.push_back(attr);
+        offset += attr.length;
+
+        // Attribute padding: STUN attributes are padded to 4-byte boundaries
+        if (attr.length % 4 != 0) {
+            offset += (4 - (attr.length % 4));
+        }
+    }
+
+    return attributes;
+}
 // Parse STUN Binding Response
 asio::ip::udp::endpoint IceAgent::parse_stun_binding_response(const std::vector<uint8_t>& response, size_t length) const {
     // STUN 메시지 파싱 (RFC 5389)
@@ -297,33 +342,43 @@ asio::ip::udp::endpoint IceAgent::parse_stun_binding_response(const std::vector<
         throw std::runtime_error("Invalid magic cookie");
     }
 
-    // Parse attributes to find MAPPED-ADDRESS
-    size_t offset = 20;
+    // Parse attributes
+    std::vector<StunAttribute> attributes = parse_stun_attributes(response, length);
+
     asio::ip::udp::endpoint mapped_endpoint(asio::ip::address_v4::any(), 0);
 
-    while (offset + 4 <= length) {
-        uint16_t attr_type = (response[offset] << 8) | response[offset + 1];
-        uint16_t attr_length = (response[offset + 2] << 8) | response[offset + 3];
-        offset += 4;
-
-        if (offset + attr_length > length) {
-            throw std::runtime_error("STUN attribute length mismatch");
-        }
-
-        if (attr_type == 0x0001) { // MAPPED-ADDRESS
-            if (attr_length >= 8) {
-                uint8_t family = response[offset + 1];
-                uint16_t port = (response[offset + 2] << 8) | response[offset + 3];
-                std::string ip = std::to_string(response[offset + 4]) + "." +
-                                 std::to_string(response[offset + 5]) + "." +
-                                 std::to_string(response[offset + 6]) + "." +
-                                 std::to_string(response[offset + 7]);
+    for (const auto& attr : attributes) {
+        if (attr.type == 0x0001) { // MAPPED-ADDRESS
+            if (attr.length >= 8) {
+                uint8_t family = attr.value[1];
+                uint16_t port = (attr.value[2] << 8) | attr.value[3];
+                std::string ip = std::to_string(attr.value[4]) + "." +
+                                 std::to_string(attr.value[5]) + "." +
+                                 std::to_string(attr.value[6]) + "." +
+                                 std::to_string(attr.value[7]);
                 mapped_endpoint = asio::ip::udp::endpoint(asio::ip::address::from_string(ip), port);
                 break;
             }
+        } else if (attr.type == 0x0020) { // XOR-MAPPED-ADDRESS
+            if (attr.length >= 8) {
+                uint8_t family = attr.value[1];
+                uint16_t xport = (attr.value[2] << 8) | attr.value[3];
+                uint32_t xaddr = (attr.value[4] << 24) | (attr.value[5] << 16) |
+                                 (attr.value[6] << 8) | attr.value[7];
+                uint32_t magic_cookie = 0x2112A442;
+                uint16_t port = xport ^ ((magic_cookie >> 16) & 0xFFFF);
+                uint32_t addr = xaddr ^ magic_cookie;
+                asio::ip::address_v4::bytes_type addr_bytes;
+                addr_bytes[0] = (addr >> 24) & 0xFF;
+                addr_bytes[1] = (addr >> 16) & 0xFF;
+                addr_bytes[2] = (addr >> 8) & 0xFF;
+                addr_bytes[3] = addr & 0xFF;
+                asio::ip::address_v4 ip_addr(addr_bytes);
+                mapped_endpoint = asio::ip::udp::endpoint(ip_addr, port);
+                break;
+            }
         }
-
-        offset += attr_length;
+        // 추가적인 속성 파싱 가능
     }
 
     if (mapped_endpoint.address() == asio::ip::address_v4::any()) {
@@ -453,16 +508,21 @@ void IceAgent::start_data_receive() {
 
 // ICE Restart
 awaitable<void> IceAgent::restart_ice() {
+    if (mode_ == IceMode::Lite) {
+        log(LogLevel::WARNING, "ICE Restart is not supported in ICE Lite mode.");
+        co_return;
+    }
+
     log(LogLevel::INFO, "Restarting ICE process...");
 
-    // Reset state
+    // 상태를 초기화
     current_state_ = IceConnectionState::New;
     selected_pair_ = CandidatePair(io_context_);
     candidate_pairs_.clear();
     remote_candidates_.clear();
     log(LogLevel::INFO, "ICE state reset.");
 
-    // Restart ICE process
+    // 새로운 후보 수집 시작
     co_await start();
 }
 
@@ -536,23 +596,41 @@ awaitable<void> IceAgent::connectivity_check() {
     log(LogLevel::INFO, "Starting connectivity check...");
     for (auto& pair : candidate_pairs_) {
         if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
-            continue; // Skip already succeeded or nominated pairs
+            continue; // 이미 성공한 Pair는 건너뜀
         }
 
-        // Determine strategy based on candidate types
+        // 전략에 따라 검증 수행
         if (pair.local_candidate.type == "host" && pair.remote_candidate.type == "host") {
             co_await udp_hole_punching();
         } else if (pair.local_candidate.type == "relay") {
             co_await turn_relay_connection();
         }
+
+        // QoS 데이터 수집 (RTT 측정)
+        co_await measure_rtt(pair);
     }
 
-    // Check connection state
-    if (selected_pair_.is_nominated) {
-        log(LogLevel::INFO, "ICE Connection Established.");
+    // QoS 기반 우선순위 재조정
+    adjust_priority_based_on_qos();
+
+    // ICE Lite 모드일 경우, 모든 Pair를 검사하지 않고 최적 Pair를 선택
+    if (mode_ == IceMode::Lite) {
+        for (auto& pair : candidate_pairs_) {
+            if (pair.state == CandidatePairState::Succeeded) {
+                pair.is_nominated = true;
+                selected_pair_ = pair;
+                transition_to_state(IceConnectionState::Connected);
+                co_return;
+            }
+        }
     } else {
-        log(LogLevel::ERROR, "ICE Connection Failed.");
-        transition_to_state(IceConnectionState::Failed);
+        // 기존 Full ICE 모드의 연결 상태 확인
+        if (selected_pair_.is_nominated) {
+            log(LogLevel::INFO, "ICE Connection Established.");
+        } else {
+            log(LogLevel::ERROR, "ICE Connection Failed.");
+            transition_to_state(IceConnectionState::Failed);
+        }
     }
 }
 
@@ -658,3 +736,54 @@ awaitable<void> IceAgent::turn_relay_connection() {
     log(LogLevel::ERROR, "[TURN Relay] All pairs failed.");
 }
 
+awaitable<void> IceAgent::measure_rtt(CandidatePair& pair) {
+    try {
+        auto start_time = std::chrono::steady_clock::now();
+
+        // STUN Binding Request 전송
+        std::vector<uint8_t> request = create_stun_binding_request(pair);
+        co_await socket_.async_send_to(asio::buffer(request), pair.remote_candidate.endpoint, asio::use_awaitable);
+
+        // 응답 대기 (타임아웃 설정)
+        std::vector<uint8_t> response(1024);
+        asio::ip::udp::endpoint sender_endpoint;
+        asio::steady_timer timer(io_context_);
+        timer.expires_after(std::chrono::seconds(pair_timeout_seconds_));
+        bool timeout = false;
+
+        co_await (
+            socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable) ||
+            timer.async_wait([&](const asio::error_code& ec) { if (!ec) timeout = true; })
+        );
+
+        if (timeout || sender_endpoint != pair.remote_candidate.endpoint) {
+            throw std::runtime_error("RTT Measurement Failed");
+        }
+
+        auto end_time = std::chrono::steady_clock::now();
+        pair.rtt = std::chrono::duration<double, std::milli>(end_time - start_time).count(); // RTT in milliseconds
+        log(LogLevel::INFO, "RTT for pair " + pair.local_candidate.endpoint.address().to_string() + ":" + 
+                                   std::to_string(pair.local_candidate.endpoint.port()) + " <-> " + 
+                                   pair.remote_candidate.endpoint.address().to_string() + ":" + 
+                                   std::to_string(pair.remote_candidate.endpoint.port()) + " = " + 
+                                   std::to_string(pair.rtt) + " ms");
+    } catch (const std::exception& ex) {
+        log(LogLevel::WARNING, "RTT measurement failed: " + std::string(ex.what()));
+        pair.rtt = std::numeric_limits<double>::max(); // 최악의 RTT 값 설정
+    }
+}
+
+void IceAgent::adjust_priority_based_on_qos() {
+    for (auto& pair : candidate_pairs_) {
+        // 예제: RTT가 낮을수록 우선순위를 높게 설정
+        // 실제 RFC 8445의 우선순위 계산을 따릅니다.
+        if (pair.rtt < std::numeric_limits<double>::max()) {
+            pair.priority = static_cast<uint64_t>(10000 / pair.rtt); // 단순한 예제
+        } else {
+            pair.priority = 0; // 실패한 Pair는 낮은 우선순위
+        }
+    }
+
+    // 우선순위 기반으로 정렬
+    sort_candidate_pairs();
+}

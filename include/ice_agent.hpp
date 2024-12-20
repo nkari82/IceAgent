@@ -41,6 +41,11 @@ enum class IceRole {
     Controlled
 };
 
+enum class IceMode {
+    Full,    // 기존 ICE
+    Lite     // ICE Lite
+};
+
 // NAT 유형 정의
 enum class NatType {
     Unknown,
@@ -77,6 +82,9 @@ struct CandidatePair {
     CandidatePairState state = CandidatePairState::Waiting;
     bool is_nominated = false;
     int retry_count = 0; // 재시도 횟수
+	double rtt; // RTT 측정 값
+    int packet_loss; // 패킷 손실률
+    double bandwidth; // 대역폭
     asio::steady_timer timeout_timer; // 타임아웃 타이머
 
     CandidatePair(asio::io_context& io_context)
@@ -93,8 +101,8 @@ public:
     using CandidateCallback = std::function<void(const Candidate&)>;
     using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
 
-    IceAgent(asio::io_context& io_context, IceRole role, const std::string& stun_server1,
-             const std::string& stun_server2, const std::string& turn_server);
+	IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
+             const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server);
 
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
@@ -116,6 +124,7 @@ private:
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
+	IceMode mode_;
     std::string stun_server1_, stun_server2_, turn_server_;
     IceConnectionState current_state_;
     asio::steady_timer keep_alive_timer_;
@@ -194,6 +203,12 @@ private:
     awaitable<void> udp_hole_punching();
     awaitable<void> direct_p2p_connection();
     awaitable<void> turn_relay_connection();
+	
+	// RTT 측정 관련
+    awaitable<void> measure_rtt(CandidatePair& pair);
+	
+	// QoS 기반 우선순위 재조정
+    void adjust_priority_based_on_qos();
 };
 
 #endif // ICE_AGENT_HPP
