@@ -10,15 +10,21 @@
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server)
     : io_context_(io_context), 
-	  socket_(io_context, asio::ip::udp::v4()), 
-	  role_(role), 
-	  mode_(mode),
-      stun_server1_(stun_server1), 
-	  stun_server2_(stun_server2), 
-	  turn_server_(turn_server),
-      current_state_(IceConnectionState::New), 
-	  keep_alive_timer_(io_context),
-      log_level_(LogLevel::INFO) {}
+	socket_(io_context, asio::ip::udp::v4()), 
+	role_(role), 
+	mode_(mode),
+    stun_server1_(stun_server1), 
+	stun_server2_(stun_server2), 
+	turn_server_(turn_server),
+    current_state_(IceConnectionState::New), 
+	keep_alive_timer_(io_context),
+    log_level_(LogLevel::INFO) {
+	// Initialize StunClients for each STUN server
+    for (const auto& server : stun_servers_) {
+        auto stun_client = std::make_shared<StunClient>(io_context_);
+        stun_clients_.push_back(stun_client);
+    }	  
+}
 
 // Setters
 void IceAgent::set_on_state_change_callback(StateCallback callback) {
@@ -35,6 +41,10 @@ void IceAgent::set_data_callback(DataCallback callback) {
 
 void IceAgent::set_log_level(LogLevel level) {
     log_level_ = level;
+}
+
+void IceAgent::set_nat_type_callback(NatTypeCallback cb) {
+    on_nat_type_detected_ = cb;
 }
 
 void IceAgent::set_signaling_client(std::shared_ptr<SignalingClient> signaling_client) {
@@ -65,12 +75,13 @@ awaitable<void> IceAgent::start() {
     }
 
     try {
+		co_await detect_nat_type();
+		
         co_await gather_candidates();
 
         // NAT 탐지 및 우회 전략 적용
-        NatType nat_type = detect_nat_type();
-        log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
-        co_await apply_nat_traversal_strategy(nat_type);
+        log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(detected_nat_type_));
+        co_await apply_nat_traversal_strategy(detected_nat_type_);
 
         if (!transition_to_state(IceConnectionState::Checking)) {
             co_return;
@@ -159,6 +170,52 @@ bool IceAgent::transition_to_state(IceConnectionState new_state) {
     }
     log(LogLevel::INFO, "Transitioned to state: " + std::to_string(static_cast<int>(current_state_)));
     return true;
+}
+
+// NAT Type Inference Logic
+NatType IceAgent::infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints) {
+    // Basic Checks
+    if (mapped_endpoints.empty()) {
+        return NatType::SymmetricUDPFirewall;
+    }
+
+    // Collect unique IPs and ports
+    std::vector<asio::ip::address_v4> unique_ips;
+    std::vector<uint16_t> unique_ports;
+
+    for (const auto& ep : mapped_endpoints) {
+        // Check for unique IPs
+        if (std::find(unique_ips.begin(), unique_ips.end(), ep.address().to_v4()) == unique_ips.end()) {
+            unique_ips.push_back(ep.address().to_v4());
+        }
+
+        // Check for unique Ports
+        if (std::find(unique_ports.begin(), unique_ports.end(), ep.port()) == unique_ports.end()) {
+            unique_ports.push_back(ep.port());
+        }
+    }
+
+    // Analyze unique IPs and Ports
+    if (unique_ips.size() == 1) {
+        if (unique_ports.size() == 1) {
+            // Same IP and Port across all STUN servers
+            return NatType::FullCone;
+        } else {
+            // Same IP but different Ports
+            return NatType::RestrictedCone;
+        }
+    } else {
+        if (unique_ports.size() == 1) {
+            // Different IPs but same Port
+            return NatType::PortRestrictedCone;
+        } else {
+            // Different IPs and different Ports
+            return NatType::Symmetric;
+        }
+    }
+
+    // Fallback
+    return NatType::Unknown;
 }
 
 // Gather local and TURN candidates
@@ -432,64 +489,53 @@ asio::ip::udp::endpoint IceAgent::parse_stun_binding_response(const std::vector<
 }
 
 // Detect NAT Type using STUN
-NatType IceAgent::detect_nat_type() {
-    try {
+awaitable<void> IceAgent::detect_nat_type() {
+    log(LogLevel::INFO, "Starting NAT type detection...");
+
+    // Gather mapped endpoints by sending STUN Binding Requests to all STUN servers
+    std::vector<asio::ip::udp::endpoint> mapped_endpoints;
+    for (auto& stun_client : stun_clients_) {
+        // Assume stun_client has a member 'stun_server_' representing its server
+        // Modify StunClient to store its STUN server if not already
+        // Here, we assume stun_client has a method to get its server
+        // Otherwise, adjust accordingly
+        // For this example, we'll pass the server endpoint during send_binding_request
+
+        // Parse STUN server address and port
+        std::string server = stun_client->stun_server_; // You may need to add a getter or store it differently
+        // Assuming server is in "host:port" format
+        size_t colon_pos = server.find(':');
+        if (colon_pos == std::string::npos) {
+            log(LogLevel::WARNING, "Invalid STUN server format: " + server);
+            continue;
+        }
+
+        std::string host = server.substr(0, colon_pos);
+        std::string port_str = server.substr(colon_pos + 1);
+        uint16_t port = static_cast<uint16_t>(std::stoi(port_str));
+
         asio::ip::udp::resolver resolver(io_context_);
-        asio::ip::udp::resolver::results_type endpoints = resolver.resolve(stun_server1_, "3478");
-        asio::ip::udp::endpoint stun_server = *endpoints.begin();
+        asio::ip::udp::resolver::results_type results = co_await resolver.async_resolve(asio::ip::udp::v4(), host, std::to_string(port), asio::use_awaitable);
+        asio::ip::udp::endpoint stun_endpoint = *results.begin();
 
-        // Send STUN Binding Request
-		
-        std::vector<uint8_t> request = create_stun_binding_request(*candidate_pairs_.begin());
-        co_await socket_.async_send_to(asio::buffer(request), stun_server, asio::use_awaitable);
-		
-		/*
-		Endpoint mapped_endpoint;
-		co_await stun_client_->send_binding_request(*candidate_pairs_.begin(), mapped_endpoint);
-		*/
-        log(LogLevel::INFO, "Sent STUN Binding Request to " + stun_server.address().to_string() + ":" + std::to_string(stun_server.port()));
-
-        // Receive STUN Binding Response
-        std::vector<uint8_t> response(1024);
-        asio::ip::udp::endpoint sender_endpoint;
-        size_t length = co_await socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable);
-
-        // Parse MAPPED-ADDRESS
-        asio::ip::udp::endpoint primary_mapped_address = parse_stun_binding_response(response, length);
-        log(LogLevel::INFO, "Received STUN Binding Response from " + sender_endpoint.address().to_string() + ":" + std::to_string(sender_endpoint.port()));
-
-        // Send STUN Binding Request to secondary STUN server
-        asio::ip::udp::resolver::results_type secondary_endpoints = resolver.resolve(stun_server2_, "3478");
-        asio::ip::udp::endpoint secondary_stun_server = *secondary_endpoints.begin();
-        co_await socket_.async_send_to(asio::buffer(request), secondary_stun_server, asio::use_awaitable);
-        log(LogLevel::INFO, "Sent STUN Binding Request to secondary STUN server: " + secondary_stun_server.address().to_string() + ":" + std::to_string(secondary_stun_server.port()));
-
-        // Receive STUN Binding Response from secondary STUN server
-        asio::ip::udp::endpoint secondary_mapped_address;
+        // Send STUN Binding Request and await response
+        asio::ip::udp::endpoint mapped_endpoint;
         try {
-            length = co_await socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable);
-            secondary_mapped_address = parse_stun_binding_response(response, length);
-            log(LogLevel::INFO, "Received STUN Binding Response from secondary STUN server: " + sender_endpoint.address().to_string() + ":" + std::to_string(sender_endpoint.port()));
-        } catch (...) {
-            log(LogLevel::WARNING, "No response from secondary STUN server.");
-            return NatType::FullCone; // Assume Full Cone NAT if no response
+            co_await stun_client->send_binding_request(stun_endpoint, mapped_endpoint);
+            mapped_endpoints.push_back(mapped_endpoint);
+            log(LogLevel::INFO, "Received mapped endpoint from " + stun_endpoint.address().to_string() + ": " + mapped_endpoint.address().to_string() + ":" + std::to_string(mapped_endpoint.port()));
+        } catch (const std::exception& ex) {
+            log(LogLevel::WARNING, "Failed to gather host candidate from " + stun_endpoint.address().to_string() + ": " + ex.what());
         }
-
-        // Compare MAPPED-ADDRESS
-        if (primary_mapped_address != secondary_mapped_address) {
-            return NatType::Symmetric; // Different MAPPED-ADDRESS implies Symmetric NAT
-        }
-
-        // Check if port is restricted
-        if (primary_mapped_address.port() != stun_server.port()) {
-            return NatType::PortRestrictedCone;
-        }
-
-        return NatType::RestrictedCone;
-    } catch (const std::exception& ex) {
-        log(LogLevel::ERROR, "NAT Type Detection Failed: " + std::string(ex.what()));
-        return NatType::Unknown;
     }
+
+    // Infer NAT type based on mapped_endpoints
+    detected_nat_type_ = infer_nat_type(mapped_endpoints);
+    if (on_nat_type_detected_) {
+        on_nat_type_detected_(detected_nat_type_);
+    }
+
+    log(LogLevel::INFO, "NAT type detection completed: " + std::to_string(static_cast<int>(detected_nat_type_)));
 }
 
 // Apply NAT traversal strategy based on detected NAT type

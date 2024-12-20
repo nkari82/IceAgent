@@ -55,7 +55,10 @@ enum class NatType {
     FullCone,
     RestrictedCone,
     PortRestrictedCone,
-    Symmetric
+    Symmetric,
+    SymmetricUDPFirewall,
+    SymmetricTCPFirewall,
+    Unknown
 };
 
 // Candidate 구조체 정의
@@ -105,6 +108,7 @@ public:
     using StateCallback = std::function<void(IceConnectionState)>;
     using CandidateCallback = std::function<void(const Candidate&)>;
     using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
+	using NatTypeCallback = std::function<void(NatType)>;
 
 	IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
              const std::string& stun_server1, const std::string& stun_server2, const std::string& turn_server);
@@ -113,10 +117,14 @@ public:
     void set_candidate_callback(CandidateCallback callback);
     void set_data_callback(DataCallback callback);
     void set_log_level(LogLevel level);
+	void set_nat_type_callback(NatTypeCallback cb);
     void set_signaling_client(std::shared_ptr<SignalingClient> signaling_client);
 
     void log(LogLevel level, const std::string& message);
 
+    // NAT Type Detection
+    awaitable<void> detect_nat_type();
+	
     awaitable<void> start();
     void send_data(const std::vector<uint8_t>& data);
     void add_remote_candidate(const Candidate& candidate);
@@ -130,7 +138,8 @@ private:
     asio::ip::udp::socket socket_;
     IceRole role_;
 	IceMode mode_;
-    std::string stun_server1_, stun_server2_, turn_server_;
+	std::vector<std::string> stun_servers_;
+    std::string turn_server_;
     IceConnectionState current_state_;
     asio::steady_timer keep_alive_timer_;
     std::vector<Candidate> local_candidates_;
@@ -140,9 +149,11 @@ private:
     StateCallback state_callback_;
     CandidateCallback candidate_callback_;
     DataCallback data_callback_;
+	NatTypeCallback on_nat_type_detected_;
     LogLevel log_level_;
+	NatType detected_nat_type_ = NatType::Unknown; // Store detected NAT type
     std::shared_ptr<SignalingClient> signaling_client_;
-    std::shared_ptr<StunClient> stun_client_;
+	std::vector<std::shared_ptr<StunClient>> stun_clients_;
 	
     // 재시도 및 타임아웃 설정
     int max_retries_ = 3;           // 최대 재시도 횟수
@@ -187,9 +198,6 @@ private:
     // STUN Binding Response 파싱
     asio::ip::udp::endpoint parse_stun_binding_response(const std::vector<uint8_t>& response, size_t length) const;
 
-    // NAT 유형 탐지
-    NatType detect_nat_type();
-
     // NAT 우회 전략 적용
     awaitable<void> apply_nat_traversal_strategy(NatType nat_type);
 
@@ -219,6 +227,9 @@ private:
 	
 	// QoS 기반 우선순위 재조정
     void adjust_priority_based_on_qos();
+	
+	// NAT Type Detection Helpers
+    NatType infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints);
 };
 
 #endif // ICE_AGENT_HPP
