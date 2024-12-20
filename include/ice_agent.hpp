@@ -69,9 +69,6 @@ struct Candidate {
     std::string foundation;
     int component_id;
     std::string transport;
-	double rtt = 0.0;
-    int packet_loss = 0;
-    double bandwidth = 0.0;
 };
 
 // Candidate Pair 상태 정의
@@ -89,10 +86,6 @@ struct CandidatePair {
     uint64_t priority;
     CandidatePairState state = CandidatePairState::Waiting;
     bool is_nominated = false;
-    int retry_count = 0; // 재시도 횟수
-	double rtt; // RTT 측정 값
-    int packet_loss; // 패킷 손실률
-    double bandwidth; // 대역폭
     asio::steady_timer timeout_timer; // 타임아웃 타이머
 
     CandidatePair(asio::io_context& io_context)
@@ -110,11 +103,13 @@ public:
     using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
 	using NatTypeCallback = std::function<void(NatType)>;
 
-	IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
-             const std::vector<std::string>& stun_servers, 
-			 const std::string& turn_server, 
-			 const std::string& turn_username, 
-			 const std::string& turn_password);
+	IceAgent(asio::io_context& io_context, 
+			IceRole role, 
+			IceMode mode,
+            const std::vector<std::string>& stun_servers, 
+			const std::string& turn_server, 
+			const std::string& turn_username, 
+			const std::string& turn_password);
 
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
@@ -129,13 +124,10 @@ public:
     awaitable<NatType> detect_nat_type();
 	
     awaitable<void> start();
+	
     void send_data(const std::vector<uint8_t>& data);
     void add_remote_candidate(const Candidate& candidate);
 	
-    // ICE Restart 관련
-    void send_restart_signal();
-    void on_receive_restart_signal();
-
 private:
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
@@ -156,13 +148,6 @@ private:
     LogLevel log_level_;
     std::shared_ptr<SignalingClient> signaling_client_;
 	std::vector<std::shared_ptr<StunClient>> stun_clients_;
-	
-    // 재시도 및 타임아웃 설정
-    int max_retries_ = 3;           // 최대 재시도 횟수
-    int pair_timeout_seconds_ = 5;  // Candidate Pair 검증 타임아웃
-
-    // 실패한 Pair 관리
-    std::unordered_set<std::string> failed_pairs_;
 
     // 로그 레벨 문자열 변환
     std::string nat_type_to_string(NatType nat_type) const;
@@ -192,9 +177,9 @@ private:
 	
     // Methods
     awaitable<void> gather_candidates();
+	awaitable<void> perform_turn_refresh()
     awaitable<void> perform_connectivity_checks();
-
-    awaitable<void> start_keep_alive();
+    awaitable<void> perform_keep_alive();
     awaitable<void> start_data_receive();
 
     // ICE Restart

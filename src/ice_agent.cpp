@@ -22,11 +22,16 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
     current_state_(IceConnectionState::New), 
 	keep_alive_timer_(io_context),
     log_level_(LogLevel::INFO) {
-   // Initialize StunClients for each STUN server
+    // Initialize StunClients for each STUN server
     for (const auto& server : stun_servers_) {
-        auto stun_client = std::make_shared<StunClient>(io_context_, server.substr(0, server.find(':')), 
-                                                       static_cast<uint16_t>(std::stoi(server.substr(server.find(':') + 1))), 
-                                                       ""); // Provide key if MESSAGE-INTEGRITY is used
+        size_t colon_pos = server.find(':');
+        if (colon_pos == std::string::npos) {
+            log(LogLevel::WARNING, "Invalid STUN server address: " + server);
+            continue;
+        }
+        std::string host = server.substr(0, colon_pos);
+        uint16_t port = static_cast<uint16_t>(std::stoi(server.substr(colon_pos + 1)));
+        auto stun_client = std::make_shared<StunClient>(io_context_, host, port, ""); // Provide key if needed
         stun_clients_.push_back(stun_client);
     }
 
@@ -34,11 +39,13 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
     if (!turn_server_.empty()) {
         size_t colon_pos = turn_server_.find(':');
         if (colon_pos == std::string::npos) {
-            throw std::invalid_argument("Invalid TURN server address.");
+            log(LogLevel::WARNING, "Invalid TURN server address: " + turn_server_);
         }
-        std::string host = turn_server_.substr(0, colon_pos);
-        uint16_t port = static_cast<uint16_t>(std::stoi(turn_server_.substr(colon_pos + 1)));
-        turn_client_ = std::make_shared<TurnClient>(io_context_, host, port, turn_username_, turn_password_);
+        else {
+            std::string host = turn_server_.substr(0, colon_pos);
+            uint16_t port = static_cast<uint16_t>(std::stoi(turn_server_.substr(colon_pos + 1)));
+            turn_client_ = std::make_shared<TurnClient>(io_context_, host, port, turn_username_, turn_password_);
+        }
     }
 }
 
@@ -130,25 +137,24 @@ awaitable<void> IceAgent::start() {
 				break;
 		}
 
-        // NAT 탐지 및 우회 전략 적용
-        log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
-        co_await apply_nat_traversal_strategy(nat_type);
-
         if (!transition_to_state(IceConnectionState::Checking)) {
             co_return;
         }
 
-        sort_candidate_pairs();
         co_await perform_connectivity_checks();
+		
+		if (current_state_ != IceConnectionState::Connected) {
+			// Spawn perform_keep_alive coroutine
+			co_spawn(io_context_, perform_keep_alive(), asio::detached);
+		
+			// Spawn perform_turn_refresh coroutine if TURN is used
+			if (turn_client_ && turn_client_->is_allocated()) {
+				co_spawn(io_context_, perform_turn_refresh(), asio::detached);
+			}
+		}
 
-        if (selected_pair_.is_nominated) {
-            if (transition_to_state(IceConnectionState::Connected)) {
-                start_keep_alive();
-                start_data_receive();
-            }
-        } else {
-            transition_to_state(IceConnectionState::Failed);
-        }
+		// Start data reception
+		co_await start_data_receive();
     } catch (const std::exception& ex) {
         log(LogLevel::ERROR, "Exception in ICE Agent: " + std::string(ex.what()));
         transition_to_state(IceConnectionState::Failed);
@@ -208,23 +214,41 @@ uint64_t IceAgent::calculate_priority(const Candidate& local, const Candidate& r
 // Sort candidate pairs based on priority
 void IceAgent::sort_candidate_pairs() {
     std::sort(candidate_pairs_.begin(), candidate_pairs_.end(), [&](const CandidatePair& a, const CandidatePair& b) {
-        // Higher priority first
-        if (a.local_candidate.priority != b.local_candidate.priority) {
             return a.local_candidate.priority > b.local_candidate.priority;
-        }
-        // Lower RTT first
-        return a.rtt < b.rtt;
     });
 }
 
 // Transition ICE state
 bool IceAgent::transition_to_state(IceConnectionState new_state) {
-    current_state_ = new_state;
-    if (state_callback_) {
-        state_callback_(current_state_);
-    }
-    log(LogLevel::INFO, "Transitioned to state: " + std::to_string(static_cast<int>(current_state_)));
-    return true;
+        switch (current_state_) {
+            case IceConnectionState::New:
+                if (new_state != IceConnectionState::Gathering) return false;
+                break;
+            case IceConnectionState::Gathering:
+                if (new_state != IceConnectionState::Checking && new_state != IceConnectionState::Failed) return false;
+                break;
+            case IceConnectionState::Checking:
+                if (new_state != IceConnectionState::Connected && new_state != IceConnectionState::Failed) return false;
+                break;
+            case IceConnectionState::Connected:
+                if (new_state != IceConnectionState::Disconnected) return false;
+                break;
+            case IceConnectionState::Disconnected:
+                return false; // 이미 Disconnected 상태에서는 다른 상태로 전환 불가
+            case IceConnectionState::Failed:
+                if (new_state != IceConnectionState::Disconnected) return false;
+                break;
+            case IceConnectionState::Reconnecting:
+                if (new_state != IceConnectionState::Connected && new_state != IceConnectionState::Failed) return false;
+                break;
+        }
+
+        current_state_ = new_state;
+        if (state_callback_) {
+            state_callback_(current_state_);
+        }
+        std::cout << "[IceAgent] State updated to: " << state_to_string(current_state_) << std::endl;
+        return true;
 }
 
 // NAT Type Inference Logic
@@ -280,9 +304,6 @@ awaitable<void> IceAgent::gather_candidates() {
 	
 	// Gather STUN candidates
 	co_await gather_host_candidates();
-	
-    // Gather TURN candidates
-    // co_await gather_relay_candidates();
 }
 
 // Gather local host candidates
@@ -366,28 +387,47 @@ awaitable<NatType> IceAgent::detect_nat_type() {
     // Infer NAT type based on mapped_endpoints
     NatType nat_type = infer_nat_type(mapped_endpoints);
 
-    log(LogLevel::INFO, "NAT type detected: " + std::to_string(static_cast<int>(nat_type)));
+	log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
 
     co_return nat_type;
 }
 
-awaitable<void> IceAgent::refresh_turn_allocation() {
-    if (!turn_client_ || !turn_client_->is_allocated()) {
-        co_return;
-    }
-
-    while (current_state_ == IceConnectionState::Connected) {
-        co_await turn_client_->refresh_allocation();
-        log(LogLevel::INFO, "Refreshed TURN allocation.");
-        keep_alive_timer_.expires_after(std::chrono::seconds(300)); // Refresh every 5 minutes
+// 주기적인 TURN 할당 갱신 메서드
+awaitable<void> IceAgent::perform_turn_refresh() {
+    while (current_state_ == IceConnectionState::Connected && turn_client_ && turn_client_->is_allocated()) {
+        // Set the timer for the TURN allocation refresh interval, e.g., 5 minutes
+        keep_alive_timer_.expires_after(std::chrono::minutes(5));
         co_await keep_alive_timer_.async_wait(asio::use_awaitable);
+
+        log(LogLevel::INFO, "Refreshing TURN allocation.");
+
+        try {
+            co_await turn_client_->allocate_relay(); // Re-allocate or refresh as needed
+            log(LogLevel::INFO, "TURN allocation refreshed successfully.");
+        }
+        catch (const std::exception& ex) {
+            log(LogLevel::ERROR, "Failed to refresh TURN allocation: " + std::string(ex.what()));
+            // Optional: Implement retry logic or handle failure
+        }
     }
 
     co_return;
 }
 
 // Start Keep-Alive messages
-awaitable<void> IceAgent::start_keep_alive() {
+awaitable<void> IceAgent::perform_keep_alive() {
+    while (current_state_ == IceConnectionState::Connected) {
+        // Set the timer for the keep-alive interval, e.g., 30 seconds
+        keep_alive_timer_.expires_after(std::chrono::seconds(30));
+        co_await keep_alive_timer_.async_wait(asio::use_awaitable);
+
+        log(LogLevel::INFO, "Performing periodic connectivity check (Keep-Alive).");
+
+        // Perform connectivity checks
+        co_await perform_connectivity_checks();
+    }
+
+    co_return;
 }
 
 // Start receiving data
@@ -539,6 +579,8 @@ awaitable<void> IceAgent::gather_srflx_candidates() {
 awaitable<void> IceAgent::perform_connectivity_checks() {
     log(LogLevel::INFO, "Performing connectivity checks...");
 
+	sort_candidate_pairs();
+	
     for (auto& pair : candidate_pairs_) {
         if (pair.state == CandidatePairState::Succeeded || pair.is_nominated) {
             continue; // 이미 성공했거나 지명된 경우 건너뜁니다.
@@ -726,13 +768,7 @@ awaitable<void> IceAgent::perform_connectivity_checks() {
                 break; // Controlled 피어는 더 이상 검사할 필요가 없으므로 루프를 종료합니다.
             }
         }
-		
-		// QoS 데이터 수집 (RTT 측정)
-        co_await measure_rtt(pair);
 	}
-	
-    // QoS 기반 우선순위 재조정
-    adjust_priority_based_on_qos();
 
     // After all checks
     bool any_succeeded = false;
