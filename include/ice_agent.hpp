@@ -182,21 +182,14 @@ private:
     // Local Candidate 수집
     awaitable<void> gather_local_candidates();
 
-    // TURN Candidate 수집
-    awaitable<void> gather_turn_candidates();
-
 	// TURN related
-    awaitable<void> gather_relay_candidates();
+    awaitable<void> gather_relay_candidates(); // turn과 relay는 같은 것?
 	
     // STUN Candidate 수집
     awaitable<void> gather_host_candidates();
 	
-    // TURN Allocate Request 생성
-    std::vector<uint8_t> create_turn_allocate_request() const;
-
-    // TURN Allocate Response 파싱
-    Candidate parse_turn_allocate_response(const std::vector<uint8_t>& response, size_t length) const;
-
+	awaitable<void> gather_srflx_candidates();
+	
     // NAT 우회 전략 적용
     awaitable<void> apply_nat_traversal_strategy(NatType nat_type);
 

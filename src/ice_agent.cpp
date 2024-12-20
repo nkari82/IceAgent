@@ -94,17 +94,33 @@ awaitable<void> IceAgent::start() {
 		// Step 2: Gather Candidates
         co_await gather_candidates();
 
-        // Step 3: NAT Traversal Strategies (e.g., UDP Hole Punching, TURN Relay)
-        // Depending on NAT type, decide whether to gather relay candidates
-        if (nat_type == NatType::Symmetric || nat_type == NatType::SymmetricUDPFirewall) {
-            if (turn_client_) {
-                log(LogLevel::INFO, "Gathering relay candidates via TURN...");
-                co_await gather_relay_candidates();
-            } else {
-                log(LogLevel::WARNING, "Symmetric NAT detected but TURN server not configured.");
-            }
-        }
-
+		switch (nat_type) {
+			case NatType::FullCone:
+			case NatType::RestrictedCone:
+			case NatType::PortRestrictedCone:
+				// These NAT types generally allow for successful peer-to-peer connections.
+				// Prioritize gathering server reflexive (srflx) candidates.
+				log(LogLevel::INFO, "Detected NAT type supports direct peer-to-peer connections. Gathering srflx candidates.");
+				co_await gather_srflx_candidates();
+				break;
+			case NatType::Symmetric:
+			case NatType::SymmetricUDPFirewall:
+				// Symmetric NATs may require relay candidates via TURN.
+				log(LogLevel::INFO, "Detected Symmetric NAT. Gathering relay candidates via TURN.");
+				if (turn_client_) {
+					co_await gather_relay_candidates();
+				} else {
+					log(LogLevel::WARNING, "TURN server not configured. Relay candidates cannot be gathered.");
+				}
+				break;
+			case NatType::OpenInternet:
+				// No NAT; direct connections are straightforward.
+				log(LogLevel::INFO, "No NAT detected. Direct peer-to-peer connections are straightforward.");
+				break;
+			default:
+				log(LogLevel::WARNING, "Unknown NAT type. Proceeding with default candidate gathering.");
+				break;
+		}
 
         // NAT 탐지 및 우회 전략 적용
         log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
@@ -254,7 +270,7 @@ awaitable<void> IceAgent::gather_candidates() {
 	co_await gather_host_candidates();
 	
     // Gather TURN candidates
-    co_await gather_turn_candidates();
+    // co_await gather_relay_candidates();
 }
 
 // Gather local host candidates
@@ -314,83 +330,6 @@ awaitable<void> IceAgent::gather_host_candidates() {
     } catch (const std::exception& ex) {
         log(LogLevel::WARNING, "Failed to gather host candidate: " + std::string(ex.what()));
     }
-}
-
-// Gather TURN relay candidates
-awaitable<void> IceAgent::gather_turn_candidates() {
-    log(LogLevel::INFO, "Gathering TURN candidates...");
-    try {
-        asio::ip::udp::resolver resolver(io_context_);
-        asio::ip::udp::resolver::results_type endpoints = co_await resolver.async_resolve(turn_server_, "3478", asio::use_awaitable);
-        asio::ip::udp::endpoint turn_endpoint = *endpoints.begin();
-
-        // TURN Allocate 요청
-        std::vector<uint8_t> allocate_request = create_turn_allocate_request();
-        co_await socket_.async_send_to(asio::buffer(allocate_request), turn_endpoint, asio::use_awaitable);
-        log(LogLevel::INFO, "TURN Allocate request sent to: " + turn_endpoint.address().to_string() + ":" + std::to_string(turn_endpoint.port()));
-
-        // 응답 수신
-        std::vector<uint8_t> response(1024);
-        asio::ip::udp::endpoint sender_endpoint;
-        size_t length = co_await socket_.async_receive_from(asio::buffer(response), sender_endpoint, asio::use_awaitable);
-
-        // 응답 검증
-        if (sender_endpoint != turn_endpoint) {
-            log(LogLevel::WARNING, "Invalid TURN Allocate response from unexpected endpoint.");
-            co_return;
-        }
-
-        Candidate relay_candidate = parse_turn_allocate_response(response, length);
-        local_candidates_.push_back(relay_candidate);
-        if (candidate_callback_) {
-            candidate_callback_(relay_candidate);
-        }
-
-        log(LogLevel::INFO, "TURN Relay Candidate gathered: " + relay_candidate.endpoint.address().to_string() + ":" + std::to_string(relay_candidate.endpoint.port()));
-    } catch (const std::exception& ex) {
-        log(LogLevel::ERROR, "Failed to gather TURN candidates: " + std::string(ex.what()));
-    }
-    co_return;
-}
-
-// Create TURN Allocate Request
-std::vector<uint8_t> IceAgent::create_turn_allocate_request() const {
-    std::vector<uint8_t> request(20, 0);
-    request[0] = 0x00; // TURN Allocate Request
-    request[1] = 0x03;
-    request[4] = 0x21; // Magic Cookie
-    request[5] = 0x12;
-    request[6] = 0xA4;
-    request[7] = 0x42;
-
-    // Attributes (e.g., Requested Transport: UDP)
-    uint16_t attribute_type = 0x0019; // REQUESTED-TRANSPORT
-    uint16_t attribute_length = 4;
-    request.push_back((attribute_type >> 8) & 0xFF);
-    request.push_back(attribute_type & 0xFF);
-    request.push_back((attribute_length >> 8) & 0xFF);
-    request.push_back(attribute_length & 0xFF);
-
-    request.push_back(0x11);  // UDP Transport
-    request.push_back(0x00);
-    request.push_back(0x00);
-    request.push_back(0x00);
-
-    return request;
-}
-
-// Parse TURN Allocate Response
-Candidate IceAgent::parse_turn_allocate_response(const std::vector<uint8_t>& response, size_t length) const {
-    Candidate relay_candidate;
-    relay_candidate.priority = 100; // Example priority for TURN Candidates
-    relay_candidate.type = "relay";
-    relay_candidate.transport = "UDP";
-
-    // 실제 STUN/TURN 메시지 파싱 구현 필요
-    // 여기서는 예제로 고정된 Relay Address 사용
-    relay_candidate.endpoint = asio::ip::udp::endpoint(asio::ip::address::from_string("203.0.113.1"), 40000);
-
-    return relay_candidate;
 }
 
 // Detect NAT Type using STUN
@@ -617,6 +556,46 @@ awaitable<void> IceAgent::gather_relay_candidates() {
         }
     } catch (const std::exception& ex) {
         log(LogLevel::ERROR, "Failed to allocate relay via TURN: " + std::string(ex.what()));
+    }
+
+    co_return;
+}
+
+// Gather Server Reflexive (srflx) Candidates
+awaitable<void> IceAgent::gather_srflx_candidates() {
+    log(LogLevel::INFO, "Gathering server reflexive (srflx) candidates...");
+
+    for (auto& stun_client : stun_clients_) {
+        asio::ip::udp::endpoint mapped_endpoint;
+        try {
+            co_await stun_client->send_binding_request(mapped_endpoint);
+            // Create srflx candidate
+            Candidate srflx_candidate;
+            srflx_candidate.endpoint = mapped_endpoint;
+            srflx_candidate.priority = 800; // Lower priority than host candidates
+            srflx_candidate.type = "srflx";
+            srflx_candidate.foundation = "SRFLX1";
+            srflx_candidate.component_id = 1;
+            srflx_candidate.transport = "UDP";
+
+            local_candidates_.push_back(srflx_candidate);
+            log(LogLevel::INFO, "Added srflx candidate: " +
+                srflx_candidate.endpoint.address().to_string() + ":" +
+                std::to_string(srflx_candidate.endpoint.port()));
+
+            // Notify via callback
+            if (on_candidate_) {
+                on_candidate_(srflx_candidate);
+            }
+
+            // Create Candidate Pair with srflx Candidate
+            CandidatePair pair(io_context_);
+            pair.local_candidate = srflx_candidate;
+            // remote_candidate will be added when remote candidates are received
+            candidate_pairs_.push_back(pair);
+        } catch (const std::exception& ex) {
+            log(LogLevel::WARNING, "Failed to gather srflx candidate from " + stun_client->get_server() + ": " + ex.what());
+        }
     }
 
     co_return;

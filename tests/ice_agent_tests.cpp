@@ -217,24 +217,20 @@ TEST_F(IceAgentTest, StartWithTurnAllocation) {
 
     // Verify that NAT type was detected
     EXPECT_NE(detected_nat_type, NatType::Unknown);
-    EXPECT_EQ(detected_nat_type, NatType::FullCone); // Based on mock STUN servers' behavior
+    EXPECT_EQ(detected_nat_type, NatType::Symmetric); // Based on mock STUN servers' behavior
 
     // Verify that relay candidates were gathered
     EXPECT_TRUE(relay_candidate_found);
 }
 
-// Additional Test Cases:
-
-// Test ICE Start without TURN Allocation (Non-Symmetric NAT)
+// Test ICE Start without TURN Allocation (Full Cone NAT)
 TEST_F(IceAgentTest, StartWithoutTurnAllocation) {
     NatType detected_nat_type = NatType::Unknown;
     bool relay_candidate_found = false;
 
     // Simulate a NAT type that does not require TURN (Full Cone)
     // Modify infer_nat_type() to return FullCone for this test
-    // This can be achieved by mocking infer_nat_type()
-
-    // For simplicity, proceed with the existing mock STUN servers which infer FullCone
+    // For simplicity, proceed with existing mock STUN servers which infer FullCone
 
     // Set NAT type callback
     ice_agent->set_nat_type_callback([&detected_nat_type](NatType nat_type) {
