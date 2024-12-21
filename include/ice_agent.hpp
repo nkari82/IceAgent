@@ -123,11 +123,11 @@ struct CandidatePair {
 struct CheckListEntry {
     CandidatePair pair;
     CandidatePairState state;
-    bool nominated;
+    bool is_nominated;
     bool in_progress; // 추가됨
 
     CheckListEntry(const CandidatePair& cp)
-        : pair(cp), state(CandidatePairState::New), nominated(false), in_progress(false) {}
+        : pair(cp), state(CandidatePairState::New), is_nominated(false), in_progress(false) {}
 };
 
 // 콜백 typedefs
@@ -235,7 +235,6 @@ private:
     asio::awaitable<NatType> detect_nat_type();
     asio::awaitable<void> gather_candidates();
     asio::awaitable<void> gather_local_candidates();
-    asio::awaitable<void> gather_host_candidates();
     asio::awaitable<void> gather_srflx_candidates();
     asio::awaitable<void> gather_relay_candidates();
     asio::awaitable<void> perform_connectivity_checks();
@@ -253,6 +252,10 @@ private:
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> handle_incoming_signaling_messages();
     std::vector<uint8_t> generate_transaction_id();
+
+    // Thread pool 관리
+    std::vector<std::thread> thread_pool_;
+    void initialize_thread_pool(size_t num_threads = std::thread::hardware_concurrency());
 };
 
 #endif // ICE_AGENT_HPP
