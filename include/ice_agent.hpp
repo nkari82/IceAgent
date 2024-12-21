@@ -4,9 +4,6 @@
 #define ICE_AGENT_HPP
 
 #include <asio.hpp>
-#if 0
-#include <asio/ssl.hpp>
-#endif
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -21,28 +18,31 @@
 #include "stun_client.hpp"
 #include "turn_client.hpp"
 #include "signaling_client.hpp"
-#include "hash_vector.hpp"
+#include "stun_message.hpp"
 
+// ICE 모드 정의
 enum class IceMode {
     Full,
     Lite
 };
 
+// ICE 역할 정의
 enum class IceRole {
     Controller,
     Controlled
 };
 
+// ICE 연결 상태 정의
 enum class IceConnectionState {
     New,
     Gathering,
     Checking,
     Connected,
-    Failed,
-    Frozen,    // 추가됨
-    Paused     // 추가됨
+    Completed,
+    Failed
 };
 
+// NAT 타입 정의
 enum class NatType {
     Unknown,
     OpenInternet,
@@ -52,6 +52,7 @@ enum class NatType {
     Symmetric
 };
 
+// 로그 레벨 정의
 enum class LogLevel {
     DEBUG,
     INFO,
@@ -59,7 +60,7 @@ enum class LogLevel {
     ERROR
 };
 
-// Candidate structure
+// Candidate 구조체
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
     std::string type; // "host", "srflx", "relay"
@@ -68,7 +69,7 @@ struct Candidate {
     int component_id;
     std::string transport;
 
-    // Convert Candidate to SDP format
+    // Candidate를 SDP 형식으로 변환
     std::string to_sdp() const {
         std::ostringstream oss;
         oss << "candidate:" << foundation << " " << component_id << " " << transport << " "
@@ -76,9 +77,8 @@ struct Candidate {
         return oss.str();
     }
 
-    // Create Candidate from SDP format
+    // SDP 형식에서 Candidate 생성
     static Candidate from_sdp(const std::string& sdp_line) {
-        // Example SDP line: "a=candidate:1 1 UDP 2122252543 192.168.1.2 54400 typ host"
         Candidate cand;
         size_t colon_pos = sdp_line.find(':');
         if (colon_pos != std::string::npos) {
@@ -96,7 +96,7 @@ struct Candidate {
     }
 };
 
-// Enumerations for Candidate Pair State
+// Candidate Pair 상태 정의
 enum class CandidatePairState {
     New,
     InProgress,
@@ -105,7 +105,7 @@ enum class CandidatePairState {
     Nominated
 };
 
-// Candidate Pair structure
+// Candidate Pair 구조체
 struct CandidatePair {
     Candidate local_candidate;
     Candidate remote_candidate;
@@ -113,7 +113,7 @@ struct CandidatePair {
     CandidatePairState state;
     bool is_nominated;
 
-    // Constructor
+    // 생성자
     CandidatePair() = default;
     CandidatePair(const Candidate& local, const Candidate& remote)
         : local_candidate(local), remote_candidate(remote), priority(0), state(CandidatePairState::New), is_nominated(false) {}
@@ -130,7 +130,7 @@ struct CheckListEntry {
         : pair(cp), state(CandidatePairState::New), nominated(false), in_progress(false) {}
 };
 
-// Callback typedefs
+// 콜백 typedefs
 using StateCallback = std::function<void(IceConnectionState)>;
 using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
@@ -144,10 +144,10 @@ struct IceAttributes {
     // 추가적인 ICE-specific attributes
 };
 
-// Maximum concurrent connectivity checks
+// 최대 동시 연결 검사 수
 constexpr size_t MAX_CONCURRENT_CHECKS = 5;
 
-// Number of ICE components (예: RTP, RTCP)
+// ICE 컴포넌트 수 (예: RTP, RTCP)
 constexpr int NUM_COMPONENTS = 2;
 
 // IceAgent 클래스 정의
@@ -160,7 +160,7 @@ public:
              const std::string& turn_password = "");
     ~IceAgent();
     
-    // Setters for callbacks
+    // 콜백 설정
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
     void set_data_callback(DataCallback callback);
@@ -168,25 +168,21 @@ public:
     void set_nominate_callback(NominateCallback cb); // 추가됨
     void set_signaling_client(std::shared_ptr<SignalingClient> signaling_client);
 
-    // Set log level
+    // 로그 레벨 설정
     void set_log_level(LogLevel level);
 
-    // Start ICE process
+    // ICE 프로세스 시작
     asio::awaitable<void> start();
 
-    // Restart ICE process
+    // ICE 프로세스 재시작
     asio::awaitable<void> restart_ice();
 
-    // Send data over established connection
+    // 연결된 소켓을 통해 데이터 전송
     void send_data(const std::vector<uint8_t>& data);
 
-    // Add remote candidate received via signaling
+    // 신호를 통해 수신된 원격 후보 추가
     void add_remote_candidate(const Candidate& candidate);
 
-    // 상태 전이 메서드
-    void freeze();
-    void pause();
-    void resume();
 
 private:
     asio::io_context& io_context_;
@@ -199,10 +195,9 @@ private:
     std::string turn_password_;
     IceConnectionState current_state_;
     asio::steady_timer keep_alive_timer_;
-    asio::steady_timer concurrency_timer_; // 추가됨
     LogLevel log_level_;
 
-    // Candidates
+    // 후보 리스트
     std::vector<Candidate> local_candidates_;
     std::vector<Candidate> remote_candidates_;
     std::vector<CandidatePair> candidate_pairs_;
@@ -211,34 +206,28 @@ private:
     std::vector<CheckListEntry> check_list_;
     std::mutex check_list_mutex_;
 
-    // STUN and TURN clients
+    // STUN 및 TURN 클라이언트
     std::vector<std::shared_ptr<StunClient>> stun_clients_;
     std::shared_ptr<TurnClient> turn_client_;
 
-    // Signaling client
+    // 신호 클라이언트
     std::shared_ptr<SignalingClient> signaling_client_;
 
-    // Callbacks
+    // 콜백들
     StateCallback state_callback_;
     CandidateCallback candidate_callback_;
     DataCallback data_callback_;
     NatTypeCallback on_nat_type_detected_;
     NominateCallback nominate_callback_; // 추가됨
 
-    // Candidate Pair Management
+    // Candidate Pair 관리
     CandidatePair nominated_pair_;
     bool connectivity_checks_running_;
 
     // ICE-specific attributes
     IceAttributes ice_attributes_;
 
-    // SSL context for DTLS
-	#if 0
-    asio::ssl::context ssl_context_;
-    std::unique_ptr<asio::ssl::stream<asio::ip::udp::socket>> ssl_stream_;
-	#endif
-
-    // Role negotiation
+    // 역할 협상
     IceRole remote_role_;
 
     // Private Methods
@@ -256,22 +245,14 @@ private:
     asio::awaitable<void> perform_turn_refresh();
     asio::awaitable<void> start_data_receive();
     NatType infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints);
-    uint64_t calculate_priority(const Candidate& local, const Candidate& remote) const;
+    uint32_t calculate_priority(const Candidate& local, const Candidate& remote) const;
     void sort_candidate_pairs();
     void log(LogLevel level, const std::string& message);
     std::string nat_type_to_string(NatType nat_type) const;
-
-    // Nomination methods
-    void nominate_pair(CheckListEntry& entry);
-    asio::awaitable<void> send_nominate(const CandidatePair& pair);
-
-    // ICE Restart methods
-    void initiate_ice_restart();
-    asio::awaitable<void> handle_incoming_signaling_messages();
-    std::vector<Candidate> parse_candidates_from_message(const std::string& message);
-
-    // 역할 협상 메서드
     void negotiate_role(IceRole remote_role);
+    asio::awaitable<void> send_nominate(const CandidatePair& pair);
+    asio::awaitable<void> handle_incoming_signaling_messages();
+    std::vector<uint8_t> generate_transaction_id();
 };
 
 #endif // ICE_AGENT_HPP
