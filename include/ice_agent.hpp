@@ -4,6 +4,7 @@
 #define ICE_AGENT_HPP
 
 #include <asio.hpp>
+#include <asio/ssl.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -13,6 +14,8 @@
 #include <functional>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
+#include <iomanip>
 #include "stun_client.hpp"
 #include "turn_client.hpp"
 #include "signaling_client.hpp"
@@ -91,9 +94,10 @@ struct CheckListEntry {
     CandidatePair pair;
     CandidatePairState state;
     bool nominated;
+    bool in_progress; // 추가됨
     
     CheckListEntry(const CandidatePair& cp)
-        : pair(cp), state(CandidatePairState::New), nominated(false) {}
+        : pair(cp), state(CandidatePairState::New), nominated(false), in_progress(false) {}
 };
 
 // Callback typedefs
@@ -148,6 +152,11 @@ public:
     // Add remote candidate received via signaling
     void add_remote_candidate(const Candidate& candidate);
 
+    // 상태 전이 메서드
+    void freeze();
+    void pause();
+    void resume();
+
 private:
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
@@ -159,6 +168,7 @@ private:
     std::string turn_password_;
     IceConnectionState current_state_;
     asio::steady_timer keep_alive_timer_;
+    asio::steady_timer concurrency_timer_; // 추가됨
     LogLevel log_level_;
 
     // Candidates
@@ -191,6 +201,13 @@ private:
     // ICE-specific attributes
     IceAttributes ice_attributes_;
 
+    // SSL context for DTLS
+    asio::ssl::context ssl_context_;
+    std::shared_ptr<asio::ssl::stream<asio::ip::udp::socket>> ssl_stream_;
+
+    // Role negotiation
+    IceRole remote_role_;
+
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<NatType> detect_nat_type();
@@ -219,6 +236,9 @@ private:
     void initiate_ice_restart();
     asio::awaitable<void> handle_incoming_signaling_messages();
     std::vector<Candidate> parse_candidates_from_message(const std::string& message);
+
+    // 역할 협상 메서드
+    void negotiate_role(IceRole remote_role);
 };
 
 #endif // ICE_AGENT_HPP
