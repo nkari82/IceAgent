@@ -3,29 +3,36 @@
 #ifndef STUN_MESSAGE_HPP
 #define STUN_MESSAGE_HPP
 
-#include <cstdint>
 #include <vector>
 #include <string>
-#include <map>
+#include <unordered_map>
+#include <cstdint>
+#include <stdexcept>
+#include <random>
+#include <algorithm>
+#include "hmac_sha1.hpp" // HMAC-SHA1 구현체
+#include "crc32.hpp"      // CRC32 구현체
 
-// STUN 메시지 기본 헤더 크기
-constexpr size_t STUN_HEADER_SIZE = 20;
-
-// STUN 메시지 타입
-constexpr uint16_t STUN_BINDING_REQUEST = 0x0001;
-constexpr uint16_t STUN_BINDING_RESPONSE_SUCCESS = 0x0101;
-constexpr uint16_t STUN_BINDING_INDICATION = 0x0111;
+enum StunMessageType {
+    STUN_BINDING_REQUEST = 0x0001,
+    STUN_BINDING_RESPONSE_SUCCESS = 0x0101,
+    STUN_BINDING_RESPONSE_ERROR = 0x0111,
+    STUN_BINDING_INDICATION = 0x0011
+    // 추가적인 STUN 메시지 타입 정의
+};
 
 // Attribute Types
-constexpr uint16_t STUN_ATTR_USERNAME = 0x0006;
-constexpr uint16_t STUN_ATTR_PASSWORD = 0x0007;
-constexpr uint16_t STUN_ATTR_MESSAGE_INTEGRITY = 0x0008;
-constexpr uint16_t STUN_ATTR_FINGERPRINT = 0x8028;
-constexpr uint16_t STUN_ATTR_USE_CANDIDATE = 0x000C;
-constexpr uint16_t STUN_ATTR_PRIORITY = 0x0024;
-constexpr uint16_t STUN_ATTR_ICE_CONTROLLING = 0x802A;
-constexpr uint16_t STUN_ATTR_ICE_CONTROLLED = 0x802B;
-constexpr uint16_t STUN_ATTR_MAPPED_ADDRESS = 0x0001;
+enum StunAttributeType {
+	STUN_ATTR_USERNAME = 0x0006;
+	STUN_ATTR_PASSWORD = 0x0007;
+	STUN_ATTR_MESSAGE_INTEGRITY = 0x0008;
+	STUN_ATTR_FINGERPRINT = 0x8028;
+	STUN_ATTR_USE_CANDIDATE = 0x000C; // 0x0011
+	STUN_ATTR_PRIORITY = 0x0024;
+	STUN_ATTR_ICE_CONTROLLING = 0x802A; // 0x8029
+	STUN_ATTR_ICE_CONTROLLED = 0x802B;
+	STUN_ATTR_MAPPED_ADDRESS = 0x0001;
+}
 
 struct StunAttribute {
     uint16_t type;
@@ -34,33 +41,36 @@ struct StunAttribute {
 
 class StunMessage {
 public:
-    StunMessage(uint16_t type, const std::vector<uint8_t>& transaction_id);
-    StunMessage(uint16_t type, const std::vector<uint8_t>& transaction_id, const std::map<std::string, std::string>& attributes);
-
-    void add_attribute(const std::string& name, const std::string& value);
-    void add_attribute(const std::string& name, const std::vector<uint8_t>& value);
-    void add_attribute(const std::string& name, uint32_t value);
-
+    StunMessage(StunMessageType type, const std::vector<uint8_t>& transaction_id);
+    StunMessageType get_type() const;
+    std::vector<uint8_t> get_transaction_id() const;
+    
+    void add_attribute(StunAttributeType attr, const std::string& value);
+    void add_attribute(StunAttributeType attr, const std::vector<uint8_t>& value);
+    void add_message_integrity(const std::string& key);
+    void add_fingerprint();
+    
     std::vector<uint8_t> serialize() const;
     std::vector<uint8_t> serialize_without_attributes(const std::vector<std::string>& exclude_attributes) const;
-    std::vector<uint8_t> serialize_without_attribute(const std::string& exclude_attribute) const;
-
+    
     static StunMessage parse(const std::vector<uint8_t>& data);
-
-    bool verify_message_integrity(const std::string& password) const;
+    
+    bool verify_message_integrity(const std::string& key) const;
     bool verify_fingerprint() const;
-
-    std::string get_attribute(const std::string& name) const;
-    uint16_t get_type() const;
-    std::vector<uint8_t> get_transaction_id() const;
-
+    
+    bool has_attribute(StunAttributeType attr) const;
+    std::string get_attribute(StunAttributeType attr) const;
+    
+    static std::vector<uint8_t> generate_transaction_id();
+    
 private:
-    uint16_t type_;
+    StunMessageType type_;
     std::vector<uint8_t> transaction_id_;
-    std::vector<StunAttribute> attributes_;
-
-    // Helper functions
+    std::unordered_map<uint16_t, std::vector<uint8_t>> attributes_;
+    
+    // Helper methods for parsing and serialization
     void parse_attributes(const std::vector<uint8_t>& data);
+    std::vector<uint8_t> calculate_fingerprint() const;
 };
 
 #endif // STUN_MESSAGE_HPP
