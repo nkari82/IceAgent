@@ -30,14 +30,20 @@ void SignalingClient::close() {
 
 std::string SignalingClient::create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates) {
     std::ostringstream oss;
-    oss << "v=0\n"
-        << "o=- 46117343 2 IN IP4 127.0.0.1\n"
-        << "s=-\n"
-        << "t=0 0\n"
-        << "a=ice-ufrag:" << ufrag << "\n"
-        << "a=ice-pwd:" << pwd << "\n";
+    oss << "v=0\r\n"
+        << "o=- 0 0 IN IP4 " << get_local_ip() << "\r\n"
+        << "s=-\r\n"
+        << "c=IN IP4 " << get_local_ip() << "\r\n"
+        << "t=0 0\r\n"
+        << "a=ice-ufrag:" << ufrag << "\r\n"
+        << "a=ice-pwd:" << pwd << "\r\n";
     for(const auto& cand : candidates) {
-        oss << "a=" << cand << "\n";
+        oss << cand << "\r\n";
+    }
+    if(role_ == IceRole::Controller) {
+        oss << "a=ice-controlling:" << tie_breaker_ << "\r\n";
+    } else if(role_ == IceRole::Controlled) {
+        oss << "a=ice-controlled:" << tie_breaker_ << "\r\n";
     }
     return oss.str();
 }
@@ -57,6 +63,7 @@ std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string
         else if (line.find("a=candidate:") == 0) {
             candidates.push_back(line.substr(2)); // Remove 'a='
         }
+		// Handle ICE-CONTROLLING and ICE-CONTROLLED if needed
     }
     return {ufrag, pwd};
 }

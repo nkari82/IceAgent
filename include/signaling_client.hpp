@@ -30,6 +30,8 @@ private:
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     asio::ip::udp::endpoint remote_endpoint_;
+	uint32_t tie_breaker_;
+	IceRole role_;
     
     // Helper methods
     std::string create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates);
