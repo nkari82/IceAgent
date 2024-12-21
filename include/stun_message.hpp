@@ -139,10 +139,23 @@ public:
         length_ += 4 + value.size() + ((value.size() % 4) ? (4 - (value.size() % 4)) : 0);
     }
 
+    bool has_attribute(const std::string& type) const {
+        return std::any_of(attributes_.begin(), attributes_.end(),
+                           [&](const StunAttribute& attr) { return attr.type == type; });
+    }
+	
     // Getters
     uint16_t get_type() const { return type_; }
     const std::vector<uint8_t>& get_transaction_id() const { return transaction_id_; }
     const std::vector<StunAttribute>& get_attributes() const { return attributes_; }
+	std::vector<uint8_t> get_attribute(const std::string& type) const {
+        auto it = std::find_if(attributes_.begin(), attributes_.end(),
+                               [&](const StunAttribute& attr) { return attr.type == type; });
+        if (it != attributes_.end()) {
+            return it->value;
+        }
+        return {};
+    }
 
     // Setters
     void set_type(uint16_t type) { type_ = type; }
@@ -162,3 +175,44 @@ private:
 };
 
 #endif // STUN_MESSAGE_HPP
+
+// Inside StunMessage class (가정: StunMessage는 RFC 5389를 기반으로 구현됨)
+
+// Inside stun_message.hpp
+struct StunAttribute {
+    std::string type;
+    std::string value;
+};
+
+// TEST
+class StunMessage {
+public:
+    // Existing methods...
+    
+    // Add ICE-specific attribute
+    void add_attribute(const std::string& type, const std::string& value) {
+        attributes_.emplace_back(StunAttribute{type, value});
+    }
+    
+    // Check if attribute exists
+    bool has_attribute(const std::string& type) const {
+        return std::any_of(attributes_.begin(), attributes_.end(),
+                           [&](const StunAttribute& attr) { return attr.type == type; });
+    }
+    
+    // Get attribute value
+    std::string get_attribute(const std::string& type) const {
+        auto it = std::find_if(attributes_.begin(), attributes_.end(),
+                               [&](const StunAttribute& attr) { return attr.type == type; });
+        if (it != attributes_.end()) {
+            return it->value;
+        }
+        return "";
+    }
+
+    // 기존 parse 및 serialize 메서드 수정 필요
+    // 예를 들어, PRIORITY, USE-CANDIDATE, etc. 처리
+private:
+    // Existing members...
+    std::vector<StunAttribute> attributes_;
+};

@@ -68,6 +68,10 @@ void IceAgent::set_nat_type_callback(NatTypeCallback cb) {
     on_nat_type_detected_ = cb;
 }
 
+void IceAgent::set_nominate_callback(NominateCallback cb) {
+    nominate_callback_ = std::move(cb);
+}
+
 void IceAgent::set_signaling_client(std::shared_ptr<SignalingClient> signaling_client) {
     signaling_client_ = signaling_client;
 }
@@ -144,6 +148,14 @@ asio::awaitable<void> IceAgent::start() {
                 break;
         }
 
+        // Exchange ICE parameters via signaling
+        if (signaling_client_) {
+            signaling_client_->send_ice_parameters(ice_attributes_.username_fragment, ice_attributes_.password, local_candidates_);
+        }
+
+        // Spawn a coroutine to handle incoming signaling messages
+        co_spawn(io_context_, handle_incoming_signaling_messages(), asio::detached);
+
         if (!transition_to_state(IceConnectionState::Checking)) {
             co_return;
         }
@@ -186,7 +198,14 @@ asio::awaitable<void> IceAgent::restart_ice() {
     remote_candidates_.clear();
     log(LogLevel::INFO, "ICE state reset.");
 
-    // Restart ICE process
+    // Generate new ICE credentials
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, 255);
+    ice_attributes_.username_fragment = "u" + std::to_string(dis(gen)) + std::to_string(dis(gen));
+    ice_attributes_.password = "p" + std::to_string(dis(gen)) + std::to_string(dis(gen));
+
+    // Gather new candidates and restart ICE
     co_await start();
 }
 
@@ -211,7 +230,8 @@ void IceAgent::send_data(const std::vector<uint8_t>& data) {
 void IceAgent::add_remote_candidate(const Candidate& candidate) {
     remote_candidates_.push_back(candidate);
     log(LogLevel::INFO, "Added remote candidate: " + candidate.type + " - " +
-        candidate.endpoint.address().to_string() + ":" + std::to_string(candidate.endpoint.port()));
+        candidate.endpoint.address().to_string() + ":" + std::to_string(candidate.endpoint.port()) +
+        " [Component " + std::to_string(candidate.component_id) + "]");
 
     // Notify via callback
     if (candidate_callback_) {
@@ -220,9 +240,11 @@ void IceAgent::add_remote_candidate(const Candidate& candidate) {
 
     // Create Candidate Pairs
     for (const auto& local : local_candidates_) {
-        CandidatePair pair(local, candidate);
-        pair.priority = calculate_priority(local, candidate);
-        check_list_.emplace_back(pair);
+        if (local.component_id == candidate.component_id) { // 동일한 컴포넌트에 대해만 쌍을 만듦
+            CandidatePair pair(local, candidate);
+            pair.priority = calculate_priority(local, candidate);
+            check_list_.emplace_back(pair);
+        }
     }
 
     // Perform connectivity checks if not already running
@@ -518,7 +540,7 @@ asio::awaitable<void> IceAgent::perform_connectivity_checks() {
     size_t active_checks = 0;
 
     for (auto& entry : check_list_) {
-        if (entry.succeeded || entry.failed || entry.in_progress) {
+        if (entry.state == CandidatePairState::Succeeded || entry.state == CandidatePairState::Failed || entry.in_progress) {
             continue; // 이미 완료된 경우 건너뜁니다.
         }
 
@@ -535,11 +557,15 @@ asio::awaitable<void> IceAgent::perform_connectivity_checks() {
         co_spawn(io_context_, [this, &entry, &active_checks]() -> asio::awaitable<void> {
             try {
                 co_await perform_single_connectivity_check(entry);
-                entry.succeeded = true;
+                entry.state = CandidatePairState::Succeeded;
                 log(LogLevel::INFO, "Connectivity succeeded for pair.");
-                nominate_pair(entry); // 성공 시 지명
+                // Nominate if Controller
+                if (role_ == IceRole::Controller) {
+                    entry.nominated = true;
+                    co_await send_nominate(entry.pair);
+                }
             } catch (const std::exception& ex) {
-                entry.failed = true;
+                entry.state = CandidatePairState::Failed;
                 log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
             }
             entry.in_progress = false;
@@ -567,7 +593,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         std::generate(transaction_id.begin(), transaction_id.end(), []() { return rand() % 256; });
 
         Stun::StunMessage connectivity_check(STUN_BINDING_REQUEST, transaction_id);
-        // Add PRIORITY attribute
+        // Add PRIORITY attribute as per RFC 8445
         connectivity_check.add_attribute("PRIORITY", std::to_string(pair.local_candidate.priority));
         // Add ICE-specific attributes if needed
 
@@ -612,6 +638,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         }
 
         // Additional attribute verifications can be added here
+        // 예: mapped address 확인, XOR-MAPPED-ADDRESS 등
 
         co_return;
     }
@@ -657,7 +684,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
 void IceAgent::evaluate_connectivity_results() {
     bool any_succeeded = false;
     for (auto& entry : check_list_) {
-        if (entry.succeeded && !entry.is_nominated) {
+        if (entry.state == CandidatePairState::Succeeded && !entry.nominated) {
             nominate_pair(entry);
             any_succeeded = true;
             break; // Nominate the first successful pair
@@ -674,25 +701,25 @@ void IceAgent::evaluate_connectivity_results() {
 
 // Nominate a successful candidate pair
 void IceAgent::nominate_pair(CheckListEntry& entry) {
-    entry.is_nominated = true;
+    entry.nominated = true;
     nominated_pair_ = entry.pair;
 
     // Send NOMINATE message to the remote peer
     asio::co_spawn(io_context_, send_nominate(entry.pair), asio::detached);
 
-    log(LogLevel::INFO, "Nominate pair with " +
+    log(LogLevel::INFO, "Nominated pair with " +
         entry.pair.remote_candidate.endpoint.address().to_string() + ":" +
         std::to_string(entry.pair.remote_candidate.endpoint.port()) +
         " [Component " + std::to_string(entry.pair.local_candidate.component_id) + "]");
 }
 
-// Send NOMINATE message using STUN Binding Indication
+// Send NOMINATE message using STUN Binding Indication with USE-CANDIDATE attribute
 asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
     std::vector<uint8_t> transaction_id(12);
     std::generate(transaction_id.begin(), transaction_id.end(), []() { return rand() % 256; });
 
     Stun::StunMessage nominate_msg(STUN_BINDING_INDICATION, transaction_id);
-    // Add USE-CANDIDATE attribute
+    // Add USE-CANDIDATE attribute as per RFC 8445
     nominate_msg.add_attribute("USE-CANDIDATE", ""); // Value is typically empty
 
     std::vector<uint8_t> serialized_nominate = nominate_msg.serialize();
@@ -817,15 +844,96 @@ void IceAgent::initiate_ice_restart() {
     }
 }
 
-// Handle incoming signaling messages (예시)
-void IceAgent::handle_incoming_signaling_messages(const std::string& message) {
-    // Parse the signaling message and take appropriate actions
-    // For example, detect ICE Restart request and handle accordingly
-    if (message == "ICE_RESTART") {
-        log(LogLevel::INFO, "Received ICE Restart request from peer.");
-        asio::co_spawn(io_context_, restart_ice(), asio::detached);
+// Handle incoming signaling messages and process NOMINATE attribute
+asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
+    while (current_state_ != IceConnectionState::Failed) {
+        std::string message = co_await signaling_client_->receive_message();
+        // Parse the message and extract ICE parameters
+        // 예시: "ICE_PARAMETERS username=<username_fragment> password=<password> candidates=<candidates>"
+        if (message.find("ICE_PARAMETERS") != std::string::npos) {
+            // Extract username_fragment, password, and candidates from the message
+            // 실제 구현에서는 프로토콜에 맞는 파싱 로직 필요
+            // 예시 값 할당
+            // ice_attributes_.username_fragment = extracted_username_fragment;
+            // ice_attributes_.password = extracted_password;
+            // std::vector<Candidate> remote_cands = extracted_candidates;
+    
+            // 예시:
+            ice_attributes_.username_fragment = "uRemoteFrag"; // 실제 값으로 교체
+            ice_attributes_.password = "pRemotePass"; // 실제 값으로 교체
+    
+            // Extract and add remote candidates
+            std::vector<Candidate> remote_cands = parse_candidates_from_message(message);
+            for (const auto& cand : remote_cands) {
+                add_remote_candidate(cand);
+            }
+        }
+        else if (message.find("ICE_RESTART") != std::string::npos) {
+            // Handle ICE Restart
+            log(LogLevel::INFO, "Received ICE Restart request from peer.");
+            // Extract new ICE credentials if provided
+            // 예시: "ICE_RESTART username=<new_fragment> password=<new_password>"
+            // ice_attributes_.username_fragment = extracted_new_fragment;
+            // ice_attributes_.password = extracted_new_password;
+    
+            // For simplicity, assume new credentials are already generated and set
+            co_await restart_ice();
+        }
+        // Handle other signaling messages as needed
     }
-    // Handle other signaling messages as needed
+    co_return;
+}
+
+// Example function to parse candidates from signaling message
+std::vector<Candidate> IceAgent::parse_candidates_from_message(const std::string& message) {
+    std::vector<Candidate> candidates;
+    // Implement parsing logic based on signaling protocol (e.g., SDP)
+    // 예시:
+    // Extract candidate lines and construct Candidate structs
+    // 실제 구현은 프로토콜에 맞게 파싱 필요
+
+    // Placeholder 예시:
+    // Assume candidates are separated by commas and formatted as "type address:port:component_id:transport"
+    size_t pos = message.find("candidates=");
+    if (pos != std::string::npos) {
+        std::string cand_str = message.substr(pos + 11); // "candidates=" 길이만큼 건너뜀
+        size_t start = 0;
+        size_t end = cand_str.find(',');
+        while (end != std::string::npos) {
+            std::string cand = cand_str.substr(start, end - start);
+            // Parse cand into Candidate struct
+            // 예시: "srflx 192.168.1.2:3478:1:UDP"
+            size_t space_pos = cand.find(' ');
+            if (space_pos != std::string::npos) {
+                std::string type = cand.substr(0, space_pos);
+                std::string addr_port = cand.substr(space_pos + 1);
+                size_t colon1 = addr_port.find(':');
+                size_t colon2 = addr_port.find(':', colon1 + 1);
+                size_t colon3 = addr_port.find(':', colon2 + 1);
+                if (colon1 != std::string::npos && colon2 != std::string::npos && colon3 != std::string::npos) {
+                    std::string ip = addr_port.substr(0, colon1);
+                    uint16_t port = static_cast<uint16_t>(std::stoi(addr_port.substr(colon1 + 1, colon2 - colon1 - 1)));
+                    int component_id = std::stoi(addr_port.substr(colon2 + 1, colon3 - colon2 - 1));
+                    std::string transport = addr_port.substr(colon3 + 1);
+                    
+                    Candidate candidate_parsed;
+                    candidate_parsed.type = type;
+                    candidate_parsed.endpoint = asio::ip::udp::endpoint(asio::ip::make_address_v4(ip), port);
+                    candidate_parsed.component_id = component_id;
+                    candidate_parsed.transport = transport;
+                    // Set priority and foundation as needed
+                    candidate_parsed.priority = 800; // 예시 값
+                    candidate_parsed.foundation = "SRFLX1"; // 예시 값
+
+                    candidates.push_back(candidate_parsed);
+                }
+            }
+            start = end + 1;
+            end = cand_str.find(',', start);
+        }
+    }
+
+    return candidates;
 }
 
 // Perform connectivity checks for a single CheckListEntry

@@ -32,7 +32,9 @@ enum class IceConnectionState {
     Gathering,
     Checking,
     Connected,
-    Failed
+    Failed,
+    Frozen,    // 추가됨
+    Paused     // 추가됨
 };
 
 enum class NatType {
@@ -75,24 +77,23 @@ struct CandidatePair {
     Candidate local_candidate;
     Candidate remote_candidate;
     uint32_t priority;
-    CandidatePairState state = CandidatePairState::New;
-    bool is_nominated = false;
-
+    CandidatePairState state;
+    bool is_nominated;
+    
     // Constructor
     CandidatePair() = default;
     CandidatePair(const Candidate& local, const Candidate& remote)
-        : local_candidate(local), remote_candidate(remote) {}
+        : local_candidate(local), remote_candidate(remote), priority(0), state(CandidatePairState::New), is_nominated(false) {}
 };
 
-// Check List Entry 구조체 추가
+// Check List Entry 구조체
 struct CheckListEntry {
     CandidatePair pair;
-    bool in_progress;
-    bool succeeded;
-    bool failed;
-
+    CandidatePairState state;
+    bool nominated;
+    
     CheckListEntry(const CandidatePair& cp)
-        : pair(cp), in_progress(false), succeeded(false), failed(false) {}
+        : pair(cp), state(CandidatePairState::New), nominated(false) {}
 };
 
 // Callback typedefs
@@ -100,6 +101,7 @@ using StateCallback = std::function<void(IceConnectionState)>;
 using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
 using NatTypeCallback = std::function<void(NatType)>;
+using NominateCallback = std::function<void(const CandidatePair&)>;
 
 // ICE-specific STUN Attributes (예시)
 struct IceAttributes {
@@ -128,6 +130,7 @@ public:
     void set_candidate_callback(CandidateCallback callback);
     void set_data_callback(DataCallback callback);
     void set_nat_type_callback(NatTypeCallback cb);
+    void set_nominate_callback(NominateCallback cb); // 추가됨
     void set_signaling_client(std::shared_ptr<SignalingClient> signaling_client);
 
     // Set log level
@@ -179,6 +182,7 @@ private:
     CandidateCallback candidate_callback_;
     DataCallback data_callback_;
     NatTypeCallback on_nat_type_detected_;
+    NominateCallback nominate_callback_; // 추가됨
 
     // Candidate Pair Management
     CandidatePair nominated_pair_;
@@ -213,7 +217,8 @@ private:
 
     // ICE Restart methods
     void initiate_ice_restart();
-    void handle_incoming_signaling_messages(const std::string& message);
+    asio::awaitable<void> handle_incoming_signaling_messages();
+    std::vector<Candidate> parse_candidates_from_message(const std::string& message);
 };
 
 #endif // ICE_AGENT_HPP
