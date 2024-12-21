@@ -15,6 +15,7 @@
 #include <mutex>
 #include <atomic>
 #include <iomanip>
+#include <sstream>
 #include "stun_client.hpp"
 #include "turn_client.hpp"
 #include "signaling_client.hpp"
@@ -60,7 +61,7 @@ enum class LogLevel {
     ERROR
 };
 
-// Candidate Pair Structures
+// Candidate 구조체
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
     uint32_t priority;
@@ -70,8 +71,8 @@ struct Candidate {
     std::string transport;
 
     std::string to_sdp() const {
-        // Implement SDP representation
-        // Example: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
+        // SDP 표현 구현
+        // 예시: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
         std::ostringstream oss;
         oss << "candidate:" << foundation << " " << component_id << " " << transport << " " << priority << " "
             << endpoint.address().to_string() << " " << endpoint.port() << " typ " << type;
@@ -79,12 +80,12 @@ struct Candidate {
     }
 
     static Candidate from_sdp(const std::string& sdp) {
-        // Implement parsing from SDP string
-        // Example SDP line: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
+        // SDP 문자열로부터 파싱 구현
+        // 예시 SDP 라인: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
         Candidate cand;
         std::istringstream iss(sdp);
         std::string prefix;
-        iss >> prefix; // "a=candidate:1"
+        iss >> prefix; // "candidate:1"
         size_t colon_pos = prefix.find(':');
         if (colon_pos != std::string::npos) {
             cand.foundation = prefix.substr(colon_pos + 1);
@@ -93,10 +94,11 @@ struct Candidate {
         iss >> cand.transport;
         iss >> cand.priority;
         std::string ip;
+        uint16_t port;
         iss >> ip;
-        iss >> cand.endpoint.port();
+        iss >> port;
         asio::ip::address address = asio::ip::make_address(ip);
-        cand.endpoint = asio::ip::udp::endpoint(address, cand.endpoint.port());
+        cand.endpoint = asio::ip::udp::endpoint(address, port);
         std::string typ;
         iss >> typ; // "typ"
         iss >> cand.type;
@@ -152,7 +154,7 @@ struct IceAttributes {
     // 추가적인 ICE-specific attributes
 };
 
-// IceAgent 클래스 정의
+// IceAgent 클래스 선언
 class IceAgent : public std::enable_shared_from_this<IceAgent> {
 public:
     IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
@@ -190,6 +192,7 @@ public:
     void add_remote_candidate(const Candidate& candidate);
 
 private:
+    // Member Variables
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
@@ -205,7 +208,6 @@ private:
     // 후보 리스트
     std::vector<Candidate> local_candidates_;
     std::vector<Candidate> remote_candidates_;
-    std::vector<CandidatePair> candidate_pairs_;
 
     // Check List
     std::vector<CheckListEntry> check_list_;
@@ -239,7 +241,11 @@ private:
     size_t candidate_gather_retries_;
     std::chrono::seconds connectivity_check_timeout_;
     size_t connectivity_check_retries_;
-	
+
+    // Thread pool 관리
+    std::vector<std::thread> thread_pool_;
+    void initialize_thread_pool(size_t num_threads = std::thread::hardware_concurrency());
+
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<NatType> detect_nat_type();
@@ -262,10 +268,8 @@ private:
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> handle_incoming_signaling_messages();
     std::vector<uint8_t> generate_transaction_id();
-
-    // Thread pool 관리
-    std::vector<std::thread> thread_pool_;
-    void initialize_thread_pool(size_t num_threads = std::thread::hardware_concurrency());
+	void nominate_pair(CheckListEntry& entry);
+	asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);
 };
 
 #endif // ICE_AGENT_HPP
