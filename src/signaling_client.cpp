@@ -1,58 +1,84 @@
 // src/signaling_client.cpp
 
 #include "signaling_client.hpp"
-#include <iostream>
+#include <stdexcept>
 #include <sstream>
+#include <algorithm>
 
-SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& remote_host, uint16_t remote_port, uint16_t local_port)
-    : io_context_(io_context),
-      socket_(io_context, asio::ip::udp::endpoint(asio::ip::udp::v4(), local_port)) {
-    asio::ip::udp::resolver resolver(io_context_);
-    asio::ip::udp::resolver::results_type results = resolver.resolve(remote_host, std::to_string(remote_port));
-    remote_endpoint_ = *results.begin();
+// Constructor
+SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& server, uint16_t port)
+    : io_context_(io_context), socket_(io_context) {
+    asio::ip::tcp::resolver resolver(io_context_);
+    auto endpoints = resolver.resolve(server, std::to_string(port));
+    asio::connect(socket_, endpoints);
 }
 
+// Destructor
+SignalingClient::~SignalingClient() {
+    std::error_code ec;
+    socket_.close(ec);
+}
+
+// Create SDP with ICE attributes
+std::string SignalingClient::create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates, IceMode mode) {
+    std::string sdp = "v=0\r\n"
+                      "o=- 0 0 IN IP4 127.0.0.1\r\n"
+                      "s=ICE Agent\r\n"
+                      "c=IN IP4 0.0.0.0\r\n"
+                      "t=0 0\r\n"
+                      "a=ice-ufrag:" + ufrag + "\r\n" +
+                      "a=ice-pwd:" + pwd + "\r\n";
+
+    // ICE Mode 설정
+    if (mode == IceMode::Lite) {
+        sdp += "a=ice-lite\r\n";
+    } else {
+        // Full ICE의 경우, 역할 협상은 SDP 교환 시 상호 합의에 따라 결정됩니다.
+        // 여기서는 기본적으로 a=ice-controlling 또는 a=ice-controlled를 추가하지 않음
+    }
+
+    // 후보 추가
+    for (const auto& cand : candidates) {
+        sdp += cand + "\r\n";
+    }
+
+    return sdp;
+}
+
+// Send SDP to remote peer
 asio::awaitable<void> SignalingClient::send_sdp(const std::string& sdp) {
-    co_await socket_.async_send_to(asio::buffer(sdp), remote_endpoint_, asio::use_awaitable);
+    // Send SDP length first (uint32_t in network byte order)
+    uint32_t sdp_length = htonl(static_cast<uint32_t>(sdp.size()));
+    std::vector<uint8_t> buffer;
+    buffer.resize(4);
+    std::memcpy(buffer.data(), &sdp_length, 4);
+    co_await asio::async_write(socket_, asio::buffer(buffer), asio::use_awaitable);
+
+    // Send SDP content
+    co_await asio::async_write(socket_, asio::buffer(sdp), asio::use_awaitable);
 }
 
+// Receive SDP from remote peer
 asio::awaitable<std::string> SignalingClient::receive_sdp() {
-    std::vector<char> recv_buffer(65536);
-    asio::ip::udp::endpoint sender_endpoint;
-    size_t bytes_received = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
-    std::string sdp(recv_buffer.data(), bytes_received);
-    co_return sdp;
+    // Receive SDP length first
+    std::vector<uint8_t> length_buffer(4);
+    co_await asio::async_read(socket_, asio::buffer(length_buffer), asio::use_awaitable);
+    uint32_t sdp_length = ntohl(*(reinterpret_cast<uint32_t*>(length_buffer.data())));
+
+    // Receive SDP content
+    std::vector<char> sdp_buffer(sdp_length);
+    co_await asio::async_read(socket_, asio::buffer(sdp_buffer), asio::use_awaitable);
+
+    return std::string(sdp_buffer.begin(), sdp_buffer.end());
 }
 
-void SignalingClient::close() {
-    socket_.close();
-}
-
-std::string SignalingClient::create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates) {
-    std::ostringstream oss;
-    oss << "v=0\r\n"
-        << "o=- 0 0 IN IP4 " << get_local_ip() << "\r\n"
-        << "s=-\r\n"
-        << "c=IN IP4 " << get_local_ip() << "\r\n"
-        << "t=0 0\r\n"
-        << "a=ice-ufrag:" << ufrag << "\r\n"
-        << "a=ice-pwd:" << pwd << "\r\n";
-    for(const auto& cand : candidates) {
-        oss << cand << "\r\n";
-    }
-    if(role_ == IceRole::Controller) {
-        oss << "a=ice-controlling:" << tie_breaker_ << "\r\n";
-    } else if(role_ == IceRole::Controlled) {
-        oss << "a=ice-controlled:" << tie_breaker_ << "\r\n";
-    }
-    return oss.str();
-}
-
+// Parse SDP and extract ICE attributes
 std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string& sdp, std::vector<std::string>& candidates) {
     std::istringstream iss(sdp);
     std::string line;
     std::string ufrag;
     std::string pwd;
+
     while (std::getline(iss, line)) {
         if (line.find("a=ice-ufrag:") == 0) {
             ufrag = line.substr(12);
@@ -61,9 +87,10 @@ std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string
             pwd = line.substr(10);
         }
         else if (line.find("a=candidate:") == 0) {
-            candidates.push_back(line.substr(2)); // Remove 'a='
+            candidates.push_back(line);
         }
-		// Handle ICE-CONTROLLING and ICE-CONTROLLED if needed
+        // 추가적인 ICE 속성 파싱 가능
     }
-    return {ufrag, pwd};
+
+    return { ufrag, pwd };
 }

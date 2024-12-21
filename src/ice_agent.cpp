@@ -1,21 +1,20 @@
-// src/ice_agent.cpp
-
 #include "ice_agent.hpp"
+#include "stun_message.hpp"
+#include "stun_client.hpp"
+#include "turn_client.hpp"
+#include "signaling_client.hpp"
+#include "hmac_sha1.hpp"
+#include "crc32.hpp"
 #include <iostream>
 #include <thread>
 #include <cstdlib>
 #include <random>
-#include <asio/ssl.hpp>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <openssl/err.h>
-#include <openssl/sha.h>
-#include <zlib.h> // For CRC32
+#include <iomanip>
+#include <algorithm>
+#include <chrono>
 
-// Constants for STUN message types
-constexpr uint16_t STUN_BINDING_REQUEST = 0x0001;
-constexpr uint16_t STUN_BINDING_RESPONSE_SUCCESS = 0x0101;
-constexpr uint16_t STUN_BINDING_INDICATION = 0x0111;
+constexpr int NUM_COMPONENTS = 1; // ICE 컴포넌트 수 (예: RTP, RTCP)
+constexpr size_t MAX_CONCURRENT_CHECKS = 5; // 최대 동시 연결 검사 수
 
 // Constructor
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
@@ -185,25 +184,34 @@ asio::awaitable<void> IceAgent::start() {
             co_spawn(io_context_, handle_incoming_signaling_messages(), asio::detached);
         }
 
-        if (!transition_to_state(IceConnectionState::Checking)) {
-            co_return;
-        }
+		if (mode_ == IceMode::Full) {
+			if (!transition_to_state(IceConnectionState::Checking)) {
+				co_return;
+			}
 
-        // Perform connectivity checks
-        co_await perform_connectivity_checks();
-        
-        if (current_state_ == IceConnectionState::Connected) {
-            // Spawn perform_keep_alive coroutine
-            co_spawn(io_context_, perform_keep_alive(), asio::detached);
-        
-            // Spawn perform_turn_refresh coroutine if TURN is used
-            if (turn_client_ && turn_client_->is_allocated()) {
-                co_spawn(io_context_, perform_turn_refresh(), asio::detached);
-            }
+			// Perform connectivity checks
+			co_await perform_connectivity_checks();
+		}
+		else {
+			// ICE Lite 모드에서는 Connectivity Checks를 수행하지 않음
+            log(LogLevel::INFO, "ICE Lite mode: Skipping connectivity checks.");
+            transition_to_state(IceConnectionState::Connected); // 직접 연결 상태로 전환
+            // **ICE Lite**는 상대방이 **Full ICE**를 수행한다고 가정하므로, **Nominated Pair**를 기다립니다.
+            // 따라서, **Nominated Pair**를 받으면 `add_remote_candidate`를 통해 처리하게 됩니다.
+		}
+		
+		if (current_state_ == IceConnectionState::Connected) {
+			// Spawn perform_keep_alive coroutine
+			co_spawn(io_context_, perform_keep_alive(), asio::detached);
+		
+			// Spawn perform_turn_refresh coroutine if TURN is used
+			if (turn_client_ && turn_client_->is_allocated()) {
+				co_spawn(io_context_, perform_turn_refresh(), asio::detached);
+			}
 
-            // Start data reception
-            asio::co_spawn(io_context_, start_data_receive(), asio::detached);
-        }
+			// Start data reception
+			asio::co_spawn(io_context_, start_data_receive(), asio::detached);
+		}
     } catch (const std::exception& ex) {
         log(LogLevel::ERROR, "Exception in ICE Agent: " + std::string(ex.what()));
         transition_to_state(IceConnectionState::Failed);
@@ -343,7 +351,7 @@ std::string IceAgent::nat_type_to_string(NatType nat_type) const {
     }
 }
 
-// Calculate priority based on RFC 8445
+// RFC 8445에 따른 우선순위 계산
 uint32_t IceAgent::calculate_priority(const Candidate& local, const Candidate& remote) const {
     uint32_t type_pref;
     if (local.type == "host") type_pref = 126;
@@ -351,9 +359,10 @@ uint32_t IceAgent::calculate_priority(const Candidate& local, const Candidate& r
     else if (local.type == "relay") type_pref = 0;
     else type_pref = 0; // 기본값
 
-    uint32_t local_pref = 65535; // 고유한 로컬 선호도 설정 가능
+    uint32_t local_pref = 65535; // Host 후보의 고유한 로컬 선호도
     uint32_t component_id = static_cast<uint32_t>(local.component_id);
 
+    // Priority = (Type Preference << 24) | (Local Preference << 8) | (256 - Component ID)
     return (type_pref << 24) | (local_pref << 8) | (256 - component_id);
 }
 
@@ -374,32 +383,6 @@ std::vector<uint8_t> IceAgent::generate_transaction_id() {
         byte = static_cast<uint8_t>(dis(gen));
     }
     return txn_id;
-}
-
-// Calculate HMAC-SHA1 for MESSAGE-INTEGRITY
-std::vector<uint8_t> IceAgent::calculate_hmac_sha1(const Stun::StunMessage& message, const std::string& key) {
-    unsigned char* result;
-    unsigned int len = SHA_DIGEST_LENGTH;
-    std::vector<uint8_t> hmac(len);
-
-    // Prepare the message for HMAC calculation (before MESSAGE-INTEGRITY and FINGERPRINT)
-    std::vector<uint8_t> msg = message.serialize_without_attributes({"MESSAGE-INTEGRITY", "FINGERPRINT"});
-
-    result = HMAC(EVP_sha1(), key.c_str(), key.length(), msg.data(), msg.size(), nullptr, nullptr);
-    if (result == nullptr) {
-        throw std::runtime_error("HMAC calculation failed.");
-    }
-    std::copy(result, result + len, hmac.begin());
-    return hmac;
-}
-
-// Calculate CRC32 for FINGERPRINT
-uint32_t IceAgent::calculate_crc32(const Stun::StunMessage& message) {
-    // Prepare the message for CRC calculation (up to the last attribute before FINGERPRINT)
-    std::vector<uint8_t> msg = message.serialize_without_attribute("FINGERPRINT");
-    uint32_t crc = crc32(0L, Z_NULL, 0);
-    crc = crc32(crc, msg.data(), msg.size());
-    return crc ^ 0x5354554E;
 }
 
 // Transition ICE state
@@ -668,26 +651,45 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
 // Perform connectivity checks with enhanced Check List management
 asio::awaitable<void> IceAgent::perform_connectivity_checks() {
     log(LogLevel::INFO, "Performing connectivity checks...");
-
     sort_candidate_pairs();
-
+	
     size_t attempts = 0;
     while (attempts < connectivity_check_retries_) {
         try {
-            for (auto& entry : check_list_) {
-                if (entry.state == CandidatePairState::New && !entry.in_progress) {
-                    entry.in_progress = true;
-                    co_await perform_single_connectivity_check(entry);
-                    entry.state = CandidatePairState::Succeeded;
-                    log(LogLevel::INFO, "Connectivity succeeded for pair.");
-                    // Nominate if Controller
-                    if (role_ == IceRole::Controller) {
-                        entry.is_nominated = true;
-                        co_await send_nominate(entry.pair);
-                    }
-                    entry.in_progress = false;
-                }
-            }
+			std::atomic<size_t> active_checks{0};
+			size_t total_pairs = check_list_.size();
+			size_t checked_pairs = 0;
+			
+			while (checked_pairs < total_pairs) {
+				for (auto& entry : check_list_) {
+					if (entry.state == CandidatePairState::New && !entry.in_progress && active_checks < MAX_CONCURRENT_CHECKS) {
+						entry.in_progress = true;
+						active_checks++;
+
+						// Spawn coroutine for each connectivity check
+						co_spawn(io_context_, [this, &entry, &active_checks, &checked_pairs]() -> asio::awaitable<void> {
+							try {
+								co_await perform_single_connectivity_check(entry);
+								entry.state = CandidatePairState::Succeeded;
+								log(LogLevel::INFO, "Connectivity succeeded for pair.");
+								if (role_ == IceRole::Controller) {
+									entry.is_nominated = true;
+									co_await send_nominate(entry.pair);
+								}
+							} catch (const std::exception& ex) {
+								entry.state = CandidatePairState::Failed;
+								log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
+							}
+							entry.in_progress = false;
+							active_checks--;
+							checked_pairs++;
+						}, asio::detached);
+					}
+				}
+
+				// Wait a bit before checking again
+				co_await asio::steady_timer(io_context_, std::chrono::milliseconds(100)).async_wait(asio::use_awaitable);
+			}
 
             // Evaluate results
             evaluate_connectivity_results();
@@ -715,11 +717,11 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
     if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
         // Connectivity check using STUN Binding Request
         std::vector<uint8_t> txn_id = generate_transaction_id();
-        Stun::StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
+        StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
         binding_request.add_attribute("PRIORITY", std::to_string(pair.local_candidate.priority));
         binding_request.add_attribute("USERNAME", ice_attributes_.username_fragment);
-        binding_request.add_attribute("MESSAGE-INTEGRITY", calculate_hmac_sha1(binding_request, ice_attributes_.password));
-        binding_request.add_attribute("FINGERPRINT", calculate_crc32(binding_request));
+        binding_request.add_attribute("MESSAGE-INTEGRITY", hmac_sha1(password_, binding_request.serialize_without_attributes({ "MESSAGE-INTEGRITY", "FINGERPRINT" })));
+        binding_request.add_attribute("FINGERPRINT", calculate_crc32(binding_request.serialize_without_attribute("FINGERPRINT")));
         std::vector<uint8_t> serialized_request = binding_request.serialize();
 
         // Send Binding Request
@@ -747,7 +749,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         }
 
         recv_buffer.resize(bytes_received);
-        Stun::StunMessage response = Stun::StunMessage::parse(recv_buffer);
+        StunMessage response = StunMessage::parse(recv_buffer);
 
         // Verify response
         if (response.get_transaction_id() != txn_id) {
@@ -868,50 +870,6 @@ void IceAgent::nominate_pair(CheckListEntry& entry) {
     // Controlled 역할은 NOMINATE를 수행하지 않음
 }
 
-// Send NOMINATE message using STUN Binding Indication with USE-CANDIDATE attribute
-asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
-    std::vector<uint8_t> txn_id = generate_transaction_id();
-
-    Stun::StunMessage nominate_msg(STUN_BINDING_INDICATION, txn_id);
-    // Add USE-CANDIDATE attribute as per RFC 8445
-    nominate_msg.add_attribute("USE-CANDIDATE", "");
-    // Add ICE-CONTROLLING if Controller
-    if (role_ == IceRole::Controller) {
-        // Generate a unique tie-breaker value
-        std::uniform_int_distribution<uint32_t> dist(0, 0xFFFFFFFF);
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        uint32_t tie_breaker = dist(gen);
-        nominate_msg.add_attribute("ICE-CONTROLLING", std::to_string(tie_breaker));
-    }
-
-    // Add MESSAGE-INTEGRITY
-    nominate_msg.add_attribute("MESSAGE-INTEGRITY", calculate_hmac_sha1(nominate_msg, ice_attributes_.password));
-
-    // Add FINGERPRINT
-    nominate_msg.add_attribute("FINGERPRINT", calculate_crc32(nominate_msg));
-
-    std::vector<uint8_t> serialized_nominate = nominate_msg.serialize();
-    co_await socket_.async_send_to(asio::buffer(serialized_nominate), pair.remote_candidate.endpoint, asio::use_awaitable);
-
-    log(LogLevel::INFO, "Sent NOMINATE to " +
-        pair.remote_candidate.endpoint.address().to_string() + ":" +
-        std::to_string(pair.remote_candidate.endpoint.port()) +
-        " [Component " + std::to_string(pair.local_candidate.component_id) + "]");
-
-    // **응답 처리**: RFC 8445에서는 NOMINATE 메시지에 대한 응답을 요구하지 않으므로, 별도의 응답 처리는 필요하지 않습니다.
-    // 그러나, NOMINATE 전송 완료를 알리기 위해 내부 상태를 업데이트하거나 콜백을 트리거할 수 있습니다.
-
-    // **내부 상태 업데이트**: 이미 `nominate_pair` 함수에서 `is_nominated`을 설정했으므로, 별도의 상태 업데이트는 필요하지 않습니다.
-
-    // **콜백 트리거**: 콜백을 통해 외부에 NOMINATE 전송 완료를 알립니다.
-    if (nominate_callback_) {
-        nominate_callback_(pair);
-    }
-
-    co_return;
-}
-
 // Implement connectivity keep-alive
 asio::awaitable<void> IceAgent::perform_keep_alive() {
     while (current_state_ == IceConnectionState::Connected) {
@@ -992,7 +950,7 @@ void IceAgent::nominate_pair(CheckListEntry& entry) {
 asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
     std::vector<uint8_t> txn_id = generate_transaction_id();
 
-    Stun::StunMessage nominate_msg(STUN_BINDING_INDICATION, txn_id);
+    StunMessage nominate_msg(STUN_BINDING_INDICATION, txn_id);
     // Add USE-CANDIDATE attribute as per RFC 8445
     nominate_msg.add_attribute("USE-CANDIDATE", "");
     // Add ICE-CONTROLLING if Controller
@@ -1022,31 +980,6 @@ asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
     // Trigger nominate callback if set
     if (nominate_callback_) {
         nominate_callback_(pair);
-    }
-}
-
-// ICE Restart initiation (사용하는 곳이 없다._
-void IceAgent::initiate_ice_restart() {
-    if (mode_ == IceMode::Lite) {
-        log(LogLevel::WARNING, "ICE Restart is not supported in ICE Lite mode.");
-        return;
-    }
-
-    log(LogLevel::INFO, "Initiating ICE Restart...");
-
-    // Reset existing state
-    current_state_ = IceConnectionState::New;
-    nominated_pair_ = CandidatePair();
-    check_list_.clear();
-    candidate_pairs_.clear();
-    remote_candidates_.clear();
-
-    // Gather new candidates and restart ICE
-    asio::co_spawn(io_context_, start(), asio::detached);
-
-    // Inform remote peer via signaling (e.g., SDP with new ICE credentials)
-    if (signaling_client_) {
-        signaling_client_->send_ice_restart();
     }
 }
 
@@ -1093,7 +1026,7 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
                 if (!ec && bytes_received > 0) {
                     recv_buffer.resize(bytes_received);
                     try {
-                        Stun::StunMessage msg = Stun::StunMessage::parse(recv_buffer);
+                        StunMessage msg = StunMessage::parse(recv_buffer);
                         if (msg.get_type() == STUN_BINDING_INDICATION) {
                             // Handle Binding Indication (e.g., USE-CANDIDATE)
                             co_await handle_binding_indication(msg, sender_endpoint);
@@ -1112,13 +1045,10 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
 }
 
 // Handle Binding Indication messages (USE-CANDIDATE) from Controller
-asio::awaitable<void> IceAgent::handle_binding_indication(const Stun::StunMessage& msg, const asio::ip::udp::endpoint& sender) {
+asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender) {
     // Extract USE-CANDIDATE attribute
     if (msg.has_attribute("USE-CANDIDATE")) {
         // Controlled 역할에서 NOMINATE 메시지를 받으면, 해당 페어를 후보로 선정합니다.
-        // 예를 들어, 페어가 이미 Succeeded 상태라면, 이를 Nominated 상태로 설정합니다.
-
-        // 여기서는 예시로 첫 번째 Succeeded 페어를 Nominated 상태로 설정합니다.
         for (auto& entry : check_list_) {
             if (entry.state == CandidatePairState::Succeeded && !entry.is_nominated) {
                 entry.is_nominated = true;
@@ -1149,7 +1079,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
     if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
         // Connectivity check using STUN Binding Request
         std::vector<uint8_t> txn_id = generate_transaction_id();
-        Stun::StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
+        StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
         binding_request.add_attribute("PRIORITY", std::to_string(pair.local_candidate.priority));
         binding_request.add_attribute("USERNAME", ice_attributes_.username_fragment);
         binding_request.add_attribute("MESSAGE-INTEGRITY", calculate_hmac_sha1(binding_request, ice_attributes_.password));
@@ -1179,7 +1109,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         }
 
         recv_buffer.resize(bytes_received);
-        Stun::StunMessage response = Stun::StunMessage::parse(recv_buffer);
+        StunMessage response = StunMessage::parse(recv_buffer);
 
         // Verify response
         if (response.get_transaction_id() != txn_id) {

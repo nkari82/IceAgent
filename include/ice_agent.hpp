@@ -60,38 +60,46 @@ enum class LogLevel {
     ERROR
 };
 
-// Candidate 구조체
+// Candidate Pair Structures
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
-    std::string type; // "host", "srflx", "relay"
     uint32_t priority;
+    std::string type; // "host", "srflx", "relay"
     std::string foundation;
     int component_id;
     std::string transport;
 
-    // Candidate를 SDP 형식으로 변환
     std::string to_sdp() const {
+        // Implement SDP representation
+        // Example: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
         std::ostringstream oss;
-        oss << "candidate:" << foundation << " " << component_id << " " << transport << " "
-            << priority << " " << endpoint.address().to_string() << " " << endpoint.port() << " typ " << type;
+        oss << "candidate:" << foundation << " " << component_id << " " << transport << " " << priority << " "
+            << endpoint.address().to_string() << " " << endpoint.port() << " typ " << type;
         return oss.str();
     }
 
-    // SDP 형식에서 Candidate 생성
-    static Candidate from_sdp(const std::string& sdp_line) {
+    static Candidate from_sdp(const std::string& sdp) {
+        // Implement parsing from SDP string
+        // Example SDP line: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
         Candidate cand;
-        size_t colon_pos = sdp_line.find(':');
+        std::istringstream iss(sdp);
+        std::string prefix;
+        iss >> prefix; // "a=candidate:1"
+        size_t colon_pos = prefix.find(':');
         if (colon_pos != std::string::npos) {
-            std::string candidate_info = sdp_line.substr(colon_pos + 1);
-            std::istringstream iss(candidate_info);
-            iss >> cand.foundation >> cand.component_id >> cand.transport >> cand.priority;
-            std::string ip;
-            uint16_t port;
-            iss >> ip >> port;
-            cand.endpoint = asio::ip::udp::endpoint(asio::ip::make_address(ip), port);
-            std::string typ;
-            iss >> typ >> cand.type; // typ host/srflx/relay
+            cand.foundation = prefix.substr(colon_pos + 1);
         }
+        iss >> cand.component_id;
+        iss >> cand.transport;
+        iss >> cand.priority;
+        std::string ip;
+        iss >> ip;
+        iss >> cand.endpoint.port();
+        asio::ip::address address = asio::ip::make_address(ip);
+        cand.endpoint = asio::ip::udp::endpoint(address, cand.endpoint.port());
+        std::string typ;
+        iss >> typ; // "typ"
+        iss >> cand.type;
         return cand;
     }
 };
@@ -144,12 +152,6 @@ struct IceAttributes {
     // 추가적인 ICE-specific attributes
 };
 
-// 최대 동시 연결 검사 수
-constexpr size_t MAX_CONCURRENT_CHECKS = 5;
-
-// ICE 컴포넌트 수 (예: RTP, RTCP)
-constexpr int NUM_COMPONENTS = 2;
-
 // IceAgent 클래스 정의
 class IceAgent : public std::enable_shared_from_this<IceAgent> {
 public:
@@ -189,6 +191,9 @@ public:
     void add_remote_candidate(const Candidate& candidate);
 
 private:
+    // Maximum number of concurrent connectivity checks
+    static constexpr size_t MAX_CONCURRENT_CHECKS = 10;
+	
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
