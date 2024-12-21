@@ -12,6 +12,7 @@
 #include <memory>
 #include <functional>
 #include <algorithm>
+#include <mutex>
 #include "stun_client.hpp"
 #include "turn_client.hpp"
 #include "signaling_client.hpp"
@@ -63,8 +64,10 @@ struct Candidate {
 // Enumerations for Candidate Pair State
 enum class CandidatePairState {
     New,
+    InProgress,
     Failed,
-    Succeeded
+    Succeeded,
+    Nominated
 };
 
 // Candidate Pair structure
@@ -77,6 +80,19 @@ struct CandidatePair {
 
     // Constructor
     CandidatePair() = default;
+    CandidatePair(const Candidate& local, const Candidate& remote)
+        : local_candidate(local), remote_candidate(remote) {}
+};
+
+// Check List Entry 구조체 추가
+struct CheckListEntry {
+    CandidatePair pair;
+    bool in_progress;
+    bool succeeded;
+    bool failed;
+
+    CheckListEntry(const CandidatePair& cp)
+        : pair(cp), in_progress(false), succeeded(false), failed(false) {}
 };
 
 // Callback typedefs
@@ -85,6 +101,20 @@ using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
 using NatTypeCallback = std::function<void(NatType)>;
 
+// ICE-specific STUN Attributes (예시)
+struct IceAttributes {
+    std::string username_fragment;
+    std::string password;
+    // 추가적인 ICE-specific attributes
+};
+
+// Maximum concurrent connectivity checks
+constexpr size_t MAX_CONCURRENT_CHECKS = 5;
+
+// Number of ICE components (예: RTP, RTCP)
+constexpr int NUM_COMPONENTS = 2;
+
+// IceAgent 클래스 정의
 class IceAgent : public std::enable_shared_from_this<IceAgent> {
 public:
     IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
@@ -133,6 +163,10 @@ private:
     std::vector<Candidate> remote_candidates_;
     std::vector<CandidatePair> candidate_pairs_;
 
+    // Check List
+    std::vector<CheckListEntry> check_list_;
+    std::mutex check_list_mutex_;
+
     // STUN and TURN clients
     std::vector<std::shared_ptr<StunClient>> stun_clients_;
     std::shared_ptr<TurnClient> turn_client_;
@@ -147,8 +181,11 @@ private:
     NatTypeCallback on_nat_type_detected_;
 
     // Candidate Pair Management
-    CandidatePair selected_pair_;
+    CandidatePair nominated_pair_;
     bool connectivity_checks_running_;
+
+    // ICE-specific attributes
+    IceAttributes ice_attributes_;
 
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
@@ -159,6 +196,8 @@ private:
     asio::awaitable<void> gather_srflx_candidates();
     asio::awaitable<void> gather_relay_candidates();
     asio::awaitable<void> perform_connectivity_checks();
+    asio::awaitable<void> perform_single_connectivity_check(CheckListEntry& entry);
+    void evaluate_connectivity_results();
     asio::awaitable<void> perform_keep_alive();
     asio::awaitable<void> perform_turn_refresh();
     asio::awaitable<void> start_data_receive();
@@ -167,6 +206,14 @@ private:
     void sort_candidate_pairs();
     void log(LogLevel level, const std::string& message);
     std::string nat_type_to_string(NatType nat_type) const;
+
+    // Nomination methods
+    void nominate_pair(CheckListEntry& entry);
+    asio::awaitable<void> send_nominate(const CandidatePair& pair);
+
+    // ICE Restart methods
+    void initiate_ice_restart();
+    void handle_incoming_signaling_messages(const std::string& message);
 };
 
 #endif // ICE_AGENT_HPP
