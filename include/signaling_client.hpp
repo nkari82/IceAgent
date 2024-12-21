@@ -4,38 +4,36 @@
 #define SIGNALING_CLIENT_HPP
 
 #include <asio.hpp>
-#include <websocketpp/config/asio_no_tls_client.hpp>
-#include <websocketpp/client.hpp>
-#include <nlohmann/json.hpp>
-#include <functional>
-#include <memory>
+#include <asio/awaitable.hpp>
+#include <asio/co_spawn.hpp>
+#include <asio/detached.hpp>
 #include <string>
+#include <vector>
+#include <functional>
 
-// JSON 라이브러리 사용
-using json = nlohmann::json;
-typedef websocketpp::client<websocketpp::config::asio_client> WebSocketClient;
-
-// Forward 선언
-class IceAgent;
-
-// SignalingClient 클래스 정의
-class SignalingClient : public std::enable_shared_from_this<SignalingClient> {
+class SignalingClient {
 public:
-    SignalingClient(asio::io_context& io_context, const std::string& uri, std::shared_ptr<IceAgent> ice_agent);
-    void connect();
-    void run();
-    void send_message(const std::string& message);
-
+    using MessageCallback = std::function<void(const std::string&)>;
+    
+    SignalingClient(asio::io_context& io_context, const std::string& remote_host, uint16_t remote_port, uint16_t local_port);
+    
+    // Send SDP message
+    asio::awaitable<void> send_sdp(const std::string& sdp);
+    
+    // Receive SDP message
+    asio::awaitable<std::string> receive_sdp();
+    
+    // Close signaling connection
+    void close();
+    
 private:
-    WebSocketClient ws_client_;
-    websocketpp::connection_hdl connection_;
-    std::string uri_;
     asio::io_context& io_context_;
-    std::shared_ptr<IceAgent> ice_agent_;
-
-    void on_message(websocketpp::connection_hdl hdl, WebSocketClient::message_ptr msg);
-    void on_open(websocketpp::connection_hdl hdl);
-    void on_fail(websocketpp::connection_hdl hdl);
+    asio::ip::udp::socket socket_;
+    asio::ip::udp::endpoint remote_endpoint_;
+    
+    // Helper methods
+    std::string create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates);
+    std::pair<std::string, std::string> parse_sdp(const std::string& sdp, std::vector<std::string>& candidates);
 };
 
 #endif // SIGNALING_CLIENT_HPP

@@ -1,83 +1,62 @@
 // src/signaling_client.cpp
 
 #include "signaling_client.hpp"
-#include "ice_agent.hpp"
 #include <iostream>
+#include <sstream>
 
-// Constructor
-SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& uri, std::shared_ptr<IceAgent> ice_agent)
-    : ws_client_(), uri_(uri), io_context_(io_context), ice_agent_(ice_agent) {
-    ws_client_.init_asio(&io_context_);
-    ws_client_.set_open_handler(std::bind(&SignalingClient::on_open, this, std::placeholders::_1));
-    ws_client_.set_message_handler(std::bind(&SignalingClient::on_message, this, std::placeholders::_1, std::placeholders::_2));
-    ws_client_.set_fail_handler(std::bind(&SignalingClient::on_fail, this, std::placeholders::_1));
+SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& remote_host, uint16_t remote_port, uint16_t local_port)
+    : io_context_(io_context),
+      socket_(io_context, asio::ip::udp::endpoint(asio::ip::udp::v4(), local_port)) {
+    asio::ip::udp::resolver resolver(io_context_);
+    asio::ip::udp::resolver::results_type results = resolver.resolve(remote_host, std::to_string(remote_port));
+    remote_endpoint_ = *results.begin();
 }
 
-// Connect to signaling server
-void SignalingClient::connect() {
-    websocketpp::lib::error_code ec;
-    auto con = ws_client_.get_connection(uri_, ec);
-    if (ec) {
-        ice_agent_->log(LogLevel::ERROR, "Connection error: " + ec.message());
-        return;
+asio::awaitable<void> SignalingClient::send_sdp(const std::string& sdp) {
+    co_await socket_.async_send_to(asio::buffer(sdp), remote_endpoint_, asio::use_awaitable);
+}
+
+asio::awaitable<std::string> SignalingClient::receive_sdp() {
+    std::vector<char> recv_buffer(65536);
+    asio::ip::udp::endpoint sender_endpoint;
+    size_t bytes_received = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
+    std::string sdp(recv_buffer.data(), bytes_received);
+    co_return sdp;
+}
+
+void SignalingClient::close() {
+    socket_.close();
+}
+
+std::string SignalingClient::create_sdp(const std::string& ufrag, const std::string& pwd, const std::vector<std::string>& candidates) {
+    std::ostringstream oss;
+    oss << "v=0\n"
+        << "o=- 46117343 2 IN IP4 127.0.0.1\n"
+        << "s=-\n"
+        << "t=0 0\n"
+        << "a=ice-ufrag:" << ufrag << "\n"
+        << "a=ice-pwd:" << pwd << "\n";
+    for(const auto& cand : candidates) {
+        oss << "a=" << cand << "\n";
     }
-    ws_client_.connect(con);
+    return oss.str();
 }
 
-// Run the WebSocket client
-void SignalingClient::run() {
-    ws_client_.run();
-}
-
-// Send message to signaling server
-void SignalingClient::send_message(const std::string& message) {
-    if (connection_.expired()) return;
-    ws_client_.send(connection_, message, websocketpp::frame::opcode::text);
-}
-
-// Handle message received from signaling server
-void SignalingClient::on_message(websocketpp::connection_hdl hdl, WebSocketClient::message_ptr msg) {
-    std::string payload = msg->get_payload();
-    ice_agent_->log(LogLevel::INFO, "Received message: " + payload);
-
-    json data = json::parse(payload);
-
-    if (data.contains("action")) {
-        std::string action = data["action"];
-        if (action == "ready_to_punch") {
-            // Handle UDP Hole Punching synchronization signal
-            ice_agent_->log(LogLevel::INFO, "Received ready_to_punch signal.");
-            // Actual synchronization logic should be implemented here
-        } else if (action == "restart_ice") {
-            ice_agent_->on_receive_restart_signal();
+std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string& sdp, std::vector<std::string>& candidates) {
+    std::istringstream iss(sdp);
+    std::string line;
+    std::string ufrag;
+    std::string pwd;
+    while (std::getline(iss, line)) {
+        if (line.find("a=ice-ufrag:") == 0) {
+            ufrag = line.substr(12);
+        }
+        else if (line.find("a=ice-pwd:") == 0) {
+            pwd = line.substr(10);
+        }
+        else if (line.find("a=candidate:") == 0) {
+            candidates.push_back(line.substr(2)); // Remove 'a='
         }
     }
-
-    // Handle Candidate Exchange
-    if (data.contains("endpoint")) {
-        std::string endpoint_str = data["endpoint"];
-        size_t colon = endpoint_str.find(':');
-        if (colon != std::string::npos) {
-            std::string ip = endpoint_str.substr(0, colon);
-            int port = std::stoi(endpoint_str.substr(colon + 1));
-            Candidate candidate;
-            candidate.endpoint = asio::ip::udp::endpoint(asio::ip::address::from_string(ip), port);
-            candidate.priority = data.value("priority", 1000);
-            candidate.type = data.value("type", "host");
-
-            ice_agent_->add_remote_candidate(candidate);
-            ice_agent_->log(LogLevel::INFO, "Added remote candidate from signaling: " + endpoint_str);
-        }
-    }
-}
-
-// Handle WebSocket open
-void SignalingClient::on_open(websocketpp::connection_hdl hdl) {
-    connection_ = hdl;
-    ice_agent_->log(LogLevel::INFO, "Connected to signaling server");
-}
-
-// Handle WebSocket failure
-void SignalingClient::on_fail(websocketpp::connection_hdl hdl) {
-    ice_agent_->log(LogLevel::ERROR, "Connection to signaling server failed");
+    return {ufrag, pwd};
 }
