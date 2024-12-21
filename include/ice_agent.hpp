@@ -160,11 +160,10 @@ public:
              const std::string& turn_server = "",
              const std::string& turn_username = "", 
              const std::string& turn_password = "",
-             // 타임아웃 및 재시도 설정
              std::chrono::seconds candidate_gather_timeout = std::chrono::seconds(5),
-             size_t candidate_gather_retries = 3,
+             size_t candidate_gather_retries = 1,
              std::chrono::seconds connectivity_check_timeout = std::chrono::seconds(3),
-             size_t connectivity_check_retries = 2);
+             size_t connectivity_check_retries = 1);
     ~IceAgent();
     
     // 콜백 설정
@@ -191,9 +190,6 @@ public:
     void add_remote_candidate(const Candidate& candidate);
 
 private:
-    // Maximum number of concurrent connectivity checks
-    static constexpr size_t MAX_CONCURRENT_CHECKS = 10;
-	
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
@@ -213,7 +209,6 @@ private:
 
     // Check List
     std::vector<CheckListEntry> check_list_;
-    std::mutex check_list_mutex_;
 
     // STUN 및 TURN 클라이언트
     std::vector<std::shared_ptr<StunClient>> stun_clients_;
@@ -248,11 +243,11 @@ private:
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<NatType> detect_nat_type();
-    asio::awaitable<void> gather_candidates();
+    asio::awaitable<void> gather_candidates(uint32_t attempts = 0);
     asio::awaitable<void> gather_local_candidates();
     asio::awaitable<void> gather_srflx_candidates();
     asio::awaitable<void> gather_relay_candidates();
-    asio::awaitable<void> perform_connectivity_checks();
+    asio::awaitable<void> perform_connectivity_checks(uint32_t attempts = 0);
     asio::awaitable<void> perform_single_connectivity_check(CheckListEntry& entry);
     void evaluate_connectivity_results();
     asio::awaitable<void> perform_keep_alive();

@@ -470,66 +470,91 @@ asio::awaitable<NatType> IceAgent::detect_nat_type() {
 }
 
 // Implement candidate gathering with retry logic within gather_candidates
-asio::awaitable<void> IceAgent::gather_candidates() {
-    // Gather local candidates
-    co_await gather_local_candidates();
+asio::awaitable<void> IceAgent::gather_candidates(uint32_t attempts) {
+	
+	// Start the candidate gathering process with timeout
+    // Create a steady_timer for the candidate gather timeout
+    asio::steady_timer gather_timer(io_context_);
+    gather_timer.expires_after(candidate_gather_timeout_);
 
-    // Gather STUN candidates
-    co_await gather_srflx_candidates();
+    // Coroutine to perform candidate gathering
+    auto gather_coroutine = [this]() -> asio::awaitable<void> {
+        // Gather local candidates
+        co_await gather_local_candidates();
 
-    // NAT Type Based Candidate Gathering
-    NatType nat_type = co_await detect_nat_type();
+        // Gather srflx candidates
+        co_await gather_srflx_candidates();
 
-    // Notify via callback
-    if (on_nat_type_detected_) {
-        on_nat_type_detected_(nat_type);
-    }
+        // NAT Type Based Candidate Gathering
+        NatType nat_type = co_await detect_nat_type();
 
-    size_t attempts = 0;
-    while (attempts < candidate_gather_retries_) {
-        try {
-            switch (nat_type) {
-                case NatType::FullCone:
-                case NatType::RestrictedCone:
-                case NatType::PortRestrictedCone:
-                    // These NAT types generally allow for successful peer-to-peer connections.
-                    // Prioritize gathering server reflexive (srflx) candidates.
-                    log(LogLevel::INFO, "Detected NAT type supports direct peer-to-peer connections.");
-                    // Already gathered srflx candidates
-                    break;
-                case NatType::Symmetric:
-                    // Symmetric NATs may require relay candidates via TURN.
-                    log(LogLevel::INFO, "Detected Symmetric NAT. Gathering relay candidates via TURN.");
-                    if (turn_client_) {
-                        co_await gather_relay_candidates();
-                    } else {
-                        log(LogLevel::WARNING, "TURN server not configured. Relay candidates cannot be gathered.");
-                    }
-                    break;
-                case NatType::OpenInternet:
-                    // No NAT; direct connections are straightforward.
-                    log(LogLevel::INFO, "No NAT detected. Direct peer-to-peer connections are straightforward.");
-                    break;
-                default:
-                    log(LogLevel::WARNING, "Unknown NAT type. Proceeding with default candidate gathering.");
-                    break;
-            }
-            break; // 성공 시 루프 탈출
-        } catch (const std::exception& ex) {
-            attempts++;
-            log(LogLevel::WARNING, "Candidate gathering attempt " + std::to_string(attempts) + " failed: " + ex.what());
-            if (attempts >= candidate_gather_retries_) {
-                log(LogLevel::ERROR, "Maximum candidate gathering retries exceeded.");
-                throw; // 최종 실패 시 예외 전파
-            } else {
-                log(LogLevel::INFO, "Retrying candidate gathering...");
-                // Reset state
-                remote_candidates_.clear();
-                check_list_.clear();
-                local_candidates_.clear();
-                // Optionally, re-initialize clients or other state
-                co_await gather_candidates(); // 재귀 호출로 재시도
-            }
+        // Notify via callback
+        if (on_nat_type_detected_) {
+            on_nat_type_detected_(nat_type);
+        }
+
+        switch (nat_type) {
+            case NatType::FullCone:
+            case NatType::RestrictedCone:
+            case NatType::PortRestrictedCone:
+                // These NAT types generally allow for successful peer-to-peer connections.
+                // Prioritize gathering server reflexive (srflx) candidates.
+                log(LogLevel::INFO, "Detected NAT type supports direct peer-to-peer connections.");
+                // Already gathered srflx candidates
+                break;
+            case NatType::Symmetric:
+                // Symmetric NATs may require relay candidates via TURN.
+                log(LogLevel::INFO, "Detected Symmetric NAT. Gathering relay candidates via TURN.");
+                if (turn_client_) {
+                    co_await gather_relay_candidates();
+                } else {
+                    log(LogLevel::WARNING, "TURN server not configured. Relay candidates cannot be gathered.");
+                }
+                break;
+            case NatType::OpenInternet:
+                // No NAT; direct connections are straightforward.
+                log(LogLevel::INFO, "No NAT detected. Direct peer-to-peer connections are straightforward.");
+                break;
+            default:
+                log(LogLevel::WARNING, "Unknown NAT type. Proceeding with default candidate gathering.");
+                break;
+        }
+
+
+        co_return;
+    };
+
+    // Race between candidate gathering and timeout
+    auto [gather_ec, gather_res] = co_await (
+        (gather_coroutine() && asio::use_awaitable)
+        || (gather_timer.async_wait(asio::use_awaitable))
+    );
+
+    if (gather_ec == asio::error::operation_aborted) {
+        // Gathering completed before timeout
+        log(LogLevel::INFO, "Candidate gathering completed successfully.");
+    } else {
+		if (!gather_ec) {
+			// Timeout occurred before gathering completed
+			log(LogLevel::ERROR, "Candidate gathering timed out after " + std::to_string(candidate_gather_timeout_.count()) + " seconds.");
+		else {
+			// Some other error occurred
+			log(LogLevel::ERROR, "Error during candidate gathering: " + gather_ec.message());
+		}
+		
+		attempts++;
+        log(LogLevel::WARNING, "Candidate gathering attempt " + std::to_string(attempts) + " failed: " + ex.what());
+        if (attempts >= candidate_gather_retries_) {
+            log(LogLevel::ERROR, "Maximum candidate gathering retries exceeded.");
+            throw; // 최종 실패 시 예외 전파
+        } else {
+            log(LogLevel::INFO, "Retrying candidate gathering...");
+            // Reset state
+            remote_candidates_.clear();
+            check_list_.clear();
+            local_candidates_.clear();
+            // Optionally, re-initialize clients or other state
+            co_await gather_candidates(attempts); // 재귀 호출로 재시도
         }
     }
 
@@ -646,52 +671,6 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
     }
 
     co_return;
-}
-
-// Perform connectivity checks with enhanced Check List management
-asio::awaitable<void> IceAgent::perform_connectivity_checks() {
-   log(LogLevel::INFO, "Performing connectivity checks...");
-    sort_candidate_pairs();
-
-    // Concurrency control
-    std::atomic<size_t> active_checks{0};
-    size_t total_pairs = check_list_.size();
-    size_t checked_pairs = 0;
-
-    while (checked_pairs < total_pairs) {
-        for (auto& entry : check_list_) {
-            if (entry.state == CandidatePairState::New && !entry.in_progress && active_checks < MAX_CONCURRENT_CHECKS) {
-                entry.in_progress = true;
-                active_checks++;
-
-                // Spawn coroutine for each connectivity check
-                co_spawn(io_context_, [this, &entry, &active_checks, &checked_pairs]() -> asio::awaitable<void> {
-                    try {
-                        co_await perform_single_connectivity_check(entry);
-                        entry.state = CandidatePairState::Succeeded;
-                        log(LogLevel::INFO, "Connectivity succeeded for pair.");
-                        // Nominate if Controller
-                        if (role_ == IceRole::Controller) {
-                            entry.is_nominated = true;
-                            co_await send_nominate(entry.pair);
-                        }
-                    } catch (const std::exception& ex) {
-                        entry.state = CandidatePairState::Failed;
-                        log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
-                    }
-                    entry.in_progress = false;
-                    active_checks--;
-                    checked_pairs++;
-                }, asio::detached);
-            }
-        }
-
-        // Wait a bit before checking again
-        co_await asio::steady_timer(io_context_, std::chrono::milliseconds(100)).async_wait(asio::use_awaitable);
-    }
-
-    // Evaluate results after all checks
-    evaluate_connectivity_results();
 }
 
 // Perform a single connectivity check
@@ -937,6 +916,7 @@ asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
     StunMessage nominate_msg(STUN_BINDING_INDICATION, txn_id);
     // Add USE-CANDIDATE attribute as per RFC 8445
     nominate_msg.add_attribute("USE-CANDIDATE", "");
+
     // Add ICE-CONTROLLING if Controller
     if (role_ == IceRole::Controller) {
         // Generate a unique tie-breaker value
@@ -948,11 +928,19 @@ asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
     }
 
     // Add MESSAGE-INTEGRITY
-    nominate_msg.add_attribute("MESSAGE-INTEGRITY", calculate_hmac_sha1(nominate_msg, ice_attributes_.password));
+    std::vector<uint8_t> serialized = nominate_msg.serialize_without_attributes({ "MESSAGE-INTEGRITY", "FINGERPRINT" });
+    std::vector<uint8_t> hmac = hmac_sha1(ice_attributes_.password, serialized);
+    nominate_msg.add_attribute("MESSAGE-INTEGRITY", hmac);
 
-    // Add FINGERPRINT
-    nominate_msg.add_attribute("FINGERPRINT", calculate_crc32(nominate_msg));
-
+    // Calculate FINGERPRINT
+    std::vector<uint8_t> serialized_without_fingerprint = nominate_msg.serialize_without_attribute("FINGERPRINT");
+    uint32_t crc = calculate_crc32(serialized_without_fingerprint);
+    nominate_msg.add_attribute("FINGERPRINT", { 
+        static_cast<uint8_t>((crc >> 24) & 0xFF), 
+        static_cast<uint8_t>((crc >> 16) & 0xFF), 
+        static_cast<uint8_t>((crc >> 8) & 0xFF), 
+        static_cast<uint8_t>(crc & 0xFF) 
+    });
     std::vector<uint8_t> serialized_nominate = nominate_msg.serialize();
     co_await socket_.async_send_to(asio::buffer(serialized_nominate), pair.remote_candidate.endpoint, asio::use_awaitable);
 
@@ -961,10 +949,14 @@ asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
         std::to_string(pair.remote_candidate.endpoint.port()) +
         " [Component " + std::to_string(pair.local_candidate.component_id) + "]");
 
-    // Trigger nominate callback if set
+    // **응답 처리 제거:** NOMINATE 메시지에 대한 응답은 필요하지 않으므로, 별도의 응답 처리 코드를 제거합니다.
+
+    // **콜백 트리거:** NOMINATE 전송 완료를 알리기 위해 콜백을 호출합니다.
     if (nominate_callback_) {
         nominate_callback_(pair);
     }
+
+    co_return;
 }
 
 // Handle incoming signaling messages and process ICE parameters
@@ -1056,119 +1048,69 @@ asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg
     co_return;
 }
 
-// Perform a single connectivity check
-asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry& entry) {
-    const CandidatePair& pair = entry.pair;
+// Perform connectivity checks with concurrency control and recursive retry
+asio::awaitable<void> IceAgent::perform_connectivity_checks(uint32_t attempts) {
+    log(LogLevel::INFO, "Performing connectivity checks...");
+    sort_candidate_pairs();
 
-    if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
-        // Connectivity check using STUN Binding Request
-        std::vector<uint8_t> txn_id = generate_transaction_id();
-        StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
-        binding_request.add_attribute("PRIORITY", std::to_string(pair.local_candidate.priority));
-        binding_request.add_attribute("USERNAME", ice_attributes_.username_fragment);
-        binding_request.add_attribute("MESSAGE-INTEGRITY", calculate_hmac_sha1(binding_request, ice_attributes_.password));
-        binding_request.add_attribute("FINGERPRINT", calculate_crc32(binding_request));
-        std::vector<uint8_t> serialized_request = binding_request.serialize();
+    // Concurrency control
+    std::atomic<size_t> active_checks{0};
+    size_t total_pairs = check_list_.size();
+    size_t checked_pairs = 0;
 
-        // Send Binding Request
-        co_await socket_.async_send_to(asio::buffer(serialized_request), pair.remote_candidate.endpoint, asio::use_awaitable);
+    while (checked_pairs < total_pairs) {
+        for (auto& entry : check_list_) {
+            if (entry.state == CandidatePairState::New && !entry.in_progress && active_checks < MAX_CONCURRENT_CHECKS) {
+                entry.in_progress = true;
+                active_checks++;
 
-        // Set timeout
-        asio::steady_timer timer(io_context_);
-        timer.expires_after(std::chrono::seconds(2));
-
-        std::vector<uint8_t> recv_buffer(2048);
-        asio::ip::udp::endpoint sender_endpoint;
-
-        using namespace asio::experimental::awaitable_operators;
-        auto [ec, bytes_received] = co_await (
-            socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable)
-            || timer.async_wait(asio::use_awaitable)
-        );
-
-        if (ec == asio::error::operation_aborted) {
-            throw std::runtime_error("Connectivity check timed out.");
-        } else if (ec) {
-            throw std::runtime_error("Connectivity check failed: " + std::string(ec.message()));
+                // Spawn coroutine for each connectivity check
+                co_spawn(io_context_, [this, &entry, &active_checks, &checked_pairs]() -> asio::awaitable<void> {
+                    try {
+                        co_await perform_single_connectivity_check(entry);
+                        entry.state = CandidatePairState::Succeeded;
+                        log(LogLevel::INFO, "Connectivity succeeded for pair.");
+                        // Nominate if Controller
+                        if (role_ == IceRole::Controller) {
+                            entry.is_nominated = true;
+                            co_await send_nominate(entry.pair);
+                        }
+                    } catch (const std::exception& ex) {
+                        entry.state = CandidatePairState::Failed;
+                        log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
+                    }
+                    entry.in_progress = false;
+                    active_checks--;
+                    checked_pairs++;
+                }, asio::detached);
+            }
         }
 
-        recv_buffer.resize(bytes_received);
-        StunMessage response = StunMessage::parse(recv_buffer);
+        // Wait a bit before checking again
+        co_await asio::steady_timer(io_context_, std::chrono::milliseconds(100)).async_wait(asio::use_awaitable);
+    }
 
-        // Verify response
-        if (response.get_transaction_id() != txn_id) {
-            throw std::runtime_error("STUN Transaction ID mismatch.");
+    // Evaluate results after all checks
+    evaluate_connectivity_results();
+
+    // Check if all checks succeeded, otherwise retry recursively
+    bool all_checks_succeeded = std::all_of(check_list_.begin(), check_list_.end(), [](const CheckListEntry& entry) {
+        return entry.state == CandidatePairState::Succeeded;
+    });
+
+    if (!all_checks_succeeded) {
+        if (attempts < connectivity_check_retries_) {
+            attempts++;
+            log(LogLevel::WARNING, "Retrying connectivity checks (" + std::to_string(attempts) + "/" + std::to_string(connectivity_check_retries_) + ")...");
+            co_await perform_connectivity_checks(attempts); // 재귀 호출
+        } else {
+            log(LogLevel::ERROR, "Maximum connectivity check retries exceeded.");
+            transition_to_state(IceConnectionState::Failed);
         }
-
-        if (response.get_type() != STUN_BINDING_RESPONSE_SUCCESS) {
-            throw std::runtime_error("Invalid STUN Binding Response type.");
-        }
-
-        // Verify MESSAGE-INTEGRITY
-        if (!response.verify_message_integrity(ice_attributes_.password)) {
-            throw std::runtime_error("Invalid MESSAGE-INTEGRITY in STUN response.");
-        }
-
-        // Verify FINGERPRINT
-        if (!response.verify_fingerprint()) {
-            throw std::runtime_error("Invalid FINGERPRINT in STUN response.");
-        }
-
-        // Extract MAPPED-ADDRESS
-        std::string mapped_address = response.get_attribute("MAPPED-ADDRESS");
-        if (mapped_address.empty()) {
-            throw std::runtime_error("MAPPED-ADDRESS attribute missing in STUN response.");
-        }
-
-        // Parse MAPPED-ADDRESS
-        size_t colon_pos = mapped_address.find(':');
-        if (colon_pos == std::string::npos) {
-            throw std::runtime_error("Invalid MAPPED-ADDRESS format.");
-        }
-        std::string ip = mapped_address.substr(0, colon_pos);
-        uint16_t port = static_cast<uint16_t>(std::stoi(mapped_address.substr(colon_pos + 1)));
-
-        asio::ip::udp::endpoint mapped_endpoint(asio::ip::make_address(ip), port);
-
-        // 연결 성공 처리
+    } else {
+        // All checks succeeded
         co_return;
     }
-    else if (pair.remote_candidate.type == "relay") {
-        // Relay connectivity check using TURN Send (data transmission)
-        std::vector<uint8_t> data = { 'D', 'A', 'T', 'A' };
-        co_await socket_.async_send_to(asio::buffer(data), pair.remote_candidate.endpoint, asio::use_awaitable);
-        log(LogLevel::INFO, "Sent data via TURN relay to " +
-            pair.remote_candidate.endpoint.address().to_string() + ":" +
-            std::to_string(pair.remote_candidate.endpoint.port()) +
-            " [Component " + std::to_string(pair.local_candidate.component_id) + "]");
-
-        // Set timeout
-        asio::steady_timer timer(io_context_);
-        timer.expires_after(std::chrono::seconds(2));
-
-        std::vector<uint8_t> recv_buffer(2048);
-        asio::ip::udp::endpoint sender_endpoint_recv;
-
-        using namespace asio::experimental::awaitable_operators;
-        auto [ec, bytes_transferred] = co_await (
-            socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint_recv, asio::use_awaitable)
-            || timer.async_wait(asio::use_awaitable)
-        );
-
-        if (ec == asio::error::operation_aborted) {
-            throw std::runtime_error("Relay connectivity check timed out.");
-        } else if (ec) {
-            throw std::runtime_error("Relay connectivity check failed: " + std::string(ec.message()));
-        }
-
-        if (bytes_transferred > 0) {
-            co_return; // Success
-        } else {
-            throw std::runtime_error("No data received from relay.");
-        }
-    }
-
-    co_return;
 }
 
 // Nominate a successful candidate pair based on role
