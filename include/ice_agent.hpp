@@ -4,7 +4,9 @@
 #define ICE_AGENT_HPP
 
 #include <asio.hpp>
+#if 0
 #include <asio/ssl.hpp>
+#endif
 #include <asio/awaitable.hpp>
 #include <asio/co_spawn.hpp>
 #include <asio/detached.hpp>
@@ -19,6 +21,7 @@
 #include "stun_client.hpp"
 #include "turn_client.hpp"
 #include "signaling_client.hpp"
+#include "hash_vector.hpp"
 
 enum class IceMode {
     Full,
@@ -64,6 +67,33 @@ struct Candidate {
     std::string foundation;
     int component_id;
     std::string transport;
+
+    // Convert Candidate to SDP format
+    std::string to_sdp() const {
+        std::ostringstream oss;
+        oss << "candidate:" << foundation << " " << component_id << " " << transport << " "
+            << priority << " " << endpoint.address().to_string() << " " << endpoint.port() << " typ " << type;
+        return oss.str();
+    }
+
+    // Create Candidate from SDP format
+    static Candidate from_sdp(const std::string& sdp_line) {
+        // Example SDP line: "a=candidate:1 1 UDP 2122252543 192.168.1.2 54400 typ host"
+        Candidate cand;
+        size_t colon_pos = sdp_line.find(':');
+        if (colon_pos != std::string::npos) {
+            std::string candidate_info = sdp_line.substr(colon_pos + 1);
+            std::istringstream iss(candidate_info);
+            iss >> cand.foundation >> cand.component_id >> cand.transport >> cand.priority;
+            std::string ip;
+            uint16_t port;
+            iss >> ip >> port;
+            cand.endpoint = asio::ip::udp::endpoint(asio::ip::make_address(ip), port);
+            std::string typ;
+            iss >> typ >> cand.type; // typ host/srflx/relay
+        }
+        return cand;
+    }
 };
 
 // Enumerations for Candidate Pair State
@@ -82,7 +112,7 @@ struct CandidatePair {
     uint32_t priority;
     CandidatePairState state;
     bool is_nominated;
-    
+
     // Constructor
     CandidatePair() = default;
     CandidatePair(const Candidate& local, const Candidate& remote)
@@ -95,7 +125,7 @@ struct CheckListEntry {
     CandidatePairState state;
     bool nominated;
     bool in_progress; // 추가됨
-    
+
     CheckListEntry(const CandidatePair& cp)
         : pair(cp), state(CandidatePairState::New), nominated(false), in_progress(false) {}
 };
@@ -128,7 +158,8 @@ public:
              const std::string& turn_server = "",
              const std::string& turn_username = "", 
              const std::string& turn_password = "");
-
+    ~IceAgent();
+    
     // Setters for callbacks
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
@@ -202,8 +233,10 @@ private:
     IceAttributes ice_attributes_;
 
     // SSL context for DTLS
+	#if 0
     asio::ssl::context ssl_context_;
-    std::shared_ptr<asio::ssl::stream<asio::ip::udp::socket>> ssl_stream_;
+    std::unique_ptr<asio::ssl::stream<asio::ip::udp::socket>> ssl_stream_;
+	#endif
 
     // Role negotiation
     IceRole remote_role_;
