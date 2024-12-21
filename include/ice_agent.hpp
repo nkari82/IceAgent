@@ -157,7 +157,14 @@ public:
              const std::vector<std::string>& stun_servers, 
              const std::string& turn_server = "",
              const std::string& turn_username = "", 
-             const std::string& turn_password = "");
+             const std::string& turn_password = "",
+             // 타임아웃 및 재시도 설정
+             std::chrono::seconds candidate_gather_timeout = std::chrono::seconds(5),
+             size_t candidate_gather_retries = 3,
+             std::chrono::seconds connectivity_check_timeout = std::chrono::seconds(3),
+             size_t connectivity_check_retries = 2,
+             std::chrono::seconds role_negotiation_timeout = std::chrono::seconds(5),
+             size_t role_negotiation_retries = 3);
     ~IceAgent();
     
     // 콜백 설정
@@ -230,6 +237,24 @@ private:
     // 역할 협상
     IceRole remote_role_;
 
+    // 타임아웃 및 재시도 설정 변수
+    std::chrono::seconds candidate_gather_timeout_;
+    size_t candidate_gather_retries_;
+    std::chrono::seconds connectivity_check_timeout_;
+    size_t connectivity_check_retries_;
+    std::chrono::seconds role_negotiation_timeout_;
+    size_t role_negotiation_retries_;
+
+    // 재시도 카운터
+    std::atomic<size_t> candidate_gather_retry_count_;
+    std::atomic<size_t> connectivity_check_retry_count_;
+    std::atomic<size_t> role_negotiation_retry_count_;
+
+    // 타임아웃 타이머
+    asio::steady_timer candidate_gather_timer_;
+    asio::steady_timer connectivity_check_timer_;
+    asio::steady_timer role_negotiation_timer_;
+	
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<NatType> detect_nat_type();
