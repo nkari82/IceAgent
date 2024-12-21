@@ -650,64 +650,48 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
 
 // Perform connectivity checks with enhanced Check List management
 asio::awaitable<void> IceAgent::perform_connectivity_checks() {
-    log(LogLevel::INFO, "Performing connectivity checks...");
+   log(LogLevel::INFO, "Performing connectivity checks...");
     sort_candidate_pairs();
-	
-    size_t attempts = 0;
-    while (attempts < connectivity_check_retries_) {
-        try {
-			std::atomic<size_t> active_checks{0};
-			size_t total_pairs = check_list_.size();
-			size_t checked_pairs = 0;
-			
-			while (checked_pairs < total_pairs) {
-				for (auto& entry : check_list_) {
-					if (entry.state == CandidatePairState::New && !entry.in_progress && active_checks < MAX_CONCURRENT_CHECKS) {
-						entry.in_progress = true;
-						active_checks++;
 
-						// Spawn coroutine for each connectivity check
-						co_spawn(io_context_, [this, &entry, &active_checks, &checked_pairs]() -> asio::awaitable<void> {
-							try {
-								co_await perform_single_connectivity_check(entry);
-								entry.state = CandidatePairState::Succeeded;
-								log(LogLevel::INFO, "Connectivity succeeded for pair.");
-								if (role_ == IceRole::Controller) {
-									entry.is_nominated = true;
-									co_await send_nominate(entry.pair);
-								}
-							} catch (const std::exception& ex) {
-								entry.state = CandidatePairState::Failed;
-								log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
-							}
-							entry.in_progress = false;
-							active_checks--;
-							checked_pairs++;
-						}, asio::detached);
-					}
-				}
+    // Concurrency control
+    std::atomic<size_t> active_checks{0};
+    size_t total_pairs = check_list_.size();
+    size_t checked_pairs = 0;
 
-				// Wait a bit before checking again
-				co_await asio::steady_timer(io_context_, std::chrono::milliseconds(100)).async_wait(asio::use_awaitable);
-			}
+    while (checked_pairs < total_pairs) {
+        for (auto& entry : check_list_) {
+            if (entry.state == CandidatePairState::New && !entry.in_progress && active_checks < MAX_CONCURRENT_CHECKS) {
+                entry.in_progress = true;
+                active_checks++;
 
-            // Evaluate results
-            evaluate_connectivity_results();
-            break; // 성공 시 루프 탈출
-        } catch (const std::exception& ex) {
-            attempts++;
-            log(LogLevel::WARNING, "Connectivity check attempt " + std::to_string(attempts) + " failed: " + ex.what());
-            if (attempts >= connectivity_check_retries_) {
-                log(LogLevel::ERROR, "Maximum connectivity check retries exceeded.");
-                throw; // 최종 실패 시 예외 전파
-            } else {
-                log(LogLevel::INFO, "Retrying connectivity checks...");
-                // Optionally, 추가적인 상태 리셋이나 로깅을 수행할 수 있습니다.
+                // Spawn coroutine for each connectivity check
+                co_spawn(io_context_, [this, &entry, &active_checks, &checked_pairs]() -> asio::awaitable<void> {
+                    try {
+                        co_await perform_single_connectivity_check(entry);
+                        entry.state = CandidatePairState::Succeeded;
+                        log(LogLevel::INFO, "Connectivity succeeded for pair.");
+                        // Nominate if Controller
+                        if (role_ == IceRole::Controller) {
+                            entry.is_nominated = true;
+                            co_await send_nominate(entry.pair);
+                        }
+                    } catch (const std::exception& ex) {
+                        entry.state = CandidatePairState::Failed;
+                        log(LogLevel::WARNING, "Connectivity check failed: " + std::string(ex.what()));
+                    }
+                    entry.in_progress = false;
+                    active_checks--;
+                    checked_pairs++;
+                }, asio::detached);
             }
         }
+
+        // Wait a bit before checking again
+        co_await asio::steady_timer(io_context_, std::chrono::milliseconds(100)).async_wait(asio::use_awaitable);
     }
 
-    co_return;
+    // Evaluate results after all checks
+    evaluate_connectivity_results();
 }
 
 // Perform a single connectivity check
@@ -1200,25 +1184,6 @@ void IceAgent::nominate_pair(CheckListEntry& entry) {
             entry.pair.remote_candidate.endpoint.address().to_string() + ":" +
             std::to_string(entry.pair.remote_candidate.endpoint.port()) +
             " [Component " + std::to_string(entry.pair.local_candidate.component_id) + "]");
-    }
-}
-
-// Evaluate connectivity results and nominate pairs
-void IceAgent::evaluate_connectivity_results() {
-    bool any_succeeded = false;
-    for (auto& entry : check_list_) {
-        if (entry.state == CandidatePairState::Succeeded && !entry.is_nominated) {
-            nominate_pair(entry);
-            any_succeeded = true;
-            break; // Nominate the first successful pair
-        }
-    }
-
-    if (any_succeeded) {
-        transition_to_state(IceConnectionState::Connected);
-    } else {
-        log(LogLevel::ERROR, "No valid candidate pairs found after connectivity checks.");
-        transition_to_state(IceConnectionState::Failed);
     }
 }
 
