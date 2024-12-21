@@ -162,9 +162,7 @@ public:
              std::chrono::seconds candidate_gather_timeout = std::chrono::seconds(5),
              size_t candidate_gather_retries = 3,
              std::chrono::seconds connectivity_check_timeout = std::chrono::seconds(3),
-             size_t connectivity_check_retries = 2,
-             std::chrono::seconds role_negotiation_timeout = std::chrono::seconds(5),
-             size_t role_negotiation_retries = 3);
+             size_t connectivity_check_retries = 2);
     ~IceAgent();
     
     // 콜백 설정
@@ -189,7 +187,6 @@ public:
 
     // 신호를 통해 수신된 원격 후보 추가
     void add_remote_candidate(const Candidate& candidate);
-
 
 private:
     asio::io_context& io_context_;
@@ -242,18 +239,6 @@ private:
     size_t candidate_gather_retries_;
     std::chrono::seconds connectivity_check_timeout_;
     size_t connectivity_check_retries_;
-    std::chrono::seconds role_negotiation_timeout_;
-    size_t role_negotiation_retries_;
-
-    // 재시도 카운터
-    std::atomic<size_t> candidate_gather_retry_count_;
-    std::atomic<size_t> connectivity_check_retry_count_;
-    std::atomic<size_t> role_negotiation_retry_count_;
-
-    // 타임아웃 타이머
-    asio::steady_timer candidate_gather_timer_;
-    asio::steady_timer connectivity_check_timer_;
-    asio::steady_timer role_negotiation_timer_;
 	
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);

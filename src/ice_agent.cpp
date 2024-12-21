@@ -12,12 +12,21 @@
 #include <openssl/sha.h>
 #include <zlib.h> // For CRC32
 
+// Constants for STUN message types
+constexpr uint16_t STUN_BINDING_REQUEST = 0x0001;
+constexpr uint16_t STUN_BINDING_RESPONSE_SUCCESS = 0x0101;
+constexpr uint16_t STUN_BINDING_INDICATION = 0x0111;
+
 // Constructor
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    const std::vector<std::string>& stun_servers, 
                    const std::string& turn_server,
                    const std::string& turn_username, 
-                   const std::string& turn_password)
+                   const std::string& turn_password,
+				   std::chrono::seconds candidate_gather_timeout,
+                   size_t candidate_gather_retries,
+                   std::chrono::seconds connectivity_check_timeout,
+                   size_t connectivity_check_retries)
     : io_context_(io_context), 
       socket_(io_context, asio::ip::udp::v4()), 
       role_(role), 
@@ -29,7 +38,11 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
       current_state_(IceConnectionState::New), 
       keep_alive_timer_(io_context),
       log_level_(LogLevel::INFO),
-      connectivity_checks_running_(false) 
+      connectivity_checks_running_(false),
+	  candidate_gather_timeout_(candidate_gather_timeout),
+      candidate_gather_retries_(candidate_gather_retries),
+      connectivity_check_timeout_(connectivity_check_timeout),
+      connectivity_check_retries_(connectivity_check_retries),
 {
     // Initialize StunClients for each STUN server
     for (const auto& server : stun_servers_) {
@@ -63,6 +76,12 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
 
 // Destructor
 IceAgent::~IceAgent() {
+	std::error_code ec;
+    socket_.close(ec);
+    if(ec){
+        log(LogLevel::WARNING, "Error closing socket: " + ec.message());
+    }
+	
     io_context_.stop();
     for(auto& thread : thread_pool_) {
         if(thread.joinable()) {
