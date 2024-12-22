@@ -188,9 +188,6 @@ public:
     // ICE 프로세스 시작
     asio::awaitable<void> start();
 
-    // ICE 프로세스 재시작
-    asio::awaitable<void> restart_ice();
-
     // 연결된 소켓을 통해 데이터 전송
     void send_data(const std::vector<uint8_t>& data);
 
@@ -258,7 +255,7 @@ private:
     asio::awaitable<void> gather_relay_candidates();
     asio::awaitable<void> perform_connectivity_checks(uint32_t attempts = 0);
     asio::awaitable<void> perform_single_connectivity_check(CheckListEntry& entry);
-    void evaluate_connectivity_results();
+    asio::awaitable<void> evaluate_connectivity_results();
     asio::awaitable<void> perform_keep_alive();
     asio::awaitable<void> perform_turn_refresh();
     asio::awaitable<void> start_data_receive();
@@ -270,8 +267,8 @@ private:
     void negotiate_role(IceRole remote_role, uint64_t remote_tie_breaker);
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> handle_incoming_signaling_messages();
-	void nominate_pair(CheckListEntry& entry);
-	asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);
+	asio::awaitable<void> nominate_pair(CheckListEntry& entry);
+	asio::awaitable<void> handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);
 };
 
 #endif // ICE_AGENT_HPP
