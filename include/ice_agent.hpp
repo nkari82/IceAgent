@@ -80,29 +80,34 @@ struct Candidate {
     }
 
     static Candidate from_sdp(const std::string& sdp) {
-        // SDP 문자열로부터 파싱 구현
-        // 예시 SDP 라인: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
-        Candidate cand;
-        std::istringstream iss(sdp);
-        std::string prefix;
-        iss >> prefix; // "candidate:1"
-        size_t colon_pos = prefix.find(':');
-        if (colon_pos != std::string::npos) {
-            cand.foundation = prefix.substr(colon_pos + 1);
-        }
-        iss >> cand.component_id;
-        iss >> cand.transport;
-        iss >> cand.priority;
-        std::string ip;
-        uint16_t port;
-        iss >> ip;
-        iss >> port;
-        asio::ip::address address = asio::ip::make_address(ip);
-        cand.endpoint = asio::ip::udp::endpoint(address, port);
-        std::string typ;
-        iss >> typ; // "typ"
-        iss >> cand.type;
-        return cand;
+		// SDP 문자열로부터 파싱 구현
+		// IPv4-mapped IPv6 예시: "a=candidate:1 1 UDP 2130706431 ::ffff:192.168.1.2 54400 typ host"
+		Candidate cand;
+		std::istringstream iss(sdp);
+		std::string prefix;
+		iss >> prefix; // "candidate:1"
+		size_t colon_pos = prefix.find(':');
+		if (colon_pos != std::string::npos) {
+			cand.foundation = prefix.substr(colon_pos + 1);
+		}
+		iss >> cand.component_id;
+		iss >> cand.transport;
+		iss >> cand.priority;
+		std::string ip;
+		uint16_t port;
+		iss >> ip;
+		iss >> port;
+		asio::ip::address address;
+		try {
+			address = asio::ip::make_address(ip);
+		} catch (const std::exception& e) {
+			throw std::runtime_error("Invalid IP address in SDP: " + ip);
+		}
+		cand.endpoint = asio::ip::udp::endpoint(address, port);
+		std::string typ;
+		iss >> typ; // "typ"
+		iss >> cand.type;
+		return cand;
     }
 };
 

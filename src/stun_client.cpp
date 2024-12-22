@@ -10,14 +10,43 @@
 StunClient::StunClient(asio::io_context& io_context, const std::string& host, uint16_t port, const std::string& key)
     : io_context_(io_context), resolver_(io_context), socket_(io_context)
 {
-    asio::ip::tcp::resolver::results_type endpoints = resolver_.resolve(host, std::to_string(port));
-    if(endpoints.empty()) {
-        throw std::runtime_error("Failed to resolve STUN server address.");
-    }
-    // IPv4 및 IPv6 모두 지원하도록 소켓 열기
-    asio::ip::udp::endpoint resolved_endpoint = *endpoints.begin();
-    socket_.open(resolved_endpoint.protocol());
-    server_endpoint_ = resolved_endpoint;
+    // 비동기 해결 및 소켓 초기화
+    co_spawn(io_context_, [this, host, port]() -> asio::awaitable<void> {
+        try {
+            asio::ip::udp::resolver::query query(host, port, asio::ip::udp::resolver::query::numeric_service);
+            auto results = co_await resolver_.async_resolve(query, asio::use_awaitable);
+
+            for(auto it = results.begin(); it != results.end(); ++it){
+                if(it->endpoint().address().is_v4() || it->endpoint().address().is_v6()){
+                    server_endpoint_ = it->endpoint();
+                    
+					std::error_code ec;
+					socket_.open(server_endpoint_.protocol(), ec);
+					if(ec){
+						throw std::runtime_error("Failed to open STUN socket: " + ec.message());
+					}
+					
+					// Set socket option to allow both IPv4 and IPv6 if supported
+					if(server_endpoint_.protocol() == asio::ip::udp::v6()){
+						asio::ip::v6_only option(false);
+						socket_.set_option(option, ec);
+						if(ec){
+							log(LogLevel::WARNING, "Failed to set dual-stack option: " + ec.message());
+						}
+					}
+					
+					socket_.connect(server_endpoint_, ec);
+					if(ec){
+						throw std::runtime_error("Failed to connect STUN socket: " + ec.message());
+					}
+                    co_return;
+                }
+            }
+            throw std::runtime_error("No valid endpoint found for STUN server.");
+        } catch(const std::exception& ex){
+            throw std::runtime_error("Failed to resolve STUN server: " + std::string(ex.what()));
+        }
+    }, asio::detached);
 }
 
 // Get STUN server address

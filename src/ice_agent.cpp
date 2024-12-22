@@ -36,7 +36,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    std::chrono::seconds connectivity_check_timeout,
                    size_t connectivity_check_retries)
     : io_context_(io_context), 
-      socket_(io_context, asio::ip::udp::v4()), 
+      socket_(io_context_), 
       role_(role), 
       mode_(mode),
       stun_servers_(stun_servers), 
@@ -79,6 +79,20 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
         }
     }
 
+    // 소켓을 Dual-Stack으로 열기 (IPv6 소켓이 IPv4도 지원하도록)
+    std::error_code ec;
+    socket_.open(asio::ip::udp::v6(), ec);
+    if(ec){
+        log(LogLevel::WARNING, "Failed to open IPv6 socket: " + ec.message());
+    }
+    else{
+        asio::ip::v6_only v6_option(false);
+        socket_.set_option(v6_option, ec);
+        if(ec){
+            log(LogLevel::WARNING, "Failed to set IPv6 dual-stack option: " + ec.message());
+        }
+    }
+	
     // Tie-breaker 생성
     std::random_device rd;
     std::mt19937_64 gen(rd());
@@ -418,13 +432,16 @@ asio::awaitable<void> IceAgent::gather_candidates(uint32_t attempts) {
 // Gather local host candidates
 asio::awaitable<void> IceAgent::gather_local_candidates() {
     log(LogLevel::INFO, "Gathering local candidates...");
+    
+    // Resolve both IPv4 and IPv6 local addresses
     asio::ip::udp::resolver resolver(io_context_);
-    asio::ip::udp::resolver::results_type results = co_await resolver.async_resolve("0.0.0.0", "0", asio::use_awaitable);
+    asio::ip::udp::resolver::results_type results_v4 = co_await resolver.async_resolve(asio::ip::udp::v4(), "0.0.0.0", "0", asio::use_awaitable);
+    asio::ip::udp::resolver::results_type results_v6 = co_await resolver.async_resolve(asio::ip::udp::v6(), "::", "0", asio::use_awaitable);
 
-    for (const auto& entry : results) {
+    auto add_candidate = [&](const asio::ip::udp::endpoint& endpoint) -> void {
         for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
             Candidate candidate;
-            candidate.endpoint = entry.endpoint();
+            candidate.endpoint = endpoint;
             candidate.priority = 65535; // 높은 우선순위
             candidate.type = "host";
             candidate.foundation = "1";
@@ -439,7 +456,27 @@ asio::awaitable<void> IceAgent::gather_local_candidates() {
             log(LogLevel::INFO, "Local Candidate gathered: " + candidate.endpoint.address().to_string() + ":" + std::to_string(candidate.endpoint.port()) +
                 " [Component " + std::to_string(component) + "]");
         }
+    };
+
+    for (const auto& entry : results_v4) {
+        add_candidate(entry.endpoint());
     }
+
+    for (const auto& entry : results_v6) {
+        // Check for IPv4-mapped IPv6 addresses
+        if(entry.endpoint().address().is_v6() && entry.endpoint().address().to_v4().is_unspecified()){
+            // Generate IPv4-mapped IPv6 address
+            asio::ip::address_v6 addr_v6 = entry.endpoint().address().to_v6();
+            asio::ip::address_v4 addr_v4 = asio::ip::address_v4::any();
+            asio::ip::address_v6 mapped_v6 = asio::ip::address_v6::v4_mapped(addr_v4);
+            asio::ip::udp::endpoint mapped_endpoint(mapped_v6, entry.endpoint().port());
+
+            add_candidate(mapped_endpoint);
+        } else {
+            add_candidate(entry.endpoint());
+        }
+    }
+
     co_return;
 }
 
@@ -455,6 +492,7 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
             asio::ip::udp::endpoint mapped_endpoint = co_await stun_client->send_binding_request();
 
             for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
+                // SRFLX 후보 생성
                 Candidate srflx_candidate;
                 srflx_candidate.endpoint = mapped_endpoint;
                 srflx_candidate.priority = 1000000; // Host 후보보다 높은 우선순위
@@ -475,6 +513,37 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
                 CandidatePair pair(srflx_candidate, Candidate());
                 check_list_.emplace_back(pair);
             }
+
+            // Handle IPv4-mapped IPv6 if applicable
+            if(mapped_endpoint.address().is_v6() && mapped_endpoint.address().to_v4().is_unspecified()){
+                // Create IPv4-mapped IPv6 endpoint
+                asio::ip::address_v6 addr_v6 = mapped_endpoint.address().to_v6();
+                asio::ip::address_v4 addr_v4 = asio::ip::address_v4::any();
+                asio::ip::address_v6 mapped_v6 = asio::ip::address_v6::v4_mapped(addr_v4);
+                asio::ip::udp::endpoint mapped_v6_endpoint(mapped_v6, mapped_endpoint.port());
+
+                for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
+                    Candidate srflx_candidate_v6;
+                    srflx_candidate_v6.endpoint = mapped_v6_endpoint;
+                    srflx_candidate_v6.priority = 1000000; // Host 후보보다 높은 우선순위
+                    srflx_candidate_v6.type = "srflx";
+                    srflx_candidate_v6.foundation = "SRFLX2";
+                    srflx_candidate_v6.component_id = component;
+                    srflx_candidate_v6.transport = "UDP";
+
+                    local_candidates_.push_back(srflx_candidate_v6);
+                    log(LogLevel::INFO, "Added local IPv4-mapped IPv6 srflx candidate: " + mapped_v6_endpoint.address().to_string() + ":" + std::to_string(mapped_v6_endpoint.port()) +
+                        " [Component " + std::to_string(component) + "]");
+
+                    if (candidate_callback_) {
+                        candidate_callback_(srflx_candidate_v6);
+                    }
+
+                    // Candidate Pair 생성
+                    CandidatePair pair_v6(srflx_candidate_v6, Candidate());
+                    check_list_.emplace_back(pair_v6);
+                }
+            }
         } catch (const std::exception& ex) {
             log(LogLevel::WARNING, "Failed to gather srflx candidate from STUN client: " + std::string(ex.what()));
         }
@@ -494,6 +563,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
         log(LogLevel::INFO, "Allocated relay endpoint: " + relay_endpoint.address().to_string() + ":" + std::to_string(relay_endpoint.port()));
 
         for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
+            // Relay Candidate 생성
             Candidate relay_candidate;
             relay_candidate.endpoint = relay_endpoint;
             relay_candidate.priority = 900000; // Host 및 srflx 후보보다 낮은 우선순위
@@ -510,8 +580,40 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
                 candidate_callback_(relay_candidate);
             }
 
+            // Candidate Pair 생성
             CandidatePair pair(relay_candidate, Candidate());
             check_list_.emplace_back(pair);
+        }
+
+        // Handle IPv4-mapped IPv6 relay endpoints if applicable
+        if(relay_endpoint.address().is_v6() && relay_endpoint.address().to_v4().is_unspecified()){
+            // Create IPv4-mapped IPv6 endpoint
+            asio::ip::address_v6 addr_v6 = relay_endpoint.address().to_v6();
+            asio::ip::address_v4 addr_v4 = asio::ip::address_v4::any();
+            asio::ip::address_v6 mapped_v6 = asio::ip::address_v6::v4_mapped(addr_v4);
+            asio::ip::udp::endpoint mapped_v6_relay_endpoint(mapped_v6, relay_endpoint.port());
+
+            for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
+                Candidate relay_candidate_v6;
+                relay_candidate_v6.endpoint = mapped_v6_relay_endpoint;
+                relay_candidate_v6.priority = 900000; // Host 및 srflx 후보보다 낮은 우선순위
+                relay_candidate_v6.type = "relay";
+                relay_candidate_v6.foundation = "RELAY2";
+                relay_candidate_v6.component_id = component;
+                relay_candidate_v6.transport = "UDP";
+
+                local_candidates_.push_back(relay_candidate_v6);
+                log(LogLevel::INFO, "Added local IPv4-mapped IPv6 relay candidate: " + mapped_v6_relay_endpoint.address().to_string() + ":" + std::to_string(mapped_v6_relay_endpoint.port()) +
+                    " [Component " + std::to_string(component) + "]");
+
+                if (candidate_callback_) {
+                    candidate_callback_(relay_candidate_v6);
+                }
+
+                // Candidate Pair 생성
+                CandidatePair pair_v6(relay_candidate_v6, Candidate());
+                check_list_.emplace_back(pair_v6);
+            }
         }
     } catch (const std::exception& ex) {
         log(LogLevel::ERROR, "Failed to allocate relay via TURN: " + std::string(ex.what()));
@@ -704,7 +806,8 @@ asio::awaitable<void> IceAgent::start_data_receive() {
                 data_callback_(recv_buffer, sender_endpoint);
             }
             log(LogLevel::INFO, "Received data: " + std::to_string(bytes_received) + " bytes from " +
-                sender_endpoint.address().to_string() + ":" + std::to_string(sender_endpoint.port()));
+                sender_endpoint.address().to_string() + ":" + std::to_string(sender_endpoint.port()) +
+                " (" + (sender_endpoint.address().is_v6() ? "IPv6" : "IPv4") + ")");
         } else {
             log(LogLevel::ERROR, "Failed to receive data: " + ec.message());
             transition_to_state(IceConnectionState::Failed);
@@ -778,7 +881,18 @@ uint32_t IceAgent::calculate_priority(const Candidate& local, const Candidate& r
 // Sort candidate pairs based on priority
 void IceAgent::sort_candidate_pairs() {
     std::sort(check_list_.begin(), check_list_.end(), [&](const CheckListEntry& a, const CheckListEntry& b) {
-        return a.pair.priority > b.pair.priority; // 내림차순 정렬
+        // Higher priority first
+        if(a.pair.priority != b.pair.priority){
+            return a.pair.priority > b.pair.priority;
+        }
+        // Prefer IPv4 over IPv6 if priorities are equal
+        if(a.pair.remote_candidate.endpoint.address().is_v4() && b.pair.remote_candidate.endpoint.address().is_v6()){
+            return true;
+        }
+        if(a.pair.remote_candidate.endpoint.address().is_v6() && b.pair.remote_candidate.endpoint.address().is_v4()){
+            return false;
+        }
+        return false;
     });
 }
 
