@@ -35,7 +35,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    size_t candidate_gather_retries,
                    std::chrono::seconds connectivity_check_timeout,
                    size_t connectivity_check_retries)
-    : strand_(io_context.get_executor())
+    : strand_(io_context.get_executor()),
 	  io_context_(io_context),
       socket_(strand_),
       role_(role),
