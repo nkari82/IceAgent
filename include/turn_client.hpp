@@ -13,6 +13,8 @@ class TurnClient {
 public:
     TurnClient(asio::io_context& io_context, const std::string& host, uint16_t port, const std::string& username, const std::string& password);
     
+	asio::awaitable<void> connect();
+	
     asio::awaitable<asio::ip::udp::endpoint> allocate_relay();
     
     asio::awaitable<void> refresh_allocation();

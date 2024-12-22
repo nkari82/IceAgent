@@ -36,6 +36,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    std::chrono::seconds connectivity_check_timeout,
                    size_t connectivity_check_retries)
     : io_context_(io_context), 
+	  strand_(asio::make_strand(io_context)),
       socket_(io_context_), 
       role_(role), 
       mode_(mode),
@@ -275,7 +276,8 @@ void IceAgent::send_data(const std::vector<uint8_t>& data) {
 }
 
 // Add remote candidate received via signaling
-void IceAgent::add_remote_candidate(const Candidate& candidate) {
+asio::awaitable<void> IceAgent::add_remote_candidate(const Candidate& candidate) {
+	co_await asio::bind_executor(strand_, asio::use_awaitable);
     remote_candidates_.push_back(candidate);
     log(LogLevel::INFO, "Added remote candidate: " + candidate.to_sdp());
 
@@ -431,6 +433,7 @@ asio::awaitable<void> IceAgent::gather_candidates(uint32_t attempts) {
 
 // Gather local host candidates
 asio::awaitable<void> IceAgent::gather_local_candidates() {
+	co_await asio::post(strand_, asio::use_awaitable);
     log(LogLevel::INFO, "Gathering local candidates...");
     
     // Resolve both IPv4 and IPv6 local addresses
@@ -462,20 +465,18 @@ asio::awaitable<void> IceAgent::gather_local_candidates() {
         add_candidate(entry.endpoint());
     }
 
-    for (const auto& entry : results_v6) {
-        // Check for IPv4-mapped IPv6 addresses
-        if(entry.endpoint().address().is_v6() && entry.endpoint().address().to_v4().is_unspecified()){
-            // Generate IPv4-mapped IPv6 address
-            asio::ip::address_v6 addr_v6 = entry.endpoint().address().to_v6();
-            asio::ip::address_v4 addr_v4 = asio::ip::address_v4::any();
-            asio::ip::address_v6 mapped_v6 = asio::ip::address_v6::v4_mapped(addr_v4);
-            asio::ip::udp::endpoint mapped_endpoint(mapped_v6, entry.endpoint().port());
-
-            add_candidate(mapped_endpoint);
-        } else {
-            add_candidate(entry.endpoint());
-        }
-    }
+	for (const auto& entry : results_v6) {
+		if (entry.endpoint().address().is_v6() && entry.endpoint().address().is_v4_mapped()) {
+			// Extract the embedded IPv4 address
+			asio::ip::address_v4 addr_v4 = entry.endpoint().address().to_v4();
+			asio::ip::address_v6 mapped_v6 = asio::ip::address_v6::v4_mapped(addr_v4);
+			asio::ip::udp::endpoint mapped_endpoint(mapped_v6, entry.endpoint().port());
+	
+			add_candidate(mapped_endpoint);
+		} else {
+			add_candidate(entry.endpoint());
+		}
+	}
 
     co_return;
 }
@@ -624,6 +625,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
 
 // Perform a single connectivity check
 asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry& entry) {
+	co_await asio::post(strand_, asio::use_awaitable);
     const CandidatePair& pair = entry.pair;
 
     if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
@@ -668,35 +670,40 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
             throw std::runtime_error("STUN Transaction ID mismatch.");
         }
 
-        if (response.get_type() != STUN_BINDING_RESPONSE_SUCCESS) {
-            throw std::runtime_error("Invalid STUN Binding Response type.");
-        }
-
-        // MESSAGE-INTEGRITY 검증
-        if (!response.verify_message_integrity(ice_attributes_.password)) {
-            throw std::runtime_error("Invalid MESSAGE-INTEGRITY in STUN response.");
-        }
-
-        // FINGERPRINT 검증
-        if (!response.verify_fingerprint()) {
-            throw std::runtime_error("Invalid FINGERPRINT in STUN response.");
-        }
+		// Verify message type
+		StunMessageType msg_type = response.get_type();
+		if (msg_type == StunMessageType::BINDING_RESPONSE_SUCCESS) {
+			// Proceed with success handling
+		} else if (msg_type == StunMessageType::BINDING_RESPONSE_ERROR) {
+			// Extract error code and reason
+			std::vector<uint8_t> error_code_bytes = response.get_attribute_as_bytes(StunAttributeType::UNKNOWN); // Replace with correct attribute type
+			if (!error_code_bytes.empty()) {
+				uint16_t error_code = (error_code_bytes[0] << 8) | error_code_bytes[1];
+				std::string reason = response.get_attribute_as_string(StunAttributeType::UNKNOWN); // Replace with correct attribute type
+				throw std::runtime_error("STUN Binding Error " + std::to_string(error_code) + ": " + reason);
+			} else {
+				throw std::runtime_error("STUN Binding Error: Unknown error.");
+			}
+		} else {
+			throw std::runtime_error("Unexpected STUN message type received.");
+		}
+		
+		// Verify MESSAGE-INTEGRITY and FINGERPRINT
+		if (!response.verify_message_integrity(ice_attributes_.password)) {
+			throw std::runtime_error("Invalid MESSAGE-INTEGRITY in STUN response.");
+		}
+		
+		if (!response.verify_fingerprint()) {
+			throw std::runtime_error("Invalid FINGERPRINT in STUN response.");
+		}
 
         // MAPPED-ADDRESS 추출
-        std::string mapped_address = response.get_attribute("MAPPED-ADDRESS");
-        if (mapped_address.empty()) {
-            throw std::runtime_error("MAPPED-ADDRESS attribute missing in STUN response.");
-        }
-
-        // MAPPED-ADDRESS 파싱
-        size_t colon_pos = mapped_address.find(':');
-        if (colon_pos == std::string::npos) {
-            throw std::runtime_error("Invalid MAPPED-ADDRESS format.");
-        }
-        std::string ip = mapped_address.substr(0, colon_pos);
-        uint16_t port = static_cast<uint16_t>(std::stoi(mapped_address.substr(colon_pos + 1)));
-
-        asio::ip::udp::endpoint mapped_endpoint(asio::ip::make_address(ip), port);
+        std::vector<uint8_t> xma_bytes = response.get_attribute_as_bytes(StunAttributeType::XOR_MAPPED_ADDRESS);
+		if (xma_bytes.empty()) {
+			throw std::runtime_error("XOR-MAPPED-ADDRESS attribute missing in STUN response.");
+}
+		// Parsing XOR-MAPPED-ADDRESS according to RFC 5389
+		asio::ip::udp::endpoint mapped_endpoint = StunMessage::parse_xor_mapped_address(xma_bytes);
 
         // 성공 처리
         co_return;
@@ -869,13 +876,20 @@ uint32_t IceAgent::calculate_priority(const Candidate& local, const Candidate& r
     if (local.type == "host") type_pref = 126;
     else if (local.type == "srflx") type_pref = 100;
     else if (local.type == "relay") type_pref = 0;
-    else type_pref = 0; // 기본값
+    else type_pref = 0; // Default
 
-    uint32_t local_pref = 65535; // Host 후보의 고유한 로컬 선호도
+    // Local preference can be dynamic or configurable
+    uint32_t local_pref = 65535; // Typically, host candidates have higher local preference
+    if (local.type == "srflx") {
+        local_pref = 10000;
+    } else if (local.type == "relay") {
+        local_pref = 5000;
+    }
+
     uint32_t component_id = static_cast<uint32_t>(local.component_id);
 
     // RFC8445 Priority Calculation: (Type Preference << 24) + (Local Preference << 8) + (256 - Component ID)
-    return (type_pref << 24) + (local_pref << 8) + (256 - component_id);
+    return (type_pref << 24) | (local_pref << 8) | (256 - component_id);
 }
 
 // Sort candidate pairs based on priority
@@ -899,7 +913,6 @@ void IceAgent::sort_candidate_pairs() {
 // Logging function with timestamp
 void IceAgent::log(LogLevel level, const std::string& message) {
     if (level >= log_level_) {
-        std::lock_guard<std::mutex> lock(log_mutex_); // 스레드 안전성 보장
         switch (level) {
             case LogLevel::DEBUG:
                 std::cout << "[DEBUG] ";
@@ -1057,24 +1070,30 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
 
 // Nominate a successful candidate pair based on role
 void IceAgent::nominate_pair(CheckListEntry& entry) {
-    if (role_ == IceRole::Controller) {
-        entry.is_nominated = true;
-        nominated_pair_ = entry.pair;
+    co_spawn(io_context_, asio::bind_executor(strand_,
+        [this, &entry]() -> asio::awaitable<void> {
+            if (role_ == IceRole::Controller) {
+                entry.is_nominated = true;
+                nominated_pair_ = entry.pair;
 
-        // NOMINATE 메시지 전송
-        asio::co_spawn(io_context_, send_nominate(entry.pair), asio::detached);
+                // Send NOMINATE message
+                co_await send_nominate(entry.pair);
 
-        log(LogLevel::INFO, "Nominated pair with " +
-            entry.pair.remote_candidate.endpoint.address().to_string() + ":" +
-            std::to_string(entry.pair.remote_candidate.endpoint.port()) +
-            " [Component " + std::to_string(entry.pair.local_candidate.component_id) + "]");
+                log(LogLevel::INFO, "Nominated pair with " +
+                    entry.pair.remote_candidate.endpoint.address().to_string() + ":" +
+                    std::to_string(entry.pair.remote_candidate.endpoint.port()) +
+                    " [Component " + std::to_string(entry.pair.local_candidate.component_id) + "]");
 
-        // 콜백 트리거
-        if (nominate_callback_) {
-            nominate_callback_(entry.pair);
-        }
-    }
-    // Controlled 역할은 NOMINATE를 수행하지 않음
+                // Trigger nomination callback
+                if (nominate_callback_) {
+                    nominate_callback_(entry.pair);
+                }
+
+                // Transition to Connected state
+                transition_to_state(IceConnectionState::Connected);
+            }
+            // Controlled role handles nomination differently
+        }, asio::use_awaitable));
 }
 
 // Handle Binding Indication messages (USE-CANDIDATE) from Controller

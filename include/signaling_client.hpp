@@ -18,6 +18,8 @@ class SignalingClient {
 public:
     SignalingClient(asio::io_context& io_context, const std::string& signaling_server, uint16_t port);
     
+	asio::awaitable<void> connect();
+	
     asio::awaitable<void> send_sdp(const std::string& sdp);
     
     asio::awaitable<std::string> receive_sdp();

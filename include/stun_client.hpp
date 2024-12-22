@@ -14,6 +14,8 @@ class StunClient {
 public:
     StunClient(asio::io_context& io_context, const std::string& host, uint16_t port, const std::string& key = "");
 
+	asio::awaitable<void> connect();
+
     asio::awaitable<asio::ip::udp::endpoint> send_binding_request();
 
     std::string get_server() const;

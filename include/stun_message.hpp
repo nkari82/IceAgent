@@ -36,10 +36,6 @@ enum class StunAttributeType : uint16_t {
     // 추가적인 STUN 속성 타입 정의
 };
 
-// 예시: PRIORITY 속성 추가
-// binding_request.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
-// binding_request.add_attribute(StunAttributeType::USERNAME, ice_attributes_.username_fragment);
-
 class StunMessage {
 public:
     StunMessage(StunMessageType type, const std::vector<uint8_t>& transaction_id);
@@ -74,7 +70,7 @@ public:
 
     static std::vector<uint8_t> generate_transaction_id();
 	
-	asio::ip::udp::endpoint parse_xor_mapped_address(const std::vector<uint8_t>& xma) const;
+	static asio::ip::udp::endpoint parse_xor_mapped_address(const std::vector<uint8_t>& xma) const;
 	
 private:
     StunMessageType type_;

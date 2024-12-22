@@ -195,11 +195,11 @@ public:
     void send_data(const std::vector<uint8_t>& data);
 
     // 신호를 통해 수신된 원격 후보 추가
-    void add_remote_candidate(const Candidate& candidate);
+    asio::awaitable<void> add_remote_candidate(const Candidate& candidate);
 
 private:
     // Member Variables
-	std::mutex log_mutex_; // 로그 뮤텍스 추가
+	asio::strand<asio::io_context::executor_type> strand_;
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
