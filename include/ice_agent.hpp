@@ -151,7 +151,8 @@ using NominateCallback = std::function<void(const CandidatePair&)>;
 struct IceAttributes {
     std::string username_fragment;
     std::string password;
-    // 추가적인 ICE-specific attributes
+	// 추가적인 ICE-specific attributes
+	uint64_t tie_breaker = 0;
 };
 
 // IceAgent 클래스 선언
@@ -193,6 +194,7 @@ public:
 
 private:
     // Member Variables
+	std::mutex log_mutex_; // 로그 뮤텍스 추가
     asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
     IceRole role_;
@@ -242,10 +244,6 @@ private:
     std::chrono::seconds connectivity_check_timeout_;
     size_t connectivity_check_retries_;
 
-    // Thread pool 관리
-    std::vector<std::thread> thread_pool_;
-    void initialize_thread_pool(size_t num_threads = std::thread::hardware_concurrency());
-
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<NatType> detect_nat_type();
@@ -264,10 +262,9 @@ private:
     void sort_candidate_pairs();
     void log(LogLevel level, const std::string& message);
     std::string nat_type_to_string(NatType nat_type) const;
-    void negotiate_role(IceRole remote_role);
+    void negotiate_role(IceRole remote_role, uint64_t remote_tie_breaker);
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> handle_incoming_signaling_messages();
-    std::vector<uint8_t> generate_transaction_id();
 	void nominate_pair(CheckListEntry& entry);
 	asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);
 };

@@ -3,15 +3,22 @@
 #include "crc32.hpp"
 
 uint32_t CRC32::calculate(const std::vector<uint8_t>& data) {
-    uint32_t crc = 0xFFFFFFFF;
-    for(auto byte : data) {
-        crc ^= byte;
-        for(int i = 0; i < 8; ++i) {
-            if(crc & 1)
-                crc = (crc >> 1) ^ 0xEDB88320;
-            else
-                crc >>=1;
+    static const std::array<uint32_t, 256> crc_table = [] {
+        std::array<uint32_t, 256> table = {};
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t crc = i;
+            for (uint32_t j = 0; j < 8; ++j) {
+                crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+            }
+            table[i] = crc;
         }
+        return table;
+    }();
+
+    uint32_t crc = 0xFFFFFFFF;
+    for (uint8_t byte : data) {
+        crc = (crc >> 8) ^ crc_table[(crc ^ byte) & 0xFF];
     }
-    return crc ^ 0xFFFFFFFF;
+
+    return ~crc;
 }

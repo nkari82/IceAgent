@@ -45,7 +45,7 @@ asio::awaitable<std::string> SignalingClient::receive_sdp() {
 }
 
 // Create SDP message
-std::string SignalingClient::create_sdp(const std::string& username_fragment, const std::string& password, const std::vector<std::string>& candidates, IceMode mode) {
+std::string SignalingClient::create_sdp(const std::string& username_fragment, const std::string& password, const std::vector<std::string>& candidates, IceMode mode, uint64_t tie_breaker) {
     std::ostringstream sdp;
     sdp << "v=0\r\n";
     sdp << "o=- 0 0 IN IP4 127.0.0.1\r\n";
@@ -56,6 +56,7 @@ std::string SignalingClient::create_sdp(const std::string& username_fragment, co
     if(mode == IceMode::Full){
         sdp << "a=ice-options:ice2,trickle\r\n";
     }
+	sdp << "a=ice-tie-breaker:" << tie_breaker << "\r\n";
     for(const auto& cand : candidates){
         sdp << cand << "\r\n";
     }
@@ -63,11 +64,12 @@ std::string SignalingClient::create_sdp(const std::string& username_fragment, co
 }
 
 // Parse SDP message
-std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string& sdp, std::vector<std::string>& candidates) {
+std::tuple<std::string, std::string, uint64_t> SignalingClient::parse_sdp(const std::string& sdp, std::vector<std::string>& candidates) {
     std::istringstream iss(sdp);
     std::string line;
     std::string ufrag;
     std::string pwd;
+	uint64_t tie_breaker;
     while(std::getline(iss, line)) {
         if(line.find("a=ice-ufrag:") == 0){
             ufrag = line.substr(12);
@@ -75,9 +77,12 @@ std::pair<std::string, std::string> SignalingClient::parse_sdp(const std::string
         else if(line.find("a=ice-pwd:") == 0){
             pwd = line.substr(10);
         }
+		else if(line.find("a=ice-tie-breaker:") == 0){
+            tie_breaker = std::stoull(line.substr(18));
+        }
         else if(line.find("a=candidate:") == 0){
             candidates.push_back(line);
         }
     }
-    return {ufrag, pwd};
+    return {ufrag, pwd, tie_breaker};
 }

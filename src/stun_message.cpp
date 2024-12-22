@@ -58,39 +58,47 @@ void StunMessage::add_fingerprint() {
 // Serialize the STUN message
 std::vector<uint8_t> StunMessage::serialize() const {
     std::vector<uint8_t> data;
-    // Message Type
-    uint16_t type = static_cast<uint16_t>(type_);
-    data.push_back((type >> 8) & 0xFF);
-    data.push_back(type & 0xFF);
-    // Placeholder for Message Length
+
+    // 메시지 헤더
+    uint16_t message_type = static_cast<uint16_t>(type_);
+    data.push_back((message_type >> 8) & 0xFF);
+    data.push_back(message_type & 0xFF);
+
+    // Placeholder for message length
     data.push_back(0x00);
     data.push_back(0x00);
+
     // Transaction ID
     data.insert(data.end(), transaction_id_.begin(), transaction_id_.end());
-    // Attributes
-    std::vector<uint8_t> attributes_data;
+
+    // Serialize attributes
     for (const auto& [attr_type, value] : attributes_) {
-        // Attribute Type
-        uint16_t type = static_cast<uint16_t>(attr_type);
-        attributes_data.push_back((type >> 8) & 0xFF);
-        attributes_data.push_back(type & 0xFF);
-        // Attribute Length
-        uint16_t length = static_cast<uint16_t>(value.size());
-        attributes_data.push_back((length >> 8) & 0xFF);
-        attributes_data.push_back(length & 0xFF);
-        // Attribute Value
-        attributes_data.insert(attributes_data.end(), value.begin(), value.end());
+        uint16_t attr = static_cast<uint16_t>(attr_type);
+        data.push_back((attr >> 8) & 0xFF);
+        data.push_back(attr & 0xFF);
+
+        uint16_t attr_length = static_cast<uint16_t>(value.size());
+        data.push_back((attr_length >> 8) & 0xFF);
+        data.push_back(attr_length & 0xFF);
+
+        data.insert(data.end(), value.begin(), value.end());
+
         // Padding to 4-byte boundary
-        while (attributes_data.size() % 4 != 0) {
-            attributes_data.push_back(0x00);
+        while (data.size() % 4 != 0) {
+            data.push_back(0x00);
         }
     }
-    // Set Message Length
-    uint16_t message_length = static_cast<uint16_t>(attributes_data.size());
+
+    // Update message length
+    uint16_t message_length = static_cast<uint16_t>(data.size() - 20); // 헤더사이즈 20
     data[2] = (message_length >> 8) & 0xFF;
     data[3] = message_length & 0xFF;
-    // Append Attributes
-    data.insert(data.end(), attributes_data.begin(), attributes_data.end());
+
+    // Padding
+    while (data.size() % 4 != 0) {
+        data.push_back(0x00);
+    }
+
     return data;
 }
 
@@ -307,7 +315,7 @@ std::vector<uint8_t> StunMessage::generate_transaction_id() {
     std::mt19937 gen(rd());
     std::uniform_int_distribution<> dis(0, 255);
     for(auto& byte : txn_id) {
-        byte = static_cast<uint8_t>(dis(gen));
+        byte = dis(gen);
     }
     return txn_id;
 }
