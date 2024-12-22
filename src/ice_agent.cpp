@@ -35,7 +35,8 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    size_t candidate_gather_retries,
                    std::chrono::seconds connectivity_check_timeout,
                    size_t connectivity_check_retries)
-    : io_context_(io_context), 
+    : strand_(io_context.get_executor())
+	  io_context_(io_context), 
       socket_(io_context_), 
       role_(role), 
       mode_(mode),
@@ -138,84 +139,94 @@ void IceAgent::set_log_level(LogLevel level) {
 
 // public
 // Start ICE process
-asio::awaitable<void> IceAgent::start() {
-    if (!transition_to_state(IceConnectionState::Gathering)) {
-        co_return;
-    }
-
-    try {
-    	// 상태 초기화
-    	transition_to_state(IceConnectionState::New);
-    	nominated_pair_ = CandidatePair();
-    	check_list_.clear();
-    	remote_candidates_.clear();
-    	local_candidates_.clear();
-    
-        // Step 1: Gather Candidates
-        co_await gather_candidates();
-
-        // Generate ICE credentials
-        std::random_device rd;
-        {
-        	std::mt19937 gen(rd());
-        	std::uniform_int_distribution<> dis(0, 255);
-        	ice_attributes_.username_fragment = "u" + std::to_string(dis(gen)) + std::to_string(dis(gen));
-        	ice_attributes_.password = "p" + std::to_string(dis(gen)) + std::to_string(dis(gen));
-		}
-
-    	// Tie-breaker 생성
-    	{
-    		std::mt19937_64 gen(rd());
-    		std::uniform_int_distribution<uint64_t> dis;
-    		ice_attributes_.tie_breaker = dis(gen);
-    	}
-    
-        // Exchange ICE parameters via signaling
-        if (signaling_client_) {
-            // Create SDP message
-            std::vector<std::string> cand_strings;
-            for(const auto& cand : local_candidates_) {
-                cand_strings.push_back("a=" + cand.to_sdp());
-            }
-            std::string sdp = signaling_client_->create_sdp(ice_attributes_, cand_strings, mode_);
-            co_await signaling_client_->send_sdp(sdp);
-            
-            // Spawn a coroutine to handle incoming signaling messages
-            co_spawn(io_context_, handle_incoming_signaling_messages(), asio::detached);
-        }
-
-        if (mode_ == IceMode::Full) {
-            if (!transition_to_state(IceConnectionState::Checking)) {
+void IceAgent::start() {
+    // Spawn the main ICE initiation coroutine using a lambda and strand_
+    asio::co_spawn(strand_,
+        [this, self = shared_from_this()]() -> asio::awaitable<void> {
+            if (current_state_ == IceConnectionState::Gathering) {
+                co_return;
                 co_return;
             }
 
-            // Perform connectivity checks with retry logic
-            co_await perform_connectivity_checks();
-        }
-        else {
-            // ICE Lite 모드에서는 Connectivity Checks를 수행하지 않음
-            log(LogLevel::INFO, "ICE Lite mode: Skipping connectivity checks.");
-            transition_to_state(IceConnectionState::Connected); // 직접 연결 상태로 전환
-            // **ICE Lite**는 상대방이 **Full ICE**를 수행한다고 가정하므로, **Nominated Pair**를 기다립니다.
-            // 따라서, **Nominated Pair**를 받으면 add_remote_candidate를 통해 처리하게 됩니다.
-        }
-        
-        if (current_state_ == IceConnectionState::Connected) {
-            // Spawn keep-alive coroutine
-            co_spawn(io_context_, perform_keep_alive(), asio::detached);
-        
-            // Spawn TURN allocation refresh coroutine if TURN is used
-            if (turn_client_ && turn_client_->is_allocated()) {
-                co_spawn(io_context_, perform_turn_refresh(), asio::detached);
+            // Transition from New to Gathering
+            if (!transition_to_state(IceConnectionState::Gathering)) {
+                co_return;
             }
 
-            // Start data reception
-            co_spawn(io_context_, start_data_receive(), asio::detached);
-        }
-    } catch (const std::exception& ex) {
-        log(LogLevel::ERROR, "Exception in ICE Agent: " + std::string(ex.what()));
-        transition_to_state(IceConnectionState::Failed);
-    }
+            try {
+                nominated_pair_ = CandidatePair();
+                check_list_.clear();
+                remote_candidates_.clear();
+                local_candidates_.clear();
+
+                // Step 1: Gather Candidates
+                co_await gather_candidates();
+
+                // Generate ICE credentials
+                std::random_device rd;
+                {
+                    std::mt19937 gen(rd());
+                    std::uniform_int_distribution<> dis(0, 255);
+                    ice_attributes_.username_fragment = "u" + std::to_string(dis(gen)) + std::to_string(dis(gen));
+                    ice_attributes_.password = "p" + std::to_string(dis(gen)) + std::to_string(dis(gen));
+                }
+
+                // Tie-breaker generation
+                {
+                    std::mt19937_64 gen(rd());
+                    std::uniform_int_distribution<uint64_t> dis;
+                    ice_attributes_.tie_breaker = dis(gen);
+                }
+
+                // Exchange ICE parameters via signaling
+                if (signaling_client_) {
+                    // Create SDP message
+                    std::vector<std::string> cand_strings;
+                    for(const auto& cand : local_candidates_) {
+                        cand_strings.push_back("a=" + cand.to_sdp());
+                    }
+                    std::string sdp = signaling_client_->create_sdp(ice_attributes_, cand_strings, mode_);
+                    co_await signaling_client_->send_sdp(sdp);
+                    
+                    // Spawn a coroutine to handle incoming signaling messages
+                    asio::co_spawn(strand_, handle_incoming_signaling_messages(), asio::detached);
+                }
+
+                if (mode_ == IceMode::Full) {
+                    if (!transition_to_state(IceConnectionState::Checking)) {
+                        co_return;
+                    }
+
+                    // Perform connectivity checks with retry logic
+                    co_await perform_connectivity_checks();
+                }
+                else {
+                    // In ICE Lite mode, skip connectivity checks
+                    log(LogLevel::INFO, "ICE Lite mode: Skipping connectivity checks.");
+                    transition_to_state(IceConnectionState::Connected); // Transition directly to Connected state
+                    // **ICE Lite** assumes the remote side performs Full ICE; wait for Nominated Pair via add_remote_candidate
+                }
+                
+                if (current_state_ == IceConnectionState::Connected) {
+                    // Spawn keep-alive coroutine
+                    asio::co_spawn(strand_, perform_keep_alive(), asio::detached);
+                
+                    // Spawn TURN allocation refresh coroutine if TURN is used
+                    if (turn_client_ && turn_client_->is_allocated()) {
+                        asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+                    }
+
+                    // Start data reception
+                    asio::co_spawn(strand_, start_data_receive(), asio::detached);
+                }
+            } catch (const std::exception& ex) {
+                log(LogLevel::ERROR, "Exception in ICE Agent: " + std::string(ex.what()));
+                transition_to_state(IceConnectionState::Failed);
+            }
+            co_return;
+        },
+        asio::detached
+    );
 }
 
 // Send data over established connection
@@ -236,30 +247,37 @@ void IceAgent::send_data(const std::vector<uint8_t>& data) {
 }
 
 // Add remote candidate received via signaling
-asio::awaitable<void> IceAgent::add_remote_candidate(const Candidate& candidate) {
-    remote_candidates_.push_back(candidate);
-    log(LogLevel::INFO, "Added remote candidate: " + candidate.to_sdp());
+void IceAgent::add_remote_candidate(const Candidate& candidate) {
+    // Spawn the remote candidate handling coroutine using a lambda and strand_
+    asio::co_spawn(strand_,
+        [this, self = shared_from_this(), candidate]() -> asio::awaitable<void> {
+            remote_candidates_.push_back(candidate);
+            log(LogLevel::INFO, "Added remote candidate: " + candidate.to_sdp());
 
-    // Notify via callback
-    if (candidate_callback_) {
-        candidate_callback_(candidate);
-    }
+            // Notify via callback
+            if (candidate_callback_) {
+                candidate_callback_(candidate);
+            }
 
-    // Create Candidate Pairs
-    for (const auto& local : local_candidates_) {
-        if (local.component_id == candidate.component_id) { // 동일한 컴포넌트에 대해만 쌍을 만듦
-            CandidatePair pair(local, candidate);
-            pair.priority = calculate_priority(local, candidate);
-            check_list_.emplace_back(pair);
-        }
-    }
+            // Create Candidate Pairs
+            for (const auto& local : local_candidates_) {
+                if (local.component_id == candidate.component_id) { // Pair only for the same component
+                    CandidatePair pair(local, candidate);
+                    pair.priority = calculate_priority(local, candidate);
+                    check_list_.emplace_back(pair);
+                }
+            }
 
-    // Perform connectivity checks if not already running (Full ICE mode)
-    if (mode_ == IceMode::Full && !connectivity_checks_running_) {
-        connectivity_checks_running_ = true;
-        co_await perform_connectivity_checks();
-        connectivity_checks_running_ = false;
-    }
+            // Perform connectivity checks if not already running (Full ICE mode)
+            if (mode_ == IceMode::Full && !connectivity_checks_running_) {
+                connectivity_checks_running_ = true;
+                co_await perform_connectivity_checks();
+                connectivity_checks_running_ = false;
+            }
+            co_return;
+        },
+        asio::detached
+    );
 }
 
 // private

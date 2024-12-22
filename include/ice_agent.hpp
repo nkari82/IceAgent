@@ -186,13 +186,13 @@ public:
     void set_log_level(LogLevel level);
 
     // ICE 프로세스 시작
-    asio::awaitable<void> start();
+    void start();
 
     // 연결된 소켓을 통해 데이터 전송
     void send_data(const std::vector<uint8_t>& data);
 
     // 신호를 통해 수신된 원격 후보 추가
-    asio::awaitable<void> add_remote_candidate(const Candidate& candidate);
+    void add_remote_candidate(const Candidate& candidate);
 
 private:
     // Member Variables
