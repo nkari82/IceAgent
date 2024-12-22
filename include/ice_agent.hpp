@@ -205,7 +205,7 @@ private:
     std::string turn_server_;
     std::string turn_username_;
     std::string turn_password_;
-    IceConnectionState current_state_;
+    std::atomic<IceConnectionState> current_state_;
     asio::steady_timer keep_alive_timer_;
     LogLevel log_level_;
 

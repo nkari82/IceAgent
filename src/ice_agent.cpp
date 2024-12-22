@@ -36,16 +36,16 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    std::chrono::seconds connectivity_check_timeout,
                    size_t connectivity_check_retries)
     : strand_(io_context.get_executor())
-	  io_context_(io_context), 
-      socket_(io_context_), 
-      role_(role), 
+	  io_context_(io_context),
+      socket_(strand_),
+      role_(role),
       mode_(mode),
-      stun_servers_(stun_servers), 
+      stun_servers_(stun_servers),
       turn_server_(turn_server),
       turn_username_(turn_username),
       turn_password_(turn_password),
       current_state_(IceConnectionState::New), 
-      keep_alive_timer_(io_context),
+      keep_alive_timer_(strand_),
       log_level_(LogLevel::INFO),
       connectivity_checks_running_(false),
       candidate_gather_timeout_(candidate_gather_timeout),
@@ -63,8 +63,8 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
         }
         std::string host = server.substr(0, colon_pos);
         uint16_t port = static_cast<uint16_t>(std::stoi(server.substr(colon_pos + 1)));
-        auto stun_client = std::make_shared<StunClient>(io_context_, host, port, ""); // 필요 시 키 제공
-        stun_clients_.push_back(stun_client);
+        auto stun_client = std::make_shared<StunClient>(strand_, host, port, ""); // 필요 시 키 제공
+        stun_clients_.push_back(std::move(stun_client));
     }
 
     // TURN 클라이언트 초기화
@@ -76,7 +76,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
         else {
             std::string host = turn_server_.substr(0, colon_pos);
             uint16_t port = static_cast<uint16_t>(std::stoi(turn_server_.substr(colon_pos + 1)));
-            turn_client_ = std::make_shared<TurnClient>(io_context_, host, port, turn_username_, turn_password_);
+            turn_client_ = std::make_shared<TurnClient>(strand_, host, port, turn_username_, turn_password_);
         }
     }
 
@@ -140,19 +140,18 @@ void IceAgent::set_log_level(LogLevel level) {
 // public
 // Start ICE process
 void IceAgent::start() {
+	if (current_state_ == IceConnectionState::Gathering) {
+		return;
+	}
+
+    // Transition from New to Gathering
+    if (!transition_to_state(IceConnectionState::Gathering)) {
+		return;
+	}
+	
     // Spawn the main ICE initiation coroutine using a lambda and strand_
     asio::co_spawn(strand_,
         [this, self = shared_from_this()]() -> asio::awaitable<void> {
-            if (current_state_ == IceConnectionState::Gathering) {
-                co_return;
-                co_return;
-            }
-
-            // Transition from New to Gathering
-            if (!transition_to_state(IceConnectionState::Gathering)) {
-                co_return;
-            }
-
             try {
                 nominated_pair_ = CandidatePair();
                 check_list_.clear();
@@ -323,7 +322,7 @@ asio::awaitable<NatType> IceAgent::detect_nat_type() {
 asio::awaitable<void> IceAgent::gather_candidates(uint32_t attempts) {
     try {
         // 후보 수집과 타임아웃을 병렬로 처리
-        asio::steady_timer gather_timer(io_context_);
+        asio::steady_timer gather_timer(strand_);
         gather_timer.expires_after(candidate_gather_timeout_);
 
         bool gather_completed = false;
@@ -417,7 +416,7 @@ asio::awaitable<void> IceAgent::gather_local_candidates() {
     log(LogLevel::INFO, "Gathering local candidates...");
     
     // Resolve both IPv4 and IPv6 local addresses
-    asio::ip::udp::resolver resolver(io_context_);
+    asio::ip::udp::resolver resolver(strand_);
     asio::ip::udp::resolver::results_type results_v4 = co_await resolver.async_resolve(asio::ip::udp::v4(), "0.0.0.0", "0", asio::use_awaitable);
     asio::ip::udp::resolver::results_type results_v6 = co_await resolver.async_resolve(asio::ip::udp::v6(), "::", "0", asio::use_awaitable);
 
@@ -621,7 +620,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         co_await socket_.async_send_to(asio::buffer(serialized_request), pair.remote_candidate.endpoint, asio::use_awaitable);
 
         // 타임아웃 설정
-        asio::steady_timer timer(io_context_);
+        asio::steady_timer timer(strand_);
         timer.expires_after(connectivity_check_timeout_);
 
         std::vector<uint8_t> recv_buffer(2048);
@@ -719,7 +718,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
             " [Component " + std::to_string(pair.local_candidate.component_id) + "]");
 
         // 타임아웃 설정
-        asio::steady_timer timer(io_context_);
+        asio::steady_timer timer(strand_);
         timer.expires_after(connectivity_check_timeout_);
 
         std::vector<uint8_t> recv_buffer(2048);
@@ -834,7 +833,7 @@ asio::awaitable<void> IceAgent::perform_keep_alive() {
 // Implement TURN allocation refresh
 asio::awaitable<void> IceAgent::perform_turn_refresh() {
     while (current_state_ == IceConnectionState::Connected && turn_client_ && turn_client_->is_allocated()) {
-        asio::steady_timer refresh_timer(io_context_);
+        asio::steady_timer refresh_timer(strand_);
         refresh_timer.expires_after(std::chrono::seconds(300)); // 예시: 5분마다
         co_await refresh_timer.async_wait(asio::use_awaitable);
 
