@@ -47,7 +47,6 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
       current_state_(IceConnectionState::New), 
       keep_alive_timer_(strand_),
       log_level_(LogLevel::INFO),
-      connectivity_checks_running_(false),
       candidate_gather_timeout_(candidate_gather_timeout),
       candidate_gather_retries_(candidate_gather_retries),
       connectivity_check_timeout_(connectivity_check_timeout),
@@ -118,10 +117,6 @@ void IceAgent::set_candidate_callback(CandidateCallback callback) {
 
 void IceAgent::set_data_callback(DataCallback callback) {
     data_callback_ = std::move(callback);
-}
-
-void IceAgent::set_nat_type_callback(NatTypeCallback cb) {
-    on_nat_type_detected_ = cb;
 }
 
 void IceAgent::set_nominate_callback(NominateCallback cb) {
@@ -267,11 +262,8 @@ void IceAgent::add_remote_candidate(const Candidate& candidate) {
                 }
             }
 
-            // Perform connectivity checks if not already running (Full ICE mode)
-            if (mode_ == IceMode::Full && !connectivity_checks_running_) {
-                connectivity_checks_running_ = true;
+            if (mode_ == IceMode::Full) {
                 co_await perform_connectivity_checks();
-                connectivity_checks_running_ = false;
             }
             co_return;
         },
@@ -292,125 +284,6 @@ bool IceAgent::transition_to_state(IceConnectionState new_state) {
     }
     return false;
 }
-
-// Detect NAT Type using STUN
-asio::awaitable<NatType> IceAgent::detect_nat_type() {
-    log(LogLevel::INFO, "Starting NAT type detection...");
-
-    // Gather mapped endpoints by sending STUN Binding Requests to all STUN servers
-    std::vector<asio::ip::udp::endpoint> mapped_endpoints;
-    for (auto& stun_client : stun_clients_) {
-        try {
-            asio::ip::udp::endpoint mapped_endpoint = co_await stun_client->send_binding_request();
-            mapped_endpoints.push_back(mapped_endpoint);
-            log(LogLevel::INFO, "Received mapped endpoint from " + stun_client->get_server() + ": " +
-                mapped_endpoint.address().to_string() + ":" + std::to_string(mapped_endpoint.port()));
-        } catch (const std::exception& ex) {
-            log(LogLevel::WARNING, "Failed to gather host candidate from " + stun_client->get_server() + ": " + ex.what());
-        }
-    }
-
-    // Infer NAT type based on mapped_endpoints
-    NatType nat_type = infer_nat_type(mapped_endpoints);
-
-    log(LogLevel::INFO, "Detected NAT Type: " + nat_type_to_string(nat_type));
-
-    co_return nat_type;
-}
-
-// Gather Candidates with Timeout and Retry Logic
-asio::awaitable<void> IceAgent::gather_candidates(uint32_t attempts) {
-    try {
-        // 후보 수집과 타임아웃을 병렬로 처리
-        asio::steady_timer gather_timer(strand_);
-        gather_timer.expires_after(candidate_gather_timeout_);
-
-        bool gather_completed = false;
-        std::exception_ptr gather_exception = nullptr;
-
-        // 후보 수집 코루틴
-        auto gather_coroutine = [this, &gather_completed, &gather_exception]() -> asio::awaitable<void> {
-            try {
-                // 로컬 후보 수집
-                co_await gather_local_candidates();
-
-                // srflx 후보 수집
-                co_await gather_srflx_candidates();
-
-                // NAT 타입 기반 후보 수집
-                NatType nat_type = co_await detect_nat_type();
-
-                // 콜백 알림
-                if (on_nat_type_detected_) {
-                    on_nat_type_detected_(nat_type);
-                }
-
-                switch (nat_type) {
-                    case NatType::FullCone:
-                    case NatType::RestrictedCone:
-                    case NatType::PortRestrictedCone:
-                        log(LogLevel::INFO, "Detected NAT type supports direct peer-to-peer connections.");
-                        break;
-                    case NatType::Symmetric:
-                        log(LogLevel::INFO, "Detected Symmetric NAT. Gathering relay candidates via TURN.");
-                        if (turn_client_) {
-                            co_await gather_relay_candidates();
-                        } else {
-                            log(LogLevel::WARNING, "TURN server not configured. Relay candidates cannot be gathered.");
-                        }
-                        break;
-                    case NatType::OpenInternet:
-                        log(LogLevel::INFO, "No NAT detected. Direct peer-to-peer connections are straightforward.");
-                        break;
-                    default:
-                        log(LogLevel::WARNING, "Unknown NAT type. Proceeding with default candidate gathering.");
-                        break;
-                }
-            } catch (...) {
-                gather_exception = std::current_exception();
-            }
-            gather_completed = true;
-        };
-
-        // 병렬로 후보 수집과 타임아웃 대기
-        co_await (
-            (gather_coroutine() && asio::use_awaitable) ||
-            (gather_timer.async_wait(asio::use_awaitable))
-        );
-
-        if (gather_completed) {
-            gather_timer.cancel(); // 타이머 취소
-        }
-
-        if (!gather_completed || gather_exception) {
-            if(gather_completed) {
-                log(LogLevel::WARNING, "Candidate gathering attempt " + std::to_string(attempts) + " failed.");
-            }
-            else {
-                // 타임아웃 발생
-                log(LogLevel::ERROR, "Candidate gathering timed out after " + std::to_string(candidate_gather_timeout_.count()) + " seconds.");
-            }
-            
-            attempts++;
-            if (attempts >= candidate_gather_retries_) {
-                log(LogLevel::ERROR, "Maximum candidate gathering retries exceeded.");
-                throw std::runtime_error("Candidate gathering timed out after maximum retries.");
-            } else {
-                log(LogLevel::INFO, "Retrying candidate gathering...");
-                remote_candidates_.clear();
-                check_list_.clear();
-                local_candidates_.clear();
-                co_await gather_candidates(attempts); // 재귀 호출로 재시도
-            }
-        }
-
-        co_return;
-    } catch (...) {
-        log(LogLevel::ERROR, "Exception during candidate gathering: " + std::string(std::current_exception() ? "Unknown exception" : "No exception"));
-        transition_to_state(IceConnectionState::Failed);
-    }
-}
-
 // Gather local host candidates
 asio::awaitable<void> IceAgent::gather_local_candidates() {
     log(LogLevel::INFO, "Gathering local candidates...");
@@ -609,10 +482,11 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
     if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
         // STUN Binding Request를 사용한 연결 검사
         std::vector<uint8_t> txn_id = StunMessage::generate_transaction_id();
-        StunMessage binding_request(STUN_BINDING_REQUEST, txn_id);
+        StunMessage binding_request(StunMessageType::BINDING_REQUEST, txn_id);
         binding_request.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
         binding_request.add_attribute(StunAttributeType::USERNAME, ice_attributes_.username_fragment);
-        binding_request.add_message_integrity(ice_attributes_.password); // StunMessage가 이 기능을 지원해야 함
+        binding_request.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint32(ice_attributes_.tie_breaker));
+        binding_request.add_message_integrity(ice_attributes_.password); // MESSAGE-INTEGRITY 추가
         binding_request.add_fingerprint(); // FINGERPRINT 속성 추가
         std::vector<uint8_t> serialized_request = binding_request.serialize();
 
@@ -626,7 +500,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
         std::vector<uint8_t> recv_buffer(2048);
         asio::ip::udp::endpoint sender_endpoint;
 
-        using namespace asio::experimental::awaitable_operators;
+        // STUN 응답 또는 타임아웃 대기
         auto [ec, bytes_received] = co_await (
             (socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable))
             || (timer.async_wait(asio::use_awaitable))
@@ -876,52 +750,6 @@ asio::awaitable<void> IceAgent::start_data_receive() {
     co_return;
 }
 
-// Infer NAT Type based on mapped endpoints
-NatType IceAgent::infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints) {
-    // 기본 검사
-    if (mapped_endpoints.empty()) {
-        return NatType::Symmetric;
-    }
-
-    // 고유한 IP와 포트 수 집계
-    std::vector<asio::ip::address_v4> unique_ips;
-    std::vector<uint16_t> unique_ports;
-
-    for (const auto& ep : mapped_endpoints) {
-        // 고유한 IP 확인
-        if (std::find(unique_ips.begin(), unique_ips.end(), ep.address().to_v4()) == unique_ips.end()) {
-            unique_ips.push_back(ep.address().to_v4());
-        }
-
-        // 고유한 포트 확인
-        if (std::find(unique_ports.begin(), unique_ports.end(), ep.port()) == unique_ports.end()) {
-            unique_ports.push_back(ep.port());
-        }
-    }
-
-    // 고유한 IP와 포트를 기반으로 NAT 타입 분석
-    if (unique_ips.size() == 1) {
-        if (unique_ports.size() == 1) {
-            // 모든 STUN 서버에서 동일한 IP와 포트
-            return NatType::FullCone;
-        } else {
-            // 동일한 IP지만 포트가 다른 경우
-            return NatType::RestrictedCone;
-        }
-    } else {
-        if (unique_ports.size() == 1) {
-            // 서로 다른 IP지만 동일한 포트
-            return NatType::PortRestrictedCone;
-        } else {
-            // 서로 다른 IP와 포트
-            return NatType::Symmetric;
-        }
-    }
-
-    // 기본값
-    return NatType::Unknown;
-}
-
 // RFC 8445에 따른 우선순위 계산
 uint32_t IceAgent::calculate_priority(const Candidate& local, const Candidate& remote) const {
     uint32_t type_pref;
@@ -1056,10 +884,10 @@ asio::awaitable<void> IceAgent::send_nominate(const CandidatePair& pair) {
 
 // Handle incoming signaling messages and process ICE parameters
 asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
-    while (current_state_ != IceConnectionState::Failed) {
+    while (current_state_ != IceConnectionState::Failed && current_state_ != IceConnectionState::Completed) {
         try {
             std::string sdp = co_await signaling_client_->receive_sdp();
-
+    
             // SDP 메시지 파싱
             std::vector<std::string> remote_candidates;
             std::string remote_ufrag;
@@ -1068,7 +896,7 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
             std::tie(remote_ufrag, remote_pwd, remote_tie_breaker) = signaling_client_->parse_sdp(sdp, remote_candidates);
 
             // Update ICE attributes
-          	ice_attributes_.username_fragment = remote_ufrag;
+            ice_attributes_.username_fragment = remote_ufrag;
             ice_attributes_.password = remote_pwd;
 
             // 원격 후보 파싱 및 추가
@@ -1079,10 +907,10 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
 
             // ICE-CONTROLLING 및 ICE-CONTROLLED에 따른 역할 결정
             IceRole remote_role;
-            if (sdp.find("ICE-CONTROLLING") != std::string::npos) {
+            if (sdp.find("ice-controlling") != std::string::npos || sdp.find("ICE-CONTROLLING") != std::string::npos) {
                 remote_role = IceRole::Controller;
             }
-            else if (sdp.find("ICE-CONTROLLED") != std::string::npos) {
+            else if (sdp.find("ice-controlled") != std::string::npos || sdp.find("ICE-CONTROLLED") != std::string::npos) {
                 remote_role = IceRole::Controlled;
             }
             else {
@@ -1095,31 +923,9 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
             if (remote_role_ == IceRole::Controller && role_ == IceRole::Controlled) {
                 // Controlled 역할에서는 Controller의 NOMINATE 메시지를 기다림
                 // Binding Indication 메시지(USE-CANDIDATE)를 수신하여 처리
-                // 지속적으로 메시지를 수신하도록 소켓을 설정
-                std::vector<uint8_t> recv_buffer(2048);
-                asio::ip::udp::endpoint sender_endpoint;
-                std::error_code ec;
-                size_t bytes_received = 0;
-                try {
-                    bytes_received = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
-                } catch (const std::exception& ex) {
-                    log(LogLevel::ERROR, "Failed to receive binding indication: " + std::string(ex.what()));
-                    transition_to_state(IceConnectionState::Failed);
-                    break;
-                }
-
-                if (bytes_received > 0) {
-                    recv_buffer.resize(bytes_received);
-                    try {
-                        StunMessage msg = StunMessage::parse(recv_buffer);
-                        if (msg.get_type() == StunMessageType::BINDING_INDICATION) {
-                            // Binding Indication 처리 (USE-CANDIDATE)
-                            co_await handle_binding_indication(msg, sender_endpoint);
-                        }
-                    } catch (const std::exception& ex) {
-                        log(LogLevel::WARNING, "Failed to parse incoming STUN message: " + std::string(ex.what()));
-                    }
-                }
+                // Binding Indication 수신 코루틴 시작
+                asio::co_spawn(strand_, listen_for_binding_indications(), asio::detached);
+                log(LogLevel::INFO, "Started listening for Binding Indication messages (USE-CANDIDATE) as Controlled role.");
             }
         } catch (const std::exception& ex) {
             log(LogLevel::ERROR, "Error handling signaling message: " + std::string(ex.what()));
@@ -1130,52 +936,69 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
 }
 
 // Nominate a successful candidate pair based on role
-awaitable<void> IceAgent::nominate_pair(CheckListEntry& entry) {
-	entry.is_nominated = true;
-	nominated_pair_ = entry.pair;
-	
-	if (role_ == IceRole::Controller) {
-		// Send NOMINATE message
-		co_await send_nominate(entry.pair);
-	}
-	else {
-		log(LogLevel::INFO, "Nominated pair " + ((role_ == IceRole::Controller) ? "(Controlling)" : "(Controlled)") + "role with " +
-	    entry.pair.remote_candidate.endpoint.address().to_string() + ":" +
-	    std::to_string(entry.pair.remote_candidate.endpoint.port()) +
-	    " [Component " + std::to_string(entry.pair.local_candidate.component_id) + "]");
-	    
-	
-		// Trigger nomination callback
-		if (nominate_callback_) {
-	    	nominate_callback_(entry.pair);
-	}
-	
-	// Transition to Connected state
-	transition_to_state(IceConnectionState::Connected);
-	co_return;
+asio::awaitable<void> IceAgent::nominate_pair(CheckListEntry& entry) {
+    entry.is_nominated = true;
+    nominated_pair_ = entry.pair;
+    
+    if (role_ == IceRole::Controller) {
+        // Send NOMINATE message
+        co_await send_nominate(entry.pair);
+    }
+    else if (role_ == IceRole::Controlled) {
+        // In Controlled role, NOMINATE is handled via received Binding Indication (USE-CANDIDATE)
+        log(LogLevel::INFO, "Nominated pair based on USE-CANDIDATE from Controller: " + entry.pair.remote_candidate.to_sdp());
+        
+        // Trigger nomination callback
+        if (nominate_callback_) {
+            nominate_callback_(entry.pair);
+        }
+        
+        // Transition to Connected state
+        transition_to_state(IceConnectionState::Connected);
+    }
+    
+    co_return;
+}
+
+// Binding Indication 메시지를 지속적으로 수신하고 처리하는 코루틴
+asio::awaitable<void> IceAgent::listen_for_binding_indications() {
+    log(LogLevel::DEBUG, "Started listening for Binding Indication messages (USE-CANDIDATE).");
+    while (current_state_ != IceConnectionState::Failed && current_state_ != IceConnectionState::Completed) {
+        try {
+            std::vector<uint8_t> recv_buffer(2048);
+            asio::ip::udp::endpoint sender_endpoint;
+            std::error_code ec;
+            size_t bytes_received = co_await socket_.async_receive_from(asio::buffer(recv_buffer), sender_endpoint, asio::use_awaitable);
+            
+            if (bytes_received == 0) {
+                continue; // 빈 메시지는 무시
+            }
+            
+            recv_buffer.resize(bytes_received);
+            StunMessage msg = StunMessage::parse(recv_buffer);
+            
+            if (msg.get_type() == StunMessageType::BINDING_INDICATION) {
+                log(LogLevel::DEBUG, "Received Binding Indication (USE-CANDIDATE) from " + sender_endpoint.address().to_string() + ":" + std::to_string(sender_endpoint.port()));
+                co_await handle_binding_indication(msg, sender_endpoint);
+            }
+        } catch (const std::exception& ex) {
+            log(LogLevel::ERROR, "Error receiving Binding Indication: " + std::string(ex.what()));
+            transition_to_state(IceConnectionState::Failed);
+            break;
+        }
+    }
+    co_return;
 }
 
 // Handle Binding Indication messages (USE-CANDIDATE) from Controller
 asio::awaitable<void> IceAgent::handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender) {
     // USE-CANDIDATE 속성 존재 여부 확인
     if (msg.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-        // Controlled 역할에서는 NOMINATE 메시지를 받으면 해당 페어를 후보로 선정
+        // Controlled 역할에서는 Controller의 NOMINATE 메시지를 받으면 해당 페어를 후보로 선정
         for (auto& entry : check_list_) {
             if (entry.state == CandidatePairState::Succeeded && !entry.is_nominated) {
-                entry.is_nominated = true;
-                nominated_pair_ = entry.pair;
-
-                log(LogLevel::INFO, "Nominated pair based on USE-CANDIDATE from Controller.");
-
-                // Connected 상태로 전환
-                transition_to_state(IceConnectionState::Connected);
-
-                // 콜백 알림
-                if (nominate_callback_) {
-                    nominate_callback_(entry.pair);
-                }
-
-                break;
+                co_await nominate_pair(entry);
+                break; // 첫 번째 성공한 페어를 지명
             }
         }
     }

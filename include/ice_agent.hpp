@@ -43,16 +43,6 @@ enum class IceConnectionState {
     Failed
 };
 
-// NAT 타입 정의
-enum class NatType {
-    Unknown,
-    OpenInternet,
-    FullCone,
-    RestrictedCone,
-    PortRestrictedCone,
-    Symmetric
-};
-
 // 로그 레벨 정의
 enum class LogLevel {
     DEBUG,
@@ -149,7 +139,6 @@ struct CheckListEntry {
 using StateCallback = std::function<void(IceConnectionState)>;
 using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
-using NatTypeCallback = std::function<void(NatType)>;
 using NominateCallback = std::function<void(const CandidatePair&)>;
 
 // ICE-specific STUN Attributes (예시)
@@ -178,7 +167,6 @@ public:
     void set_on_state_change_callback(StateCallback callback);
     void set_candidate_callback(CandidateCallback callback);
     void set_data_callback(DataCallback callback);
-    void set_nat_type_callback(NatTypeCallback cb);
     void set_nominate_callback(NominateCallback cb); // 추가됨
     void set_signaling_client(std::shared_ptr<SignalingClient> signaling_client);
 
@@ -227,12 +215,10 @@ private:
     StateCallback state_callback_;
     CandidateCallback candidate_callback_;
     DataCallback data_callback_;
-    NatTypeCallback on_nat_type_detected_;
-    NominateCallback nominate_callback_; // 추가됨
+    NominateCallback nominate_callback_;
 
     // Candidate Pair 관리
     CandidatePair nominated_pair_;
-    bool connectivity_checks_running_;
 
     // ICE-specific attributes
     IceAttributes ice_attributes_;
@@ -248,7 +234,6 @@ private:
 
     // Private Methods
     bool transition_to_state(IceConnectionState new_state);
-    asio::awaitable<NatType> detect_nat_type();
     asio::awaitable<void> gather_candidates(uint32_t attempts = 0);
     asio::awaitable<void> gather_local_candidates();
     asio::awaitable<void> gather_srflx_candidates();
@@ -259,15 +244,14 @@ private:
     asio::awaitable<void> perform_keep_alive();
     asio::awaitable<void> perform_turn_refresh();
     asio::awaitable<void> start_data_receive();
-    NatType infer_nat_type(const std::vector<asio::ip::udp::endpoint>& mapped_endpoints);
     uint32_t calculate_priority(const Candidate& local, const Candidate& remote) const;
     void sort_candidate_pairs();
     void log(LogLevel level, const std::string& message);
-    std::string nat_type_to_string(NatType nat_type) const;
     void negotiate_role(IceRole remote_role, uint64_t remote_tie_breaker);
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> handle_incoming_signaling_messages();
 	asio::awaitable<void> nominate_pair(CheckListEntry& entry);
+	asio::awaitable<void> listen_for_binding_indications();
 	asio::awaitable<void> handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);
 };
 
