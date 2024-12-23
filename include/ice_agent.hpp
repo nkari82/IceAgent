@@ -51,53 +51,84 @@ enum class LogLevel {
     ERROR
 };
 
+enum class CandidateType {
+    Host,
+    PeerReflexive,
+    ServerReflexive,
+    Relay
+};
+
 // Candidate 구조체
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
+    CandidateType type;
     uint32_t priority;
-    std::string type; // "host", "srflx", "relay"
-    std::string foundation;
     int component_id;
-    std::string transport;
+    std::string foundation;
+    std::string transport; // Typically "UDP"
 
+    // Convert Candidate to SDP format
     std::string to_sdp() const {
-        // SDP 표현 구현
-        // 예시: "a=candidate:1 1 UDP 2130706431 192.168.1.2 54400 typ host"
         std::ostringstream oss;
-        oss << "candidate:" << foundation << " " << component_id << " " << transport << " " << priority << " "
-            << endpoint.address().to_string() << " " << endpoint.port() << " typ " << type;
+        oss << "a=candidate:" << foundation << " " << component_id << " "
+            << transport << " " << priority << " "
+            << endpoint.address().to_string() << " " << endpoint.port()
+            << " typ ";
+
+        switch (type) {
+            case CandidateType::Host:
+                oss << "host";
+                break;
+            case CandidateType::PeerReflexive:
+                oss << "prflx";
+                break;
+            case CandidateType::ServerReflexive:
+                oss << "srflx";
+                break;
+            case CandidateType::Relay:
+                oss << "relay";
+                break;
+        }
+
         return oss.str();
     }
 
-    static Candidate from_sdp(const std::string& sdp) {
-		// SDP 문자열로부터 파싱 구현
-		// IPv4-mapped IPv6 예시: "a=candidate:1 1 UDP 2130706431 ::ffff:192.168.1.2 54400 typ host"
-		Candidate cand;
-		std::istringstream iss(sdp);
-		std::string prefix;
-		iss >> prefix; // "candidate:1"
-		size_t colon_pos = prefix.find(':');
-		if (colon_pos != std::string::npos) {
-			cand.foundation = prefix.substr(colon_pos + 1);
-		}
-		iss >> cand.component_id;
-		iss >> cand.transport;
-		iss >> cand.priority;
-		std::string ip;
-		uint16_t port;
-		iss >> ip;
-		iss >> port;
-		asio::ip::address address;
-		try {
-			address = asio::ip::make_address(ip);
-		} catch (const std::exception& e) {
-			throw std::runtime_error("Invalid IP address in SDP: " + ip);
-		}
-		cand.endpoint = asio::ip::udp::endpoint(address, port);
-		std::string typ;
-		iss >> typ; // "typ"
-		iss >> cand.type;
-		return cand;
+    // Parse Candidate from SDP format
+    static Candidate from_sdp(const std::string& sdp_line) {
+        Candidate cand;
+        std::istringstream iss(sdp_line);
+        std::string prefix;
+        iss >> prefix; // "a=candidate:<foundation>"
+
+        // Extract foundation
+        size_t colon_pos = prefix.find(':');
+        if (colon_pos != std::string::npos) {
+            cand.foundation = prefix.substr(colon_pos + 1);
+        }
+
+        iss >> cand.component_id;
+        std::string transport;
+        iss >> transport;
+        cand.transport = transport;
+        iss >> cand.priority;
+        std::string ip;
+        uint16_t port;
+        iss >> ip >> port;
+
+        asio::ip::address address = asio::ip::make_address(ip);
+        cand.endpoint = asio::ip::udp::endpoint(address, port);
+
+        std::string typ;
+        iss >> typ; // "typ"
+        std::string type_str;
+        iss >> type_str;
+        if (type_str == "host") cand.type = CandidateType::Host;
+        else if (type_str == "prflx") cand.type = CandidateType::PeerReflexive;
+        else if (type_str == "srflx") cand.type = CandidateType::ServerReflexive;
+        else if (type_str == "relay") cand.type = CandidateType::Relay;
+        else throw std::runtime_error("Unknown candidate type in SDP");
+
+        return cand;
     }
 };
 
@@ -114,14 +145,12 @@ enum class CandidatePairState {
 struct CandidatePair {
     Candidate local_candidate;
     Candidate remote_candidate;
-    uint32_t priority;
-    CandidatePairState state;
-    bool is_nominated;
+    uint64_t priority;
 
     // 생성자
     CandidatePair() = default;
     CandidatePair(const Candidate& local, const Candidate& remote)
-        : local_candidate(local), remote_candidate(remote), priority(0), state(CandidatePairState::New), is_nominated(false) {}
+        : local_candidate(local), remote_candidate(remote), priority(0) {}
 };
 
 // Check List Entry 구조체
@@ -129,10 +158,10 @@ struct CheckListEntry {
     CandidatePair pair;
     CandidatePairState state;
     bool is_nominated;
-    bool in_progress; // 추가됨
+	uint32_t retry_count;
 
     CheckListEntry(const CandidatePair& cp)
-        : pair(cp), state(CandidatePairState::New), is_nominated(false), in_progress(false) {}
+        : pair(cp), state(CandidatePairState::New), is_nominated(false), retry_count(0) {}
 };
 
 // 콜백 typedefs
@@ -141,12 +170,12 @@ using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
 using NominateCallback = std::function<void(const CandidatePair&)>;
 
-// ICE-specific STUN Attributes (예시)
+// ICE-specific STUN Attributes
 struct IceAttributes {
-    std::string username_fragment;
-    std::string password;
-	// 추가적인 ICE-specific attributes
-	uint64_t tie_breaker = 0;
+    std::string ufrag;
+    std::string pwd;
+    uint64_t tie_breaker;
+    IceRole role;
 };
 
 // IceAgent 클래스 선언
@@ -157,8 +186,6 @@ public:
              const std::string& turn_server = "",
              const std::string& turn_username = "", 
              const std::string& turn_password = "",
-             std::chrono::seconds candidate_gather_timeout = std::chrono::seconds(5),
-             size_t candidate_gather_retries = 1,
              std::chrono::seconds connectivity_check_timeout = std::chrono::seconds(3),
              size_t connectivity_check_retries = 1);
     ~IceAgent();
@@ -179,15 +206,10 @@ public:
     // 연결된 소켓을 통해 데이터 전송
     void send_data(const std::vector<uint8_t>& data);
 
-    // 신호를 통해 수신된 원격 후보 추가
-    void add_remote_candidate(const Candidate& candidate);
-
 private:
     // Member Variables
 	asio::strand<asio::io_context::executor_type> strand_;
-    asio::io_context& io_context_;
     asio::ip::udp::socket socket_;
-    IceRole role_;
     IceMode mode_;
     std::vector<std::string> stun_servers_;
     std::string turn_server_;
@@ -222,13 +244,9 @@ private:
 
     // ICE-specific attributes
     IceAttributes ice_attributes_;
-
-    // 역할 협상
-    IceRole remote_role_;
+	IceAttributes remote_ice_attributes_;
 
     // 타임아웃 및 재시도 설정 변수
-    std::chrono::seconds candidate_gather_timeout_;
-    size_t candidate_gather_retries_;
     std::chrono::seconds connectivity_check_timeout_;
     size_t connectivity_check_retries_;
 
@@ -244,12 +262,15 @@ private:
     asio::awaitable<void> perform_keep_alive();
     asio::awaitable<void> perform_turn_refresh();
     asio::awaitable<void> start_data_receive();
-    uint32_t calculate_priority(const Candidate& local, const Candidate& remote) const;
+    uint32_t calculate_priority(const Candidate& local) const;
+    uint64_t calculate_priority_pair(const Candidate& local, const Candidate& remote) const;
     void sort_candidate_pairs();
     void log(LogLevel level, const std::string& message);
-    void negotiate_role(IceRole remote_role, uint64_t remote_tie_breaker);
+    void negotiate_role(uint64_t remote_tie_breaker);
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
+    asio::awaitable<void> add_remote_candidate(const std::vector<Candidate>& candidates); // 신호를 통해 수신된 원격 후보 추가
     asio::awaitable<void> handle_incoming_signaling_messages();
+	asio::awaitable<void> handle_incoming_stun_messages();
 	asio::awaitable<void> nominate_pair(CheckListEntry& entry);
 	asio::awaitable<void> listen_for_binding_indications();
 	asio::awaitable<void> handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);

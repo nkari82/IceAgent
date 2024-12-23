@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <sstream>
 
+// https://datatracker.ietf.org/doc/rfc8839/
+
 // Constructor
 SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& signaling_server, uint16_t port)
     : io_context_(io_context), resolver_(io_context), socket_(io_context)
@@ -45,44 +47,68 @@ asio::awaitable<std::string> SignalingClient::receive_sdp() {
 }
 
 // Create SDP message
-std::string SignalingClient::create_sdp(const std::string& username_fragment, const std::string& password, const std::vector<std::string>& candidates, IceMode mode, uint64_t tie_breaker) {
+std::string SignalingClient::create_sdp(const IceAttributes& ice_attributes, const std::vector<std::string>& candidates, IceMode mode) {
     std::ostringstream sdp;
     sdp << "v=0\r\n";
-    sdp << "o=- 0 0 IN IP4 127.0.0.1\r\n";
+    sdp << "o=- 0 0 IN IP4 127.0.0.1\r\n"; // Simplified; replace with actual origin
     sdp << "s=-\r\n";
     sdp << "t=0 0\r\n";
-    sdp << "a=ice-ufrag:" << username_fragment << "\r\n";
-    sdp << "a=ice-pwd:" << password << "\r\n";
-    if(mode == IceMode::Full){
-        sdp << "a=ice-options:ice2,trickle\r\n";
+    sdp << "a=ice-ufrag:" << attrs.ufrag << "\r\n";
+    sdp << "a=ice-pwd:" << attrs.pwd << "\r\n";
+    if(mode == IceMode::Lite){
+        sdp << "a=ice-options:ice-lite\r\n"; // Include ice-lite option
     }
-	sdp << "a=ice-tie-breaker:" << tie_breaker << "\r\n";
+    else{
+        sdp << "a=ice-options:ice2,trickle\r\n"; // Example ICE options
+    }
     for(const auto& cand : candidates){
         sdp << cand << "\r\n";
     }
+    // Add ice-controlling or ice-controlled based on role
+    // if (attrs.controlling_role == IceRole::Controller) {
+    //     sdp << "a=ice-controlling:" << attrs.tie_breaker << "\r\n";
+    // }
+    // else if (attrs.controlling_role == IceRole::Controlled) {
+    //     sdp << "a=ice-controlled:" << attrs.tie_breaker << "\r\n";
+    // }
     return sdp.str();
 }
 
 // Parse SDP message
-std::tuple<std::string, std::string, uint64_t> SignalingClient::parse_sdp(const std::string& sdp, std::vector<std::string>& candidates) {
+std::tuple<IceAttributes, std::vector<std::string>> SignalingClient::parse_sdp(const std::string& sdp) {
     std::istringstream iss(sdp);
     std::string line;
-    std::string ufrag;
-    std::string pwd;
-	uint64_t tie_breaker;
-    while(std::getline(iss, line)) {
-        if(line.find("a=ice-ufrag:") == 0){
-            ufrag = line.substr(12);
+	IceAttributes ice_attributes;
+	std::vector<std::Candidate>& candidates
+
+	while (std::getline(iss, line)) {
+        if (line.find("a=ice-ufrag:") == 0) {
+            ice_attributes.ufrag = line.substr(11);
         }
-        else if(line.find("a=ice-pwd:") == 0){
-            pwd = line.substr(10);
+        else if (line.find("a=ice-pwd:") == 0) {
+            ice_attributes.pwd = line.substr(10);
         }
-		else if(line.find("a=ice-tie-breaker:") == 0){
-            tie_breaker = std::stoull(line.substr(18));
+        else if (line.find("a=ice-options:") == 0) {
+            // Parse and handle ice-options if needed
+            // std::string ice_options = line.substr(14);
+            // log(LogLevel::INFO, "Negotiated ICE options: " + ice_options);
+            // Adjust behavior based on negotiated options if necessary
         }
-        else if(line.find("a=candidate:") == 0){
-            candidates.push_back(line);
+		else if(line.find("a=ice-tie-breaker:") == 0) {
+			ice_attributes.tie_breaker = std::stoull(line.substr(18));
+		}
+        // else if (line.find("a=ice-controlling:") == 0) {
+        //    tie_breaker = std::stoull(line.substr(18));
+        //    role = IceRole::Controller;
+        // }
+        // else if (line.find("a=ice-controlled:") == 0) {
+        //    tie_breaker = std::stoull(line.substr(17));
+        //    role = IceRole::Controlled;
+        // }
+        else if (line.find("a=candidate:") == 0) {
+            candidates.push_back(Candidate from_sdp(line));
         }
     }
-    return {ufrag, pwd, tie_breaker};
+	
+    return {ice_attributes, candidates};
 }

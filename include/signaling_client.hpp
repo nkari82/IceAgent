@@ -8,11 +8,7 @@
 #include <string>
 #include <vector>
 #include <memory>
-
-enum class IceMode {
-    Full,
-    Lite
-};
+#include <ice_agent.hpp>
 
 class SignalingClient {
 public:
@@ -24,9 +20,9 @@ public:
     
     asio::awaitable<std::string> receive_sdp();
     
-    std::string create_sdp(const std::string& username_fragment, const std::string& password, const std::vector<std::string>& candidates, IceMode mode, uint64_t tie_breaker);
+    std::string create_sdp(const IceAttributes& ice_attributese, const std::vector<std::string>& candidates, IceMode mode);
     
-    std::tuple<std::string, std::string, uint64_t> parse_sdp(const std::string& sdp, std::vector<std::string>& candidates);
+    std::tuple<IceAttributes, std::vector<Candidate>> parse_sdp(const std::string& sdp);
     
 private:
     asio::io_context& io_context_;

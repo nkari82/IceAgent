@@ -55,7 +55,7 @@ std::string StunClient::get_server() const {
 }
 
 // Send Binding Request and receive Binding Response
-asio::awaitable<asio::ip::udp::endpoint> StunClient::send_binding_request() {
+asio::awaitable<asio::ip::udp::endpoint> StunClient::send_binding_request(asio::strand<asio::io_context::executor_type>& strand) {
     // Generate Transaction ID
     std::vector<uint8_t> txn_id = StunMessage::generate_transaction_id();
     
