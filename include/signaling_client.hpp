@@ -13,14 +13,12 @@
 class SignalingClient {
 public:
     SignalingClient(asio::io_context& io_context, const std::string& signaling_server, uint16_t port);
-    
-	asio::awaitable<void> connect();
-	
+
     asio::awaitable<void> send_sdp(const std::string& sdp);
     
     asio::awaitable<std::string> receive_sdp();
     
-    std::string create_sdp(const IceAttributes& ice_attributese, const std::vector<std::string>& candidates, IceMode mode);
+    std::string create_sdp(const IceAttributes& ice_attributese, const std::vector<std::string>& candidates);
     
     std::tuple<IceAttributes, std::vector<Candidate>> parse_sdp(const std::string& sdp);
     

@@ -174,8 +174,9 @@ using NominateCallback = std::function<void(const CandidatePair&)>;
 struct IceAttributes {
     std::string ufrag;
     std::string pwd;
+	IceRole role;
     uint64_t tie_breaker;
-    IceRole role;
+	std::set<std::string> options; // options.contains(key = ice-lite, ice2, trickle)
 };
 
 // IceAgent 클래스 선언
@@ -210,7 +211,9 @@ private:
     // Member Variables
 	asio::strand<asio::io_context::executor_type> strand_;
     asio::ip::udp::socket socket_;
+	IceRole role_;
     IceMode mode_;
+	uint64_t tie_breaker_;
     std::vector<std::string> stun_servers_;
     std::string turn_server_;
     std::string turn_username_;
@@ -251,6 +254,7 @@ private:
     size_t connectivity_check_retries_;
 
     // Private Methods
+	IceAttributes generate_ice_attributes();
     bool transition_to_state(IceConnectionState new_state);
     asio::awaitable<void> gather_candidates(uint32_t attempts = 0);
     asio::awaitable<void> gather_local_candidates();
@@ -270,7 +274,6 @@ private:
     asio::awaitable<void> send_nominate(const CandidatePair& pair);
     asio::awaitable<void> add_remote_candidate(const std::vector<Candidate>& candidates); // 신호를 통해 수신된 원격 후보 추가
     asio::awaitable<void> handle_incoming_signaling_messages();
-	asio::awaitable<void> handle_incoming_stun_messages();
 	asio::awaitable<void> nominate_pair(CheckListEntry& entry);
 	asio::awaitable<void> listen_for_binding_indications();
 	asio::awaitable<void> handle_binding_indication(const StunMessage& msg, const asio::ip::udp::endpoint& sender);

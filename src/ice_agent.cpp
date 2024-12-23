@@ -30,6 +30,19 @@ static std::vector<uint8_t> serialize_uint32(uint32_t value) {
     return serialized;
 }
 
+static std::string generate_random_string(size_t length) {
+    const std::string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dis(0, chars.size() - 1);
+    std::string s;
+    s.reserve(length);
+    for (size_t i = 0; i < length; ++i) {
+        s += chars[dis(gen)];
+    }
+    return s;
+}
+
 // Constructor
 IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
                    const std::vector<std::string>& stun_servers, 
@@ -42,6 +55,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
       socket_(strand_),
       role_(role),
       mode_(mode),
+	  tie_breaker_(0),
       stun_servers_(stun_servers),
       turn_server_(turn_server),
       turn_username_(turn_username),
@@ -51,18 +65,7 @@ IceAgent::IceAgent(asio::io_context& io_context, IceRole role, IceMode mode,
       log_level_(LogLevel::INFO),
       connectivity_check_timeout_(connectivity_check_timeout),
       connectivity_check_retries_(connectivity_check_retries)
-{
-	// Generate ICE credentials
-    std::random_device rd;
-    std::mt19937 gen(rd());
-	std::mt19937_64 gen64(rd());
-    std::uniform_int_distribution<> dis(0, 255);
-	std::uniform_int_distribution<uint64_t> dis64;
-    ice_attributes_.ufrag = "u" + std::to_string(dis(gen)) + std::to_string(dis(gen));
-    ice_attributes_.pwd = "p" + std::to_string(dis(gen)) + std::to_string(dis(gen));
-	ice_attributes_.tie_breaker = dis64(gen);
-	ice_attributes_.role = role;
-	
+{	
     // STUN 클라이언트 초기화
     for (const auto& server : stun_servers_) {
         size_t colon_pos = server.find(':');
@@ -174,12 +177,11 @@ void IceAgent::start() {
 					// Handle sending candidates as they are gathered
 					// This requires implementing candidate gathering callbacks or signals
 				
+					// Generate ICE credentials
+					IceAttributes ice_attributes = generate_ice_attributes();
+	
                     // Create SDP message
-                    std::vector<std::string> cand_strings;
-                    for(const auto& cand : local_candidates_) {
-                        cand_strings.push_back("a=" + cand.to_sdp());
-                    }
-                    std::string sdp = signaling_client_->create_sdp(ice_attributes_, cand_strings, mode_);
+                    std::string sdp = signaling_client_->create_sdp(ice_attributes, local_candidates_);
                     co_await signaling_client_->send_sdp(sdp);
                     
                     // Spawn a coroutine to handle incoming signaling messages
@@ -243,6 +245,28 @@ void IceAgent::send_data(const std::vector<uint8_t>& data) {
 }
 
 // private
+IceAttributes IceAgent::generate_ice_attributes() {
+	IceAttributes ice_attributes;
+	std::random_device rd;
+	std::mt19937_64 gen64(rd());
+	std::uniform_int_distribution<uint64_t> dis64;
+	tie_breaker_ = dis64(gen);
+	
+	ice_attributes.ufrag = generate_random_string(16);	// Example: 16 characters
+	ice_attributes.pwd = generate_random_string(22);	// Minimum 22 characters as per RFC
+	ice_attributes.tie_breaker = tie_breaker_;
+	ice_attributes.role = role_;
+	
+	if (mode_ == IceMode::Full) {
+		ice_attributes.options.insert("ice2");
+		ice_attributes.options.insert("trickle");
+	}
+	else {
+		ice_attributes.options.insert("ice-lite");
+	}
+	return ice_attributes;
+}
+
 // Transition ICE state
 bool IceAgent::transition_to_state(IceConnectionState new_state) {
     if (current_state_ != new_state) {
@@ -284,7 +308,7 @@ asio::awaitable<void> IceAgent::gather_local_candidates() {
         for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
 			Candidate candidate;
 			candidate.endpoint = endpoint;
-			candidate.type = "host";
+			candidate.type = CandidateType::Host;
 			candidate.foundation = "1";
 			candidate.component_id = component;
 			candidate.transport = "UDP";
@@ -335,7 +359,7 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
                 // SRFLX 후보 생성
                 Candidate srflx_candidate;
                 srflx_candidate.endpoint = mapped_endpoint;
-                srflx_candidate.type = "srflx";
+                srflx_candidate.type = CandidateType::ServerReflexive;
                 srflx_candidate.foundation = "SRFLX1";
                 srflx_candidate.component_id = component;
                 srflx_candidate.transport = "UDP";
@@ -349,9 +373,7 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
                     candidate_callback_(srflx_candidate);
                 }
 
-                // Candidate Pair 생성
-                CandidatePair pair(srflx_candidate, Candidate());
-                check_list_.emplace_back(pair);
+                local_candidates_.push_back(candidate);
             }
 
             // Handle IPv4-mapped IPv6 if applicable
@@ -365,7 +387,7 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
                 for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
                     Candidate srflx_candidate_v6;
                     srflx_candidate_v6.endpoint = mapped_v6_endpoint;
-                    srflx_candidate_v6.type = "srflx";
+                    srflx_candidate_v6.type = CandidateType::ServerReflexive;
                     srflx_candidate_v6.foundation = "SRFLX2";
                     srflx_candidate_v6.component_id = component;
                     srflx_candidate_v6.transport = "UDP";
@@ -379,9 +401,7 @@ asio::awaitable<void> IceAgent::gather_srflx_candidates() {
                         candidate_callback_(srflx_candidate_v6);
                     }
 
-                    // Candidate Pair 생성
-                    CandidatePair pair_v6(srflx_candidate_v6, Candidate());
-                    check_list_.emplace_back(pair_v6);
+					local_candidates_.push_back(srflx_candidate_v6);
                 }
             }
         } catch (const std::exception& ex) {
@@ -406,7 +426,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
             // Relay Candidate 생성
             Candidate relay_candidate;
             relay_candidate.endpoint = relay_endpoint;
-            relay_candidate.type = "relay";
+            relay_candidate.type = CandidateType::Relay;
             relay_candidate.foundation = "RELAY1";
             relay_candidate.component_id = component;
             relay_candidate.transport = "UDP";
@@ -420,9 +440,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
                 candidate_callback_(relay_candidate);
             }
 
-            // Candidate Pair 생성
-            CandidatePair pair(relay_candidate, Candidate());
-            check_list_.emplace_back(pair);
+			local_candidates_.push_back(relay_candidate);
         }
 
         // Handle IPv4-mapped IPv6 relay endpoints if applicable
@@ -436,7 +454,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
             for (int component = 1; component <= NUM_COMPONENTS; ++component) { // 다중 컴포넌트 지원
                 Candidate relay_candidate_v6;
                 relay_candidate_v6.endpoint = mapped_v6_relay_endpoint;
-                relay_candidate_v6.type = "relay";
+                relay_candidate_v6.type = CandidateType::Relay;
                 relay_candidate_v6.foundation = "RELAY2";
                 relay_candidate_v6.component_id = component;
                 relay_candidate_v6.transport = "UDP";
@@ -450,9 +468,7 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
                     candidate_callback_(relay_candidate_v6);
                 }
 
-                // Candidate Pair 생성
-                CandidatePair pair_v6(relay_candidate_v6, Candidate());
-                check_list_.emplace_back(pair_v6);
+				local_candidates_.push_back(relay_candidate_v6);
             }
         }
     } catch (const std::exception& ex) {
@@ -466,7 +482,8 @@ asio::awaitable<void> IceAgent::gather_relay_candidates() {
 asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry& entry) {
     const CandidatePair& pair = entry.pair;
 
-    if (pair.remote_candidate.type == "srflx" || pair.remote_candidate.type == "host") {
+    if (pair.remote_candidate.type == CandidateType::ServerReflexive || 
+		pair.remote_candidate.type == CandidateType::Host) {
         // STUN Binding Request를 사용한 연결 검사
         std::vector<uint8_t> txn_id = StunMessage::generate_transaction_id();
         StunMessage binding_request(StunMessageType::BINDING_REQUEST, txn_id);
@@ -569,7 +586,7 @@ asio::awaitable<void> IceAgent::perform_single_connectivity_check(CheckListEntry
 
         co_return;
     }
-    else if (pair.remote_candidate.type == "relay") {
+    else if (pair.remote_candidate.type == CandidateType::Relay) {
         // TURN Send를 사용한 릴레이 연결 검사 (데이터 전송)
         std::vector<uint8_t> data = { 'D', 'A', 'T', 'A' };
         co_await socket_.async_send_to(asio::buffer(data), pair.remote_candidate.endpoint, asio::use_awaitable);
@@ -775,8 +792,8 @@ asio::awaitable<void> IceAgent::start_data_receive() {
 
 // RFC 8445에 따른 우선순위 계산
 uint32_t IceAgent::calculate_priority(const Candidate& local) const {
-   uint32_t type_pref;
-    switch (candidate.type) {
+    uint32_t type_pref;
+    switch (local.type) {
         case CandidateType::Host:
             type_pref = 126;
             break;
@@ -793,8 +810,8 @@ uint32_t IceAgent::calculate_priority(const Candidate& local) const {
             type_pref = 0;
     }
 
-    uint32_t local_pref = 65535; // Can be adjusted as needed
-    uint32_t component_id = static_cast<uint32_t>(candidate.component_id);
+    uint32_t local_pref = 65535; // Typically based on base preferences
+    uint32_t component_id = static_cast<uint32_t>(local.component_id);
 
     // RFC 8445 Priority Calculation: (type-preference << 24) | (local-preference << 8) | (256 - component-id)
     return (type_pref << 24) | (local_pref << 8) | (256 - component_id);
@@ -863,12 +880,10 @@ void IceAgent::log(LogLevel level, const std::string& message) {
 
 // Negotiate role based on remote signaling
 void IceAgent::negotiate_role(uint64_t remote_tie_breaker) {
-    if (ice_attributes_.tie_breaker > remote_tie_breaker) {
+    if (tie_breaker_ > remote_tie_breaker) {
         role_ = IceRole::Controller;
-        remote_role_ = IceRole::Controlled;
     } else {
         role_ = IceRole::Controlled;
-        remote_role_ = IceRole::Controller;
     }
     log(LogLevel::INFO, "Negotiated role: " + std::to_string(static_cast<int>(role_)));
 }
@@ -951,23 +966,35 @@ asio::awaitable<void> IceAgent::handle_incoming_signaling_messages() {
     
             // SDP 메시지 파싱
 			auto [remote_ice_attributes,  remote_candidates] = signaling_client_->parse_sdp(sdp);
-			remote_ice_attributes_ = remote_ice_attributes;
-
+			
+			// Detect ICE restart
+			/*
+            if (remote_ice_attributes.options("ice2")) { // ice-options:ice2
+                log(LogLevel::INFO, "Detected ICE Restart in SDP.");
+                IceAttributes ice_attributes = generate_ice_attributes();
+	
+                // Create SDP message
+                std::string sdp = signaling_client_->create_sdp(ice_attributes, local_candidates_)
+                co_await signaling_client_->send_sdp(sdp);
+                continue;
+            }
+			*/
+	
 			// Negotiate role based on tie-breaker
-			negotiate_role(remote_ice_attributes_.remote_tie_breaker);
+			negotiate_role(remote_ice_attributes.tie_breaker);
 
             // 원격 후보 파싱 및 추가
 			co_await add_remote_candidate(remote_candidates);
 
             // 역할 협상에 따른 처리
-            if (remote_ice_attributes_.remote_role == IceRole::Controller && ice_attributes_.role == IceRole::Controlled) {
+            if (remote_ice_attributes.role == IceRole::Controller && role_ == IceRole::Controlled) {
                 // Controlled 역할에서는 Controller의 NOMINATE 메시지를 기다림
                 // Binding Indication 메시지(USE-CANDIDATE)를 수신하여 처리
                 // Binding Indication 수신 코루틴 시작은 이미 start()에서 수행됨
                 asio::co_spawn(strand_, listen_for_binding_indications(), asio::detached);
                 log(LogLevel::INFO, "Started listening for Binding Indication messages (USE-CANDIDATE) as Controlled role.");
             }
-			else if (remote_ice_attributes_.role == IceRole::Controlled && ice_attributes_.role == IceRole::Controller) {
+			else if (remote_ice_attributes.role == IceRole::Controlled && role_ == IceRole::Controller) {
 				if (mode_ == IceMode::Lite) {
 					// Ice Lite 에이전트는 일반적으로 Controlled 역할만 수행하므로 이 경우 예외 처리 필요
 					log(LogLevel::ERROR, "ICE Lite agent should not negotiate as Controller.");

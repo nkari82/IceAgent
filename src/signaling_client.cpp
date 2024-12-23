@@ -4,8 +4,6 @@
 #include <stdexcept>
 #include <sstream>
 
-// https://datatracker.ietf.org/doc/rfc8839/
-
 // Constructor
 SignalingClient::SignalingClient(asio::io_context& io_context, const std::string& signaling_server, uint16_t port)
     : io_context_(io_context), resolver_(io_context), socket_(io_context)
@@ -46,31 +44,57 @@ asio::awaitable<std::string> SignalingClient::receive_sdp() {
     return std::string(sdp_data.begin(), sdp_data.end());
 }
 
+/*
+if(mode == IceMode::Lite){
+    sdp << "a=ice-options:ice-lite\r\n"; // Include ice-lite option
+}
+else{
+    sdp << "a=ice-options:ice2,trickle\r\n"; // Example ICE options
+}
+*/
+
+// SDP
+// v=: SDP 버전
+// o=: 세션의 소유자 및 세션 ID
+// s=: 세션 이름
+// t=: 세션의 활성 시간
+// a=: 속성(attribute)
+// m=: 미디어 설명
+	
 // Create SDP message
-std::string SignalingClient::create_sdp(const IceAttributes& ice_attributes, const std::vector<std::string>& candidates, IceMode mode) {
+std::string SignalingClient::create_sdp(const IceAttributes& attrs, const std::vector<Candidate>& candidates) {
     std::ostringstream sdp;
     sdp << "v=0\r\n";
     sdp << "o=- 0 0 IN IP4 127.0.0.1\r\n"; // Simplified; replace with actual origin
     sdp << "s=-\r\n";
     sdp << "t=0 0\r\n";
-    sdp << "a=ice-ufrag:" << attrs.ufrag << "\r\n";
-    sdp << "a=ice-pwd:" << attrs.pwd << "\r\n";
-    if(mode == IceMode::Lite){
-        sdp << "a=ice-options:ice-lite\r\n"; // Include ice-lite option
-    }
-    else{
-        sdp << "a=ice-options:ice2,trickle\r\n"; // Example ICE options
-    }
+	if (!attrs.ufrag.empty())
+		sdp << "a=ice-ufrag:" << attrs.ufrag << "\r\n";
+	
+	if (!attrs.pwd.empty())
+		sdp << "a=ice-pwd:" << attrs.pwd << "\r\n";
+
+	if (!attrs.options.empty()) {
+        sdp << "a=ice-options:";
+        for (auto it = attrs.options.begin(); it != attrs.options.end(); ++it) {
+            if (it != attrs.options.begin()) {
+                sdp << ",";
+            }
+            sdp << *it;
+        }
+        sdp << "\r\n";
+	}
+		
     for(const auto& cand : candidates){
-        sdp << cand << "\r\n";
+        sdp << "a=" << cand.to_sdp() << "\r\n";
     }
     // Add ice-controlling or ice-controlled based on role
-    // if (attrs.controlling_role == IceRole::Controller) {
-    //     sdp << "a=ice-controlling:" << attrs.tie_breaker << "\r\n";
-    // }
-    // else if (attrs.controlling_role == IceRole::Controlled) {
-    //     sdp << "a=ice-controlled:" << attrs.tie_breaker << "\r\n";
-    // }
+    if (attrs.controlling_role == IceRole::Controller) {
+         sdp << "a=ice-controlling:" << attrs.tie_breaker << "\r\n";
+    }
+    else if (attrs.controlling_role == IceRole::Controlled) {
+        sdp << "a=ice-controlled:" << attrs.tie_breaker << "\r\n";
+    }
     return sdp.str();
 }
 
@@ -78,37 +102,36 @@ std::string SignalingClient::create_sdp(const IceAttributes& ice_attributes, con
 std::tuple<IceAttributes, std::vector<std::string>> SignalingClient::parse_sdp(const std::string& sdp) {
     std::istringstream iss(sdp);
     std::string line;
-	IceAttributes ice_attributes;
-	std::vector<std::Candidate>& candidates
+	IceAttributes attrs;
+	std::vector<Candidate> candidates
 
 	while (std::getline(iss, line)) {
         if (line.find("a=ice-ufrag:") == 0) {
-            ice_attributes.ufrag = line.substr(11);
+            attrs.ufrag = line.substr(11);
         }
         else if (line.find("a=ice-pwd:") == 0) {
-            ice_attributes.pwd = line.substr(10);
+            attrs.pwd = line.substr(10);
         }
         else if (line.find("a=ice-options:") == 0) {
-            // Parse and handle ice-options if needed
-            // std::string ice_options = line.substr(14);
-            // log(LogLevel::INFO, "Negotiated ICE options: " + ice_options);
-            // Adjust behavior based on negotiated options if necessary
+            std::string options = line.substr(14);
+			std::istringstream iss(options);
+            std::string option;
+			while (std::getline(iss, option, ',')) {
+				attrs.options.insert(option);
+            }
         }
-		else if(line.find("a=ice-tie-breaker:") == 0) {
-			ice_attributes.tie_breaker = std::stoull(line.substr(18));
-		}
-        // else if (line.find("a=ice-controlling:") == 0) {
-        //    tie_breaker = std::stoull(line.substr(18));
-        //    role = IceRole::Controller;
-        // }
-        // else if (line.find("a=ice-controlled:") == 0) {
-        //    tie_breaker = std::stoull(line.substr(17));
-        //    role = IceRole::Controlled;
-        // }
+        else if (line.find("a=ice-controlling:") == 0) {
+           attrs.tie_breaker = std::stoull(line.substr(18));
+           attrs.role = IceRole::Controller;
+        }
+        else if (line.find("a=ice-controlled:") == 0) {
+           attrs.tie_breaker = std::stoull(line.substr(17));
+           attrs.role = IceRole::Controlled;
+        }
         else if (line.find("a=candidate:") == 0) {
-            candidates.push_back(Candidate from_sdp(line));
+            candidates.push_back(Candidate::from_sdp(line));
         }
     }
 	
-    return {ice_attributes, candidates};
+    return {attrs, candidates};
 }
