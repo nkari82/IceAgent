@@ -1,6 +1,8 @@
 #pragma once
 #include <asio.hpp>
 #include <asio/awaitable.hpp>
+#include <asio/experimental/parallel_group.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #include <functional>
 #include <memory>
 #include <atomic>
@@ -12,6 +14,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iostream>
+#include <optional>
 #include "stun_message.hpp"
 #include "stun_client.hpp"
 #include "turn_client.hpp"
@@ -178,7 +181,7 @@ public:
             size_t pos = s.find(':');
             if (pos!=std::string::npos) {
                 std::string host = s.substr(0,pos);
-                uint16_t port = (uint16_t)std::stoi(s.substr(pos+1));
+                uint16_t port = static_cast<uint16_t>(std::stoi(s.substr(pos+1)));
                 auto sc = std::make_shared<StunClient>(strand_, host, port, "");
                 stun_clients_.push_back(sc);
             }
@@ -188,7 +191,7 @@ public:
             size_t pos = turn_server_.find(':');
             if (pos!=std::string::npos) {
                 std::string host = turn_server_.substr(0,pos);
-                uint16_t port = (uint16_t)std::stoi(turn_server_.substr(pos+1));
+                uint16_t port = static_cast<uint16_t>(std::stoi(turn_server_.substr(pos+1)));
                 turn_client_ = std::make_shared<TurnClient>(strand_, host, port, turn_username_, turn_password_);
             }
         }
@@ -230,7 +233,7 @@ public:
 
     // ICE 시작
     void start() {
-        if (current_state_==IceConnectionState::Gathering) return;
+        if (current_state_==IceConnectionState::New) return;
         local_ice_attributes_ = generate_ice_attributes();
 
         asio::co_spawn(strand_,
@@ -253,7 +256,7 @@ public:
                         asio::co_spawn(strand_, handle_incoming_signaling_messages(), asio::detached);
                     }
 
-                    if (mode_==IceMode::Full) {
+                    if (mode_ == IceMode::Full) {
                         transition_to_state(IceConnectionState::Checking);
                         co_await perform_connectivity_checks();
                     } else {
@@ -262,9 +265,9 @@ public:
                         transition_to_state(IceConnectionState::Connected);
                     }
 
-                    if (current_state_==IceConnectionState::Connected || current_state_==IceConnectionState::Completed) {
+                    if (current_state_ == IceConnectionState::Connected || current_state_ == IceConnectionState::Completed) {
                         // Keep-alive
-                        if (mode_==IceMode::Full) {
+                        if (mode_ == IceMode::Full) {
                             asio::co_spawn(strand_, perform_consent_freshness(), asio::detached);
                         }
                         // TURN refresh
@@ -285,37 +288,13 @@ public:
 
     // ICE 재시작
     void restart_ice() {
-        session_id_ = generate_random_string(12);
-        local_ice_attributes_ = generate_ice_attributes();
-        check_list_.clear();
-        nominated_pair_ = CandidatePair();
-        transition_to_state(IceConnectionState::New);
-
-        if (signaling_client_) {
-            asio::co_spawn(strand_,
-                [this, self=shared_from_this()]() -> asio::awaitable<void> {
-                    remote_candidates_.clear();
-                    local_candidates_.clear();
-                    co_await gather_candidates();
-
-                    std::string sdp = signaling_client_->create_sdp(local_ice_attributes_, local_candidates_);
-                    co_await signaling_client_->send_sdp(sdp);
-
-                    if (mode_==IceMode::Full) {
-                        transition_to_state(IceConnectionState::Checking);
-                        co_await perform_connectivity_checks();
-                    } else {
-                        transition_to_state(IceConnectionState::Connected);
-                    }
-                    co_return;
-                }, asio::detached
-            );
-        }
+        log(LogLevel::INFO, "Restarting ICE...");
+        start();
     }
 
     // 데이터 전송
     void send_data(const std::vector<uint8_t>& data) {
-        if (current_state_!=IceConnectionState::Connected && current_state_!=IceConnectionState::Completed) {
+        if (current_state_ != IceConnectionState::Connected && current_state_ != IceConnectionState::Completed) {
             log(LogLevel::WARNING,"send_data() => not connected");
             return;
         }
@@ -363,17 +342,15 @@ private:
     IceAttributes local_ice_attributes_;
     IceAttributes remote_ice_attributes_;
 
-    // 세션 식별 (ICE Credential 경합 방지용)
-    std::string session_id_;
 
     // ---------- 내부 함수들 ----------
     bool transition_to_state(IceConnectionState new_state) {
-        if (current_state_==new_state) return false;
+        if (current_state_ == new_state) return false;
         current_state_ = new_state;
         if (state_callback_) {
             state_callback_(new_state);
         }
-        log(LogLevel::INFO, "ICE State => " + std::to_string((int)new_state));
+        log(LogLevel::INFO, "ICE State => " + std::to_string(static_cast<int>(new_state)));
         return true;
     }
 
@@ -388,7 +365,7 @@ private:
         attrs.ufrag = generate_random_string(8);
         attrs.pwd = generate_random_string(24);
         attrs.role = role_;
-        if (mode_==IceMode::Lite) {
+        if (mode_ == IceMode::Lite) {
             attrs.options.insert("ice-lite");
         } else {
             attrs.options.insert("ice2");
@@ -399,7 +376,7 @@ private:
 
     // gather_candidates()
     asio::awaitable<void> gather_candidates() {
-		transition_to_state(IceConnectionState::Gathering);
+        transition_to_state(IceConnectionState::Gathering);
         co_await gather_local_candidates();
         co_await gather_srflx_candidates();
         co_await gather_relay_candidates();
@@ -415,14 +392,15 @@ private:
             Candidate c;
             c.endpoint = ep;
             c.type = CandidateType::Host;
-            c.foundation="host";
-            c.transport="UDP";
-            c.component_id=1;
+            c.foundation = "host";
+            c.transport = "UDP";
+            c.component_id = 1;
             c.priority = calculate_priority(c);
             local_candidates_.push_back(c);
             if (candidate_callback_) {
                 candidate_callback_(c);
             }
+            log(LogLevel::DEBUG, "Gathered local candidate: " + c.to_sdp());
         };
         for (auto& r: results4) add_candidate(r.endpoint());
         for (auto& r: results6) add_candidate(r.endpoint());
@@ -434,17 +412,20 @@ private:
             try {
                 auto mapped = co_await sc->send_binding_request();
                 Candidate c;
-                c.endpoint=mapped;
-                c.type=CandidateType::ServerReflexive;
-                c.foundation="srflx";
-                c.transport="UDP";
-                c.component_id=1;
-                c.priority=calculate_priority(c);
+                c.endpoint = mapped;
+                c.type = CandidateType::ServerReflexive;
+                c.foundation = "srflx";
+                c.transport = "UDP";
+                c.component_id = 1;
+                c.priority = calculate_priority(c);
                 local_candidates_.push_back(c);
                 if (candidate_callback_){
                     candidate_callback_(c);
                 }
-            } catch(...) {}
+                log(LogLevel::DEBUG, "Gathered SRFLX candidate: " + c.to_sdp());
+            } catch(const std::exception& ex) {
+                log(LogLevel::WARNING, "Failed to gather SRFLX candidate: " + std::string(ex.what()));
+            }
         }
         co_return;
     }
@@ -454,17 +435,20 @@ private:
             try {
                 auto relay_ep = co_await turn_client_->allocate_relay();
                 Candidate c;
-                c.endpoint=relay_ep;
-                c.type=CandidateType::Relay;
-                c.foundation="relay";
-                c.transport="UDP";
-                c.component_id=1;
-                c.priority=calculate_priority(c);
+                c.endpoint = relay_ep;
+                c.type = CandidateType::Relay;
+                c.foundation = "relay";
+                c.transport = "UDP";
+                c.component_id = 1;
+                c.priority = calculate_priority(c);
                 local_candidates_.push_back(c);
                 if (candidate_callback_){
                     candidate_callback_(c);
                 }
-            } catch(...) {}
+                log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
+            } catch(const std::exception& ex) {
+                log(LogLevel::WARNING, "Failed to gather Relay candidate: " + std::string(ex.what()));
+            }
         }
         co_return;
     }
@@ -475,9 +459,9 @@ private:
         check_list_.clear();
         for (auto& rc : remote_candidates_) {
             for (auto& lc : local_candidates_) {
-                if (lc.component_id==rc.component_id) {
+                if (lc.component_id == rc.component_id) {
                     CandidatePair cp(lc, rc);
-                    cp.priority = calculate_priority_pair(lc,rc);
+                    cp.priority = calculate_priority_pair(lc, rc);
                     check_list_.emplace_back(cp);
                 }
             }
@@ -490,16 +474,14 @@ private:
             std::vector<asio::awaitable<void>> tasks;
             size_t concurrency = std::min<size_t>(5, check_list_.size());
             for (size_t i=0; i<concurrency; ++i) {
-                tasks.push_back([this, i]() -> asio::awaitable<void>{
+                tasks.emplace_back([this, i]() -> asio::awaitable<void>{
                     CheckListEntry& entry = check_list_[i];
-                    
-                    if (entry.state==CandidatePairState::New || entry.state==CandidatePairState::Failed) {
-                        entry.state=CandidatePairState::InProgress;
+
+                    if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
+                        entry.state = CandidatePairState::InProgress;
                         co_await perform_single_connectivity_check(entry);
-                    } else {
-                        break;
                     }
-                    
+
                     co_return;
                 }());
             }
@@ -514,7 +496,7 @@ private:
 
     asio::awaitable<void> perform_single_connectivity_check(CheckListEntry& entry) {
         const auto& pair = entry.pair;
-        bool is_relay = (pair.remote_candidate.type==CandidateType::Relay);
+        bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
         // STUN Binding Request
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
@@ -524,7 +506,7 @@ private:
         std::string uname = remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag;
         req.add_attribute(StunAttributeType::USERNAME, uname);
         // role
-        if (role_==IceRole::Controller) {
+        if (role_ == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -535,97 +517,126 @@ private:
 
         asio::ip::udp::endpoint dest = pair.remote_candidate.endpoint;
 
-        bool success = false;
+        std::optional<StunMessage> resp_opt;
         try {
             if (is_relay && turn_client_) {
                 // TURN 통해 전송
-                success = co_await turn_client_->send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, dest);
+                resp_opt = co_await turn_client_->send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, dest);
             } else {
-                success = co_await send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, dest,
+                resp_opt = co_await send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, dest,
                                                                      std::chrono::milliseconds(500),
                                                                      7);
             }
-        } catch(...) { success=false; }
 
-        if (success) {
-            entry.state=CandidatePairState::Succeeded;
-        } else {
-            entry.state=CandidatePairState::Failed;
+            if (resp_opt.has_value()) {
+                entry.state = CandidatePairState::Succeeded;
+                log(LogLevel::DEBUG, "Connectivity check succeeded for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp());
+            } else {
+                entry.state = CandidatePairState::Failed;
+                log(LogLevel::DEBUG, "Connectivity check failed for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp());
+            }
+        } catch(const std::exception& ex) {
+            entry.state = CandidatePairState::Failed;
+            log(LogLevel::WARNING, "Connectivity check exception for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp() + " | " + ex.what());
         }
+
         co_return;
     }
 
-    // STUN 재전송
-    asio::awaitable<bool> send_stun_request_with_retransmit(const StunMessage& request,
-                                                            const std::string& remote_pwd,
-                                                            const asio::ip::udp::endpoint& dest,
-                                                            std::chrono::milliseconds initial_timeout,
-                                                            int max_tries)
+    // STUN 재전송 및 응답 반환
+    asio::awaitable<std::optional<StunMessage>> send_stun_request_with_retransmit(
+        const StunMessage& request,
+        const std::string& remote_pwd,
+        const asio::ip::udp::endpoint& dest,
+        std::chrono::milliseconds initial_timeout,
+        int max_tries)
     {
+        using namespace asio::experimental::awaitable_operators;
+
         auto data = request.serialize();
         auto txn_id = request.get_transaction_id();
 
-        std::chrono::milliseconds timeout=initial_timeout;
-        for (int attempt=0; attempt<max_tries; ++attempt) {
+        std::chrono::milliseconds timeout = initial_timeout;
+        for (int attempt = 0; attempt < max_tries; ++attempt) {
             co_await socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
 
-            // Timeout or receive
             asio::steady_timer timer(strand_);
             timer.expires_after(timeout);
+
             std::vector<uint8_t> buf(2048);
             asio::ip::udp::endpoint sender;
-            auto [ec, bytes] = co_await(
-                socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable)
-                || timer.async_wait(asio::use_awaitable)
+
+            std::optional<StunMessage> response = std::nullopt;
+
+            co_await (
+                (
+                    [&]() -> asio::awaitable<void> {
+                        try {
+                            std::size_t bytes = co_await socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
+                            buf.resize(bytes);
+                            StunMessage resp = StunMessage::parse(buf);
+                            if (resp.get_transaction_id() == txn_id &&
+                                resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS) {
+                                // Verify message integrity and fingerprint
+                                if (resp.verify_message_integrity(local_ice_attributes_.pwd) &&
+                                    resp.verify_fingerprint()) {
+                                    response = resp;
+                                }
+                            }
+                        } catch(...) {
+                            // Ignore parsing errors and continue
+                        }
+                    }()
+                )
+                ||
+                (
+                    [&]() -> asio::awaitable<void> {
+                        try {
+                            co_await timer.async_wait(asio::use_awaitable);
+                        } catch(...) {
+                            // Ignore timer cancellation
+                        }
+                    }()
+                )
             );
-            if (!ec && bytes>0) {
-                buf.resize(bytes);
-                try {
-                    StunMessage resp = StunMessage::parse(buf);
-                    if (resp.get_transaction_id()==txn_id
-                        && resp.get_type()==StunMessageType::BINDING_RESPONSE_SUCCESS) {
-                        // 검증(로컬 pwd)
-                        if (!resp.verify_message_integrity(local_ice_attributes_.pwd)) {
-                            co_return false;
-                        }
-                        if (!resp.verify_fingerprint()) {
-                            co_return false;
-                        }
-                        co_return true;
-                    }
-                } catch(...) {
-                }
+
+            if (response.has_value()) {
+                co_return response;
             }
-            // backoff
-            timeout = std::min(timeout*2, std::chrono::milliseconds(1600));
+
+            // Backoff
+            timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+            log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt+1));
         }
 
-        co_return false;
+        co_return std::nullopt;
     }
 
     asio::awaitable<void> evaluate_connectivity_results() {
-        bool any_success=false;
+        bool any_success = false;
         for (auto& e: check_list_) {
-            if (e.state==CandidatePairState::Succeeded && !e.is_nominated) {
+            if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
                 co_await nominate_pair(e);
-                any_success=true;
+                any_success = true;
                 break;
             }
         }
         if (!any_success) {
             transition_to_state(IceConnectionState::Failed);
+            log(LogLevel::ERROR, "All connectivity checks failed.");
         } else {
             transition_to_state(IceConnectionState::Connected);
+            log(LogLevel::INFO, "ICE connection established.");
         }
         co_return;
     }
 
     // Nomination
     asio::awaitable<void> nominate_pair(CheckListEntry& entry) {
-        entry.is_nominated=true;
+        entry.is_nominated = true;
         nominated_pair_ = entry.pair;
 
-        if (role_==IceRole::Controller) {
+        if (role_ == IceRole::Controller) {
             // Binding Indication w/ USE-CANDIDATE
             StunMessage ind(StunMessageType::BINDING_INDICATION, StunMessage::generate_transaction_id());
             ind.add_attribute(StunAttributeType::USE_CANDIDATE, {});
@@ -636,6 +647,7 @@ private:
             co_await socket_.async_send_to(asio::buffer(ind.serialize()),
                                            entry.pair.remote_candidate.endpoint,
                                            asio::use_awaitable);
+            log(LogLevel::DEBUG, "Sent BINDING_INDICATION with USE-CANDIDATE to " + entry.pair.remote_candidate.to_sdp());
             if (nominate_callback_) {
                 nominate_callback_(entry.pair);
             }
@@ -645,20 +657,22 @@ private:
                 nominate_callback_(entry.pair);
             }
             transition_to_state(IceConnectionState::Completed);
+            log(LogLevel::INFO, "ICE connection completed.");
         }
         co_return;
     }
-	
+
     // Consent Freshness
     asio::awaitable<void> perform_consent_freshness() {
-        while (current_state_==IceConnectionState::Connected
-            || current_state_==IceConnectionState::Completed) 
+        while (current_state_ == IceConnectionState::Connected
+            || current_state_ == IceConnectionState::Completed) 
         {
             asio::steady_timer t(strand_);
             t.expires_after(std::chrono::seconds(15));
             co_await t.async_wait(asio::use_awaitable);
             if (!co_await send_consent_binding_request()) {
                 transition_to_state(IceConnectionState::Failed);
+                log(LogLevel::ERROR, "Consent freshness failed.");
                 co_return;
             }
         }
@@ -672,7 +686,7 @@ private:
         // BINDING_REQUEST
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
         req.add_attribute(StunAttributeType::USERNAME, remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag);
-        if (role_==IceRole::Controller) {
+        if (role_ == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -680,25 +694,38 @@ private:
         req.add_message_integrity(remote_ice_attributes_.pwd);
         req.add_fingerprint();
 
-        bool ok = co_await send_stun_request_with_retransmit(
-            req, remote_ice_attributes_.pwd,
-            nominated_pair_.remote_candidate.endpoint,
-            std::chrono::milliseconds(500),
-            5
-        );
+        bool ok = false;
+        try {
+            std::optional<StunMessage> resp_opt = co_await send_stun_request_with_retransmit(
+                req, remote_ice_attributes_.pwd,
+                nominated_pair_.remote_candidate.endpoint,
+                std::chrono::milliseconds(500),
+                5
+            );
+            ok = resp_opt.has_value();
+            if (ok) {
+                log(LogLevel::DEBUG, "Consent binding request succeeded.");
+            } else {
+                log(LogLevel::WARNING, "Consent binding request timed out.");
+            }
+        } catch(const std::exception& ex) {
+            log(LogLevel::ERROR, std::string("Consent binding request exception: ") + ex.what());
+        }
         co_return ok;
     }
 
     // TURN refresh
     asio::awaitable<void> perform_turn_refresh() {
-        while (current_state_==IceConnectionState::Connected && turn_client_ && turn_client_->is_allocated()) {
+        while (current_state_ == IceConnectionState::Connected && turn_client_ && turn_client_->is_allocated()) {
             asio::steady_timer timer(strand_);
             timer.expires_after(std::chrono::seconds(300));
             co_await timer.async_wait(asio::use_awaitable);
             try {
                 co_await turn_client_->refresh_allocation();
-            } catch(...) {
+                log(LogLevel::DEBUG, "TURN allocation refreshed.");
+            } catch(const std::exception& ex) {
                 transition_to_state(IceConnectionState::Failed);
+                log(LogLevel::ERROR, std::string("TURN refresh failed: ") + ex.what());
             }
         }
         co_return;
@@ -706,8 +733,8 @@ private:
 
     // 데이터 수신
     asio::awaitable<void> start_data_receive() {
-        while (current_state_==IceConnectionState::Connected
-            || current_state_==IceConnectionState::Completed)
+        while (current_state_ == IceConnectionState::Connected
+            || current_state_ == IceConnectionState::Completed)
         {
             std::vector<uint8_t> buf(2048);
             asio::ip::udp::endpoint sender;
@@ -716,9 +743,10 @@ private:
                 bytes = co_await socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
             } catch(...) {
                 transition_to_state(IceConnectionState::Failed);
+                log(LogLevel::ERROR, "Data receive failed.");
                 break;
             }
-            if (bytes>0) {
+            if (bytes > 0) {
                 buf.resize(bytes);
                 // STUN vs Application data
                 try {
@@ -729,6 +757,7 @@ private:
                     // not STUN => app data
                     if (data_callback_) {
                         data_callback_(buf, sender);
+                        log(LogLevel::DEBUG, "Received application data from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
                     }
                 }
             }
@@ -756,35 +785,37 @@ private:
         // username => "ourUfrag:theirUfrag"
         auto uname = req.get_attribute_as_string(StunAttributeType::USERNAME);
         auto delim = uname.find(':');
-        if (delim==std::string::npos) co_return;
+        if (delim == std::string::npos) co_return;
         std::string rcv_ufrag = uname.substr(0, delim);
         std::string snd_ufrag = uname.substr(delim+1);
 
         // 우리가 수신자 => rcv_ufrag == local_ice_attributes_.ufrag
-        if (rcv_ufrag!=local_ice_attributes_.ufrag) co_return;
+        if (rcv_ufrag != local_ice_attributes_.ufrag) co_return;
 
         // 무결성 => local pwd로 검증
         if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
+            log(LogLevel::WARNING, "Invalid message integrity in inbound binding request.");
             co_return;
         }
         if (!req.verify_fingerprint()) {
+            log(LogLevel::WARNING, "Invalid fingerprint in inbound binding request.");
             co_return;
         }
 
         // PeerReflexive Candidate 생성 가능
         Candidate prflx;
-        prflx.type=CandidateType::PeerReflexive;
-        prflx.endpoint=sender;
-        prflx.component_id=1; 
-        prflx.foundation="prflx";
-        prflx.transport="UDP";
-        prflx.priority=(110<<24);
+        prflx.type = CandidateType::PeerReflexive;
+        prflx.endpoint = sender;
+        prflx.component_id = 1; 
+        prflx.foundation = "prflx";
+        prflx.transport = "UDP";
+        prflx.priority = (110 << 24);
 
         // check list에 페어 없으면 추가 ...
-        bool found_pair=false;
+        bool found_pair = false;
         for (auto& e: check_list_) {
-            if (e.pair.remote_candidate.endpoint==sender) {
-                found_pair=true;
+            if (e.pair.remote_candidate.endpoint == sender) {
+                found_pair = true;
                 break;
             }
         }
@@ -793,11 +824,12 @@ private:
             Candidate local_cand;
             // 임시로 첫 host candidate 사용 (실제론 family·component matching)
             if (!local_candidates_.empty()) {
-                local_cand= local_candidates_[0];
+                local_cand = local_candidates_[0];
             }
             CandidatePair newp(local_cand, prflx);
             newp.priority = calculate_priority_pair(local_cand, prflx);
             check_list_.emplace_back(newp);
+            log(LogLevel::DEBUG, "Added new PeerReflexive pair: " + local_cand.to_sdp() + " <-> " + prflx.to_sdp());
         }
 
         // BINDING RESPONSE
@@ -806,6 +838,7 @@ private:
         resp.add_fingerprint();
 
         co_await socket_.async_send_to(asio::buffer(resp.serialize()), sender, asio::use_awaitable);
+        log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
 
         co_return;
     }
@@ -815,39 +848,48 @@ private:
         if (ind.has_attribute(StunAttributeType::USE_CANDIDATE)) {
             // 첫 Succeeded & 미지명 Pair nominate
             for (auto& e: check_list_) {
-                if (e.state==CandidatePairState::Succeeded && !e.is_nominated) {
+                if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
                     co_await nominate_pair(e);
                     break;
                 }
             }
+            log(LogLevel::DEBUG, "Processed BINDING_INDICATION with USE-CANDIDATE from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
         }
         co_return;
     }
 
     // 신호 메시지 받기
     asio::awaitable<void> handle_incoming_signaling_messages() {
-        while (current_state_!=IceConnectionState::Failed && current_state_!=IceConnectionState::Completed) {
+        while (current_state_ != IceConnectionState::Failed && current_state_ != IceConnectionState::Completed) {
             try {
                 std::string sdp = co_await signaling_client_->receive_sdp();
                 auto [rattr, rcands] = signaling_client_->parse_sdp(sdp);
                 remote_ice_attributes_ = rattr;
                 negotiate_role(rattr.tie_breaker);
 
-                if (mode_==IceMode::Lite && role_==IceRole::Controller) {
+                if (mode_ == IceMode::Lite && role_ == IceRole::Controller) {
                     log(LogLevel::ERROR, "Lite agent cannot be Controller => fail");
                     transition_to_state(IceConnectionState::Failed);
                     co_return;
                 }
 
-                if (rattr.role==IceRole::Controller && role_==IceRole::Controller) {
+                if (rattr.role == IceRole::Controller && role_ == IceRole::Controller) {
                     log(LogLevel::ERROR, "Both sides are Controller => fail");
                     transition_to_state(IceConnectionState::Failed);
                     co_return;
                 }
 
                 co_await add_remote_candidate(rcands);
-            } catch(...) {
+
+                // If trickle ICE is enabled, handle additional candidates as they arrive
+                if (local_ice_attributes_.options.find("trickle") != local_ice_attributes_.options.end()) {
+                    if (mode_ == IceMode::Full) {
+                        co_await perform_connectivity_checks();
+                    }
+                }
+            } catch(const std::exception& ex) {
                 transition_to_state(IceConnectionState::Failed);
+                log(LogLevel::ERROR, std::string("handle_incoming_signaling_messages exception: ") + ex.what());
             }
         }
         co_return;
@@ -859,8 +901,9 @@ private:
             if (candidate_callback_){
                 candidate_callback_(c);
             }
+            log(LogLevel::DEBUG, "Added remote candidate: " + c.to_sdp());
         }
-        if (mode_==IceMode::Full) {
+        if (mode_ == IceMode::Full) {
             co_await perform_connectivity_checks();
         }
         co_return;
@@ -873,7 +916,7 @@ private:
         } else {
             role_=IceRole::Controlled;
         }
-        log(LogLevel::INFO, "Negotiated role => " + std::to_string((int)role_));
+        log(LogLevel::INFO, "Negotiated role => " + std::to_string(static_cast<int>(role_)));
     }
 
     uint32_t calculate_priority(const Candidate& c) const {
@@ -886,27 +929,26 @@ private:
             case CandidateType::Relay: type_pref=0; break;
         }
         uint32_t local_pref=65535;
-        uint32_t comp = (uint32_t)c.component_id;
-        return (type_pref<<24) | (local_pref<<8) | (256-comp);
+        uint32_t comp = static_cast<uint32_t>(c.component_id);
+        return (type_pref << 24) | (local_pref << 8) | (256 - comp);
     }
 
     uint64_t calculate_priority_pair(const Candidate& l, const Candidate& r) const {
-        uint32_t g = std::max(l.priority, r.priority);
-        uint32_t d = std::min(l.priority, r.priority);
-        // (g<<32) + d*2 + (l>r?1:0)
-        return ((uint64_t)g<<32) + (d*2) + ((l.priority>r.priority)?1:0);
+        uint32_t min_priority = std::min(l.priority, r.priority);
+        uint32_t max_priority = std::max(l.priority, r.priority);
+        return (static_cast<uint64_t>(min_priority) << 32) + (static_cast<uint64_t>(max_priority) * 2) + ((l.priority > r.priority) ? 1 : 0);
     }
 
     void sort_candidate_pairs() {
         std::sort(check_list_.begin(), check_list_.end(), [&](auto& a, auto& b){
-            return a.pair.priority> b.pair.priority;
+            return a.pair.priority > b.pair.priority;
         });
     }
 
     // 로깅
     void log(LogLevel lvl, const std::string& msg) {
-        if (lvl<log_level_) return;
-        std::cout << "[IceAgent]["<<(int)lvl<<"] " << msg << std::endl;
+        if (lvl < log_level_) return;
+        std::cout << "[IceAgent][" << static_cast<int>(lvl) << "] " << msg << std::endl;
     }
 
     // 랜덤 스트링
@@ -922,12 +964,22 @@ private:
         return s;
     }
 
+    // 직렬화 uint32
+    std::vector<uint8_t> serialize_uint32(uint32_t val) {
+        std::vector<uint8_t> out(4);
+        for(int i=0;i<4;++i){
+            out[3-i]=(val & 0xFF);
+            val >>=8;
+        }
+        return out;
+    }
+
     // 직렬화 uint64
     std::vector<uint8_t> serialize_uint64(uint64_t val) {
         std::vector<uint8_t> out(8);
         for(int i=0;i<8;++i){
-            out[7-i]=(val&0xFF);
-            val>>=8;
+            out[7-i]=(val & 0xFF);
+            val >>=8;
         }
         return out;
     }
