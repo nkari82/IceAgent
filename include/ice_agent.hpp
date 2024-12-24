@@ -36,12 +36,12 @@ enum class IceOption {
 };
 
 enum class IceConnectionState {
-    New,
-    Gathering,
-    Checking,
-    Connected,
-    Completed,
-    Failed
+    New, // 어떤 액션이 취해지기 전의 초기 상태입니다.
+    Gathering, // 지역 후보자를 수집합니다.
+    Checking, // 로컬 후보와 원격 후보 간의 연결성 검사를 수행합니다.
+    Connected, // 하나 이상의 후보 쌍이 성공했지만 검사가 아직 진행 중일 수 있습니다.
+    Completed, // 모든 후보 쌍이 확인되었으며 하나 이상의 쌍이 성공했습니다.
+    Failed // 유효한 후보 쌍을 설정할 수 없습니다.
 };
 
 enum class LogLevel {
@@ -347,7 +347,6 @@ public:
                     }
 					else {
 	                    if (mode_ == IceMode::Full) {
-	                        transition_to_state(IceConnectionState::Checking);
 	                        co_await perform_connectivity_checks();
 	                    } else {
 	                        // Lite 모드: 로컬 검사를 건너뜀
@@ -372,7 +371,6 @@ public:
                     log(LogLevel::ERROR, std::string("start() exception: ") + ex.what());
                     transition_to_state(IceConnectionState::Failed);
                 }
-                co_return;
             }, asio::detached
         );
     }
@@ -490,11 +488,11 @@ private:
 
     // Gather all candidates
     asio::awaitable<void> gather_candidates() {
-        transition_to_state(IceConnectionState::Gathering);
+        if (!transition_to_state(IceConnectionState::Gathering))
+			co_return;
         co_await gather_local_candidates();
         co_await gather_srflx_candidates();
         co_await gather_relay_candidates();
-        co_return;
     }
 
     // Gather local host candidates
@@ -519,7 +517,6 @@ private:
         };
         for (auto& r: results4) add_candidate(r.endpoint());
         for (auto& r: results6) add_candidate(r.endpoint());
-        co_return;
     }
 
     // STUN을 통한 서버 반사형 후보자 수집
@@ -556,7 +553,6 @@ private:
                 log(LogLevel::WARNING, "Failed to gather SRFLX candidate from " + stun_ep.address().to_string() + ":" + std::to_string(stun_ep.port()) + " | " + ex.what());
             }
         }
-        co_return;
     }
 
     // Gather relay candidates via TURN
@@ -565,11 +561,13 @@ private:
         if (!turn_endpoints_.empty()) {
             co_await allocate_turn_relay();
         }
-        co_return;
     }
 
     // 연결성 검사 수행
     asio::awaitable<void> perform_connectivity_checks() {
+		if (!transition_to_state(IceConnectionState::Checking))
+			co_return;
+		
         // 후보자 쌍 생성
         check_list_.clear();
         for (auto& rc : remote_candidates_) {
@@ -596,7 +594,11 @@ private:
                     CheckListEntry& entry = check_list_[next_pair];
                     if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
                         entry.state = CandidatePairState::InProgress;
-                        group.add(perform_single_connectivity_check(entry));
+                        group.add([&]() -> awaitable<void> {
+									co_await perform_single_connectivity_check(entry);
+									if (entry.state == CandidatePairState::Succeeded)
+										transition_to_state(IceConnectionState::Connected);
+								});
                         ++active_tasks;
                     }
                     ++next_pair;
@@ -612,8 +614,6 @@ private:
         } catch(...) {
             transition_to_state(IceConnectionState::Failed);
         }
-
-        co_return;
     }
 
     // Perform a single connectivity check
@@ -699,8 +699,6 @@ private:
             entry.state = CandidatePairState::Failed;
             log(LogLevel::WARNING, "Connectivity check exception for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp() + " | " + ex.what());
         }
-
-        co_return;
     }
 
     // Send STUN request with optional message integrity verification
@@ -808,10 +806,9 @@ private:
             transition_to_state(IceConnectionState::Failed);
             log(LogLevel::ERROR, "All connectivity checks failed.");
         } else {
-            transition_to_state(IceConnectionState::Connected);
-            log(LogLevel::INFO, "ICE connection established.");
+            transition_to_state(IceConnectionState::Completed);
+            log(LogLevel::INFO, "ICE completed established.");
         }
-        co_return;
     }
 
     // Nominate a candidate pair
@@ -848,7 +845,6 @@ private:
             transition_to_state(IceConnectionState::Completed);
             log(LogLevel::INFO, "ICE connection completed.");
         }
-        co_return;
     }
 
     // Consent Freshness
@@ -865,7 +861,6 @@ private:
                 co_return;
             }
         }
-        co_return;
     }
 
     asio::awaitable<bool> send_consent_binding_request() {
@@ -943,7 +938,6 @@ private:
                 log(LogLevel::ERROR, std::string("TURN refresh failed: ") + ex.what());
             }
         }
-        co_return;
     }
 
     // 데이터 수신 시작 및 사용자 데이터 처리
@@ -995,7 +989,6 @@ private:
                 }
             }
         }
-        co_return;
     }
 
     // Handle inbound STUN messages
@@ -1010,7 +1003,6 @@ private:
             default:
                 break;
         }
-        co_return;
     }
 
     // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
@@ -1113,8 +1105,6 @@ private:
 
         co_await send_stun_request(resp, "", sender, false);
         log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
-
-        co_return;
     }
 
     // Handle STUN Binding Indication (USE-CANDIDATE)
@@ -1129,7 +1119,6 @@ private:
             }
             log(LogLevel::DEBUG, "Processed BINDING_INDICATION with USE-CANDIDATE from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
         }
-        co_return;
     }
 
     // Handle inbound signaling messages (e.g., SDP)
@@ -1166,7 +1155,6 @@ private:
                 log(LogLevel::ERROR, std::string("handle_incoming_signaling_messages exception: ") + ex.what());
             }
         }
-        co_return;
     }
 
     // Add remote candidates received via signaling
@@ -1437,7 +1425,6 @@ private:
 
         // 모든 TURN 서버에서 할당 실패 시
         log(LogLevel::WARNING, "Failed to allocate TURN relay from all TURN servers.");
-        co_return;
     }
 
     // ---------- END TURN Operations Integrated ----------
@@ -1448,7 +1435,6 @@ private:
     asio::awaitable<void> start_signaling_communication() {
         signaling_server_connected_ = true;
         // 이후에 ICE 시작 로직을 호출하거나 필요한 초기화 수행
-        co_return;
     }
 
     // 시그널링 서버에 SDP 전송
@@ -1456,7 +1442,6 @@ private:
         std::string message = sdp + "\n"; // 메시지 구분자를 줄바꿈으로 가정
         co_await asio::async_write(tcp_socket_, asio::buffer(message), asio::use_awaitable);
         log(LogLevel::DEBUG, "Sent SDP to signaling server.");
-        co_return;
     }
 
     // SDP 메시지를 생성 (예: Offer 또는 Answer)
