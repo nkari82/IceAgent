@@ -163,7 +163,7 @@ public:
       turn_username_(turn_username),
       turn_password_(turn_password),
       current_state_(IceConnectionState::New),
-      log_level_(LogLevel::INFO),
+      log_level_(LogLevel::INFO)
     {
         // Generate random ICE credentials
         local_ice_attributes_ = generate_ice_attributes();
@@ -250,7 +250,7 @@ public:
 
     // Start ICE Process
     void start() {
-        if (current_state_ != IceConnectionState::New)
+        if (current_state_ != IceConnectionState::New) {
             log(LogLevel::WARNING, "ICE is already started");
             return;
         }
@@ -264,7 +264,7 @@ public:
                     local_candidates_.clear();
                     relay_endpoint_ = asio::ip::udp::endpoint();
 
-  					// Gather candidates
+                    // Gather candidates
                     co_await gather_candidates();
 
                     // Send gathered candidates via signaling
@@ -348,6 +348,10 @@ private:
     std::atomic<IceConnectionState> current_state_;
     LogLevel log_level_;
 
+    // TURN 서버로부터 받은 REALM과 NONCE를 저장
+    std::string turn_realm_;
+    std::string turn_nonce_;
+	
     std::vector<Candidate> local_candidates_;
     std::vector<Candidate> remote_candidates_;
     std::vector<CheckListEntry> check_list_;
@@ -446,21 +450,18 @@ private:
     asio::awaitable<void> gather_srflx_candidates() {
         for (const auto& stun_ep : stun_endpoints_) { // Iterate over resolved STUN endpoints
             try {
-                // Create a binding request STUN message
+                // Create a binding request STUN message using local ICE credentials
                 StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-                // Add necessary attributes
+                // Add necessary attributes using local ICE credentials
                 req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(calculate_priority(local_candidates_[0])));
-                req.add_attribute(StunAttributeType::USERNAME, remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag);
-                if (local_ice_attributes_.role == IceRole::Controller) {
-                    req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
-                } else {
-                    req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
-                }
-                req.add_message_integrity(remote_ice_attributes_.pwd);
+                req.add_attribute(StunAttributeType::USERNAME, local_ice_attributes_.ufrag); // Use local ufrag only
+                // Do not add ICE Controlling/Controlled attributes at this stage
+                // These are added during connectivity checks after role negotiation
+                req.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
                 req.add_fingerprint();
 
-                // Send STUN request and await response
-                auto resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, stun_ep);
+                // Send STUN request and await response without relying on remote credentials
+                auto resp_opt = co_await send_stun_request(req, "", stun_ep);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
                     // Extract mapped address from response
@@ -542,18 +543,18 @@ private:
         const auto& pair = entry.pair;
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
-        // Create STUN Binding Request
+        // Create STUN Binding Request using local ICE credentials
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-        // Add necessary attributes
+        // Add necessary attributes using local ICE credentials
         req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
-        std::string uname = remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag;
+        std::string uname = local_ice_attributes_.ufrag; // Use local ufrag only
         req.add_attribute(StunAttributeType::USERNAME, uname);
         if (local_ice_attributes_.role == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
         }
-        req.add_message_integrity(remote_ice_attributes_.pwd);
+        req.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
         req.add_fingerprint();
 
         asio::ip::udp::endpoint dest = pair.remote_candidate.endpoint;
@@ -624,80 +625,94 @@ private:
         co_return;
     }
 
-    // Send STUN request with retransmission and await response
-	asio::awaitable<std::optional<StunMessage>> send_stun_request(
-		const StunMessage& request,
-		const std::string& remote_pwd,
-		const asio::ip::udp::endpoint& dest,
-		std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500),
-		int max_tries = 7)
-	{
-		using namespace asio::experimental::awaitable_operators;
+    // Send STUN request with optional message integrity verification
+    asio::awaitable<std::optional<StunMessage>> send_stun_request(
+        const StunMessage& request,
+        const std::string& remote_pwd,
+        const asio::ip::udp::endpoint& dest,
+        bool expect_response = true,
+        std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500),
+        int max_tries = 7)
+    {
+        using namespace asio::experimental::awaitable_operators;
 
-		auto data = request.serialize();
-		auto txn_id = request.get_transaction_id();
+        auto data = request.serialize();
+        auto txn_id = request.get_transaction_id();
 
-		std::chrono::milliseconds timeout = initial_timeout;
-		for (int attempt = 0; attempt < max_tries; ++attempt) {
-			// Send the STUN request
-			co_await socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-			log(LogLevel::DEBUG, "Sent STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
+        if (!expect_response) {
+            // Send the message without waiting for a response
+            co_await socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+            log(LogLevel::DEBUG, "Sent STUN message to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Not expecting response");
+            co_return std::nullopt;
+        }
 
-			// Set up a timer for the response timeout
-			asio::steady_timer timer(strand_);
-			timer.expires_after(timeout);
+        std::chrono::milliseconds timeout = initial_timeout;
+        for (int attempt = 0; attempt < max_tries; ++attempt) {
+            // Send the STUN request
+            co_await socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+            log(LogLevel::DEBUG, "Sent STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
 
-			std::vector<uint8_t> buf(2048);
-			asio::ip::udp::endpoint sender;
+            // Set up a timer for the response timeout
+            asio::steady_timer timer(strand_);
+            timer.expires_after(timeout);
 
-			std::optional<StunMessage> response = std::nullopt;
+            std::vector<uint8_t> buf(2048);
+            asio::ip::udp::endpoint sender;
 
-			// Await either a STUN response or the timer expiration
-			co_await (
-				(
-					[&]() -> asio::awaitable<void> {
-						try {
-							std::size_t bytes = co_await socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
-							std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
-							StunMessage resp = StunMessage::parse(received_data);
-							if (resp.get_transaction_id() == txn_id &&
-								resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS) {
-								// Verify message integrity and fingerprint
-								if (resp.verify_message_integrity(remote_pwd) &&
-									resp.verify_fingerprint()) {
-									response = resp;
-								}
-							}
-						} catch(...) {
-							// Parsing failed or other errors; ignore and continue
-						}
-					}()
-				)
-				||
-				(
-					[&]() -> asio::awaitable<void> {
-						try {
-							co_await timer.async_wait(asio::use_awaitable);
-						} catch(...) {
-							// Ignore timer cancellation
-						}
-					}()
-				)
-			);
+            std::optional<StunMessage> response = std::nullopt;
 
-			if (response.has_value()) {
-				log(LogLevel::DEBUG, "Received valid STUN response from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
-				co_return response;
-			}
+            // Await either a STUN response or the timer expiration
+            co_await (
+                (
+                    [&]() -> asio::awaitable<void> {
+                        try {
+                            std::size_t bytes = co_await socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
+                            std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
+                            StunMessage resp = StunMessage::parse(received_data);
+                            if (resp.get_transaction_id() == txn_id &&
+                                (resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS ||
+                                 resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR)) {
+                                // Verify message integrity and fingerprint only if remote_pwd is provided
+                                bool integrity_ok = true;
+                                bool fingerprint_ok = true;
+                                if (!remote_pwd.empty()) {
+                                    integrity_ok = resp.verify_message_integrity(remote_pwd);
+                                    fingerprint_ok = resp.verify_fingerprint();
+                                }
+                                if (integrity_ok && fingerprint_ok) {
+                                    response = resp;
+                                }
+                            }
+                        } catch(...) {
+                            // Parsing failed or other errors; ignore and continue
+                        }
+                    }()
+                )
+                ||
+                (
+                    [&]() -> asio::awaitable<void> {
+                        try {
+                            co_await timer.async_wait(asio::use_awaitable);
+                        } catch(...) {
+                            // Ignore timer cancellation
+                        }
+                    }()
+                )
+            );
 
-			// Exponential backoff
-			timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-			log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt + 1) + " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
-		}
+            if (response.has_value()) {
+                log(LogLevel::DEBUG, "Received valid STUN response from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
+                co_return response;
+            }
 
-		log(LogLevel::WARNING, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " failed after " + std::to_string(max_tries) + " attempts.");
-		co_return std::nullopt;
-	}
+            // Exponential backoff
+            timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+            log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt + 1) + " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
+        }
+
+        log(LogLevel::WARNING, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " failed after " + std::to_string(max_tries) + " attempts.");
+        co_return std::nullopt;
+    }
 
     // Evaluate connectivity results after checks
     asio::awaitable<void> evaluate_connectivity_results() {
@@ -738,7 +753,8 @@ private:
             ind.add_message_integrity(remote_ice_attributes_.pwd);
             ind.add_fingerprint();
 
-            co_await socket_.async_send_to(asio::buffer(ind.serialize()), target, asio::use_awaitable);
+            // Send the BINDING_INDICATION without expecting a response
+            co_await send_stun_request(ind, "", target, false);
             log(LogLevel::DEBUG, "Sent BINDING_INDICATION with USE-CANDIDATE to " + target.to_string());
 
             if (nominate_callback_) {
@@ -784,13 +800,13 @@ private:
         }
         // BINDING_REQUEST
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-        req.add_attribute(StunAttributeType::USERNAME, remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag);
+        req.add_attribute(StunAttributeType::USERNAME, local_ice_attributes_.ufrag); // Use local ufrag only
         if (local_ice_attributes_.role == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
         }
-        req.add_message_integrity(remote_ice_attributes_.pwd);
+        req.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
         req.add_fingerprint();
 
         bool ok = false;
@@ -798,6 +814,7 @@ private:
             std::optional<StunMessage> resp_opt = co_await send_stun_request(
                 req, remote_ice_attributes_.pwd,
                 target,
+                true,
                 std::chrono::milliseconds(500),
                 5
             );
@@ -824,8 +841,8 @@ private:
                 StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
                 // Add necessary attributes
                 refresh_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-                refresh_req.add_attribute(StunAttributeType::REALM, "example.com"); // Replace with actual realm
-                refresh_req.add_attribute(StunAttributeType::NONCE, "nonce"); // Replace with actual nonce
+                refresh_req.add_attribute(StunAttributeType::REALM, turn_realm_); // Replace with actual realm
+                refresh_req.add_attribute(StunAttributeType::NONCE, turn_nonce_); // Replace with actual nonce
                 refresh_req.add_attribute(StunAttributeType::REFRESH, {}); // Indicate it's a refresh
                 refresh_req.add_message_integrity(turn_password_);
                 refresh_req.add_fingerprint();
@@ -1010,10 +1027,10 @@ private:
 
         // Send BINDING RESPONSE
         StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
-        resp.add_message_integrity(remote_ice_attributes_.pwd);
+        resp.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
         resp.add_fingerprint();
 
-        co_await socket_.async_send_to(asio::buffer(resp.serialize()), sender, asio::use_awaitable);
+        co_await send_stun_request(resp, "", sende)
         log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
 
         co_return;
@@ -1128,7 +1145,7 @@ private:
 
     // Logging function
     void log(LogLevel lvl, const std::string& msg) {
-        if (lvl < log_level_) return;
+        if (static_cast<int>(lvl) < static_cast<int>(log_level_)) return;
         std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << msg << std::endl;
     }
 
@@ -1187,73 +1204,82 @@ private:
     // ---------- TURN Operations Integrated ----------
 
     // Allocate TURN relay
-	asio::awaitable<void> allocate_turn_relay() {
-		if (turn_endpoints_.empty()) {
-			log(LogLevel::WARNING, "No TURN servers available for allocation.");
-			co_return;
-		}
+    asio::awaitable<void> allocate_turn_relay() {
+        if (turn_endpoints_.empty()) {
+            log(LogLevel::WARNING, "No TURN servers available for allocation.");
+            co_return;
+        }
 
-		for (const auto& turn_ep : turn_endpoints_) {
-			try {
-				// Step 1: Initial Allocate request without REALM and NONCE
-				StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-				alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
+        for (const auto& turn_ep : turn_endpoints_) {
+            try {
+                // Step 1: Initial Allocate request without REALM and NONCE
+                StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
+                // REALM과 NONCE는 서버로부터 받아와야 함
 
-				// Send Allocate request
-				auto resp_opt = co_await send_stun_request(alloc_req, turn_password_, turn_ep, std::chrono::milliseconds(1000), 5);
-				if (resp_opt.has_value()) {
-					StunMessage resp = resp_opt.value();
-					// Extract REALM and NONCE from response
-					std::string realm = resp.get_attribute_as_string(StunAttributeType::REALM);
-					std::string nonce = resp.get_attribute_as_string(StunAttributeType::NONCE);
+                // Send Allocate request without expecting a response (initial request)
+                std::optional<StunMessage> resp_opt = co_await send_stun_request(alloc_req, "", turn_ep, true, std::chrono::milliseconds(1000), 3);
+                if (resp_opt.has_value()) {
+                    StunMessage resp = resp_opt.value();
+                    // Extract REALM and NONCE from response
+                    turn_realm_ = resp.get_attribute_as_string(StunAttributeType::REALM);
+                    turn_nonce_ = resp.get_attribute_as_string(StunAttributeType::NONCE);
 
-					// Step 2: Re-send Allocate request with REALM and NONCE
-					StunMessage auth_alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-					auth_alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-					auth_alloc_req.add_attribute(StunAttributeType::REALM, realm);
-					auth_alloc_req.add_attribute(StunAttributeType::NONCE, nonce);
-					auth_alloc_req.add_message_integrity(turn_password_);
-					auth_alloc_req.add_fingerprint();
+                    if (turn_realm_.empty() || turn_nonce_.empty()) {
+                        log(LogLevel::WARNING, "TURN Allocate response missing REALM or NONCE.");
+                        continue;
+                    }
 
-					// Send authenticated Allocate request
-					auto auth_resp_opt = co_await send_stun_request(auth_alloc_req, turn_password_, turn_ep, std::chrono::milliseconds(1000), 5);
-					if (auth_resp_opt.has_value()) {
-						StunMessage auth_resp = auth_resp_opt.value();
-						// Extract relay endpoint
-						asio::ip::udp::endpoint relay = auth_resp.get_relay_address();
-						if (!relay.address().is_unspecified()) {
-							relay_endpoint_ = relay;
-							log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
-							
-							// Create Relay candidate
-							Candidate c;
-							c.endpoint = relay;
-							c.type = CandidateType::Relay;
-							c.foundation = "relay";
-							c.transport = "UDP";
-							c.component_id = 1;
-							c.priority = calculate_priority(c);
-							local_candidates_.push_back(c);
-							if (candidate_callback_){
-								candidate_callback_(c);
-							}
-							log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
+                    // Step 2: Re-send Allocate request with REALM and NONCE
+                    StunMessage auth_alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                    auth_alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
+                    auth_alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
+                    auth_alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
+                    auth_alloc_req.add_message_integrity(turn_password_);
+                    auth_alloc_req.add_fingerprint();
 
-							// Start periodic TURN refresh
-							asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
-							co_return;
-						}
-					}
-				}
-			} catch(const std::exception& ex) {
-				log(LogLevel::WARNING, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" + std::to_string(turn_ep.port()) + " | " + ex.what());
-				// Continue to next TURN server
-			}
-		}
-	
-		// If allocation failed for all TURN servers
-		log(LogLevel::WARNING, "Failed to allocate TURN relay from all TURN servers.");
-		co_return;
-	}
+                    // Send authenticated Allocate request and expect a response
+                    std::optional<StunMessage> auth_resp_opt = co_await send_stun_request(auth_alloc_req, turn_password_, turn_ep, true, std::chrono::milliseconds(1000), 3);
+                    if (auth_resp_opt.has_value()) {
+                        StunMessage auth_resp = auth_resp_opt.value();
+                        // Extract relay endpoint from response
+                        asio::ip::udp::endpoint relay = auth_resp.get_relay_address(); // Implement this method as needed
+                        if (!relay.address().is_unspecified()) {
+                            relay_endpoint_ = relay;
+                            log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
+                            
+                            // Create Relay candidate
+                            Candidate c;
+                            c.endpoint = relay;
+                            c.type = CandidateType::Relay;
+                            c.foundation = "relay";
+                            c.transport = "UDP";
+                            c.component_id = 1;
+                            c.priority = calculate_priority(c);
+                            local_candidates_.push_back(c);
+                            if (candidate_callback_){
+                                candidate_callback_(c);
+                            }
+                            log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
+
+                            // Start periodic TURN refresh
+                            asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+
+                            // Allocation successful, exit the loop
+                            co_return;
+                        }
+                    }
+                }
+            } catch(const std::exception& ex) {
+                log(LogLevel::WARNING, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" + std::to_string(turn_ep.port()) + " | " + ex.what());
+                // Continue to next TURN server
+            }
+        }
+
+        // If allocation failed for all TURN servers
+        log(LogLevel::WARNING, "Failed to allocate TURN relay from all TURN servers.");
+        co_return;
+    }
+
     // ---------- END TURN Operations Integrated ----------
 };
