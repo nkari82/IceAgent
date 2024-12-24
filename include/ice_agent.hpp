@@ -64,7 +64,7 @@ struct Candidate {
     // Convert to SDP format
     std::string to_sdp() const {
         std::ostringstream oss;
-        oss << "a=candidate:" << foundation << " " << component_id << " " 
+        oss << "a=candidate:" << foundation << " " << component_id << " "
             << transport << " " << priority << " "
             << endpoint.address().to_string() << " " << endpoint.port()
             << " typ ";
@@ -152,30 +152,22 @@ public:
              IceRole role,
              IceMode mode,
              const std::vector<std::string>& stun_servers,
-             const std::string& turn_server="",
-             const std::string& turn_username="",
-             const std::string& turn_password="",
-             std::chrono::seconds connectivity_check_timeout=std::chrono::seconds(3),
-             size_t connectivity_check_retries=3)
+             const std::vector<std::string>& turn_servers, // Changed to vector
+             const std::string& turn_username = "",
+             const std::string& turn_password = "",)
     : strand_(io_context.get_executor()),
       socket_(strand_),
-      role_(role),
       mode_(mode),
-      tie_breaker_(0),
       stun_servers_(stun_servers),
-      turn_server_(turn_server),
+      turn_servers_(turn_servers),
       turn_username_(turn_username),
       turn_password_(turn_password),
       current_state_(IceConnectionState::New),
       log_level_(LogLevel::INFO),
-      connectivity_check_timeout_(connectivity_check_timeout),
-      connectivity_check_retries_(connectivity_check_retries)
     {
-        // Initialize tie_breaker with a random value
-        tie_breaker_ = generate_random_uint64();
-
         // Generate random ICE credentials
         local_ice_attributes_ = generate_ice_attributes();
+        local_ice_attributes_.role = role;
 
         // Resolve STUN servers and store endpoints
         asio::ip::udp::resolver resolver(io_context);
@@ -196,21 +188,21 @@ public:
             }
         }
 
-        // Resolve TURN server and store endpoint
-        if (!turn_server_.empty()) {
-            size_t pos = turn_server_.find(':');
+        // Resolve TURN servers and store endpoints
+        for (const auto& s : turn_servers_) {
+            size_t pos = s.find(':');
             if (pos != std::string::npos) {
-                std::string host = turn_server_.substr(0, pos);
-                std::string port_str = turn_server_.substr(pos+1);
+                std::string host = s.substr(0, pos);
+                std::string port_str = s.substr(pos+1);
                 try {
                     asio::ip::udp::resolver resolver_turn(io_context);
                     auto results = resolver_turn.resolve(asio::ip::udp::v4(), host, port_str);
-                    if (!results.empty()) {
-                        turn_endpoints_.push_back(results.begin()->endpoint());
-                        log(LogLevel::DEBUG, "Resolved TURN server: " + results.begin()->endpoint().address().to_string() + ":" + std::to_string(results.begin()->endpoint().port()));
+                    for (const auto& r : results) {
+                        turn_endpoints_.push_back(r.endpoint());
+                        log(LogLevel::DEBUG, "Resolved TURN server: " + r.endpoint().address().to_string() + ":" + std::to_string(r.endpoint().port()));
                     }
                 } catch(const std::exception& ex) {
-                    log(LogLevel::WARNING, "Failed to resolve TURN server '" + turn_server_ + "': " + ex.what());
+                    log(LogLevel::WARNING, "Failed to resolve TURN server '" + s + "': " + ex.what());
                 }
             }
         }
@@ -270,11 +262,12 @@ public:
                     check_list_.clear();
                     remote_candidates_.clear();
                     local_candidates_.clear();
+                    relay_endpoint_ = asio::ip::udp::endpoint();
 
-                    // Gather candidates
+  					// Gather candidates
                     co_await gather_candidates();
 
-                    // Signaling: Send SDP and handle incoming messages
+                    // Send gathered candidates via signaling
                     if (signaling_client_) {
                         std::string sdp = signaling_client_->create_sdp(local_ice_attributes_, local_candidates_);
                         co_await signaling_client_->send_sdp(sdp);
@@ -328,6 +321,11 @@ public:
         }
         asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
 
+        // If relay is allocated and the nominated pair uses relay, use relay endpoint
+        if (nominated_pair_.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
+            target = relay_endpoint_;
+        }
+
         socket_.async_send_to(asio::buffer(data), target,
             [this](std::error_code ec, std::size_t){
                 if (ec) {
@@ -340,12 +338,10 @@ private:
     // Members
     asio::strand<asio::io_context::executor_type> strand_;
     asio::ip::udp::socket socket_;
-    IceRole role_;
     IceMode mode_;
-    uint64_t tie_breaker_;
     std::vector<std::string> stun_servers_;
     std::vector<asio::ip::udp::endpoint> stun_endpoints_; // Resolved STUN server endpoints
-    std::string turn_server_;
+    std::vector<std::string> turn_servers_; // List of TURN servers
     std::string turn_username_;
     std::string turn_password_;
     std::vector<asio::ip::udp::endpoint> turn_endpoints_; // Resolved TURN server endpoints
@@ -366,9 +362,7 @@ private:
     NominateCallback nominate_callback_;
 
     CandidatePair nominated_pair_;
-    std::chrono::seconds connectivity_check_timeout_;
-    size_t connectivity_check_retries_;
-
+    
     // ICE Attributes
     IceAttributes local_ice_attributes_;
     IceAttributes remote_ice_attributes_;
@@ -402,10 +396,9 @@ private:
     // Generate random ICE attributes
     IceAttributes generate_ice_attributes() {
         IceAttributes attrs;
-        attrs.tie_breaker = tie_breaker_;
+        attrs.tie_breaker = generate_random_uint64();
         attrs.ufrag = generate_random_string(8);
         attrs.pwd = generate_random_string(24);
-        attrs.role = role_;
         if (mode_ == IceMode::Lite) {
             attrs.options.insert("ice-lite");
         } else {
@@ -458,7 +451,7 @@ private:
                 // Add necessary attributes
                 req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(calculate_priority(local_candidates_[0])));
                 req.add_attribute(StunAttributeType::USERNAME, remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag);
-                if (role_ == IceRole::Controller) {
+                if (local_ice_attributes_.role == IceRole::Controller) {
                     req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
                 } else {
                     req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -472,18 +465,20 @@ private:
                     StunMessage resp = resp_opt.value();
                     // Extract mapped address from response
                     asio::ip::udp::endpoint mapped = resp.get_mapped_address(); // Implement this method as needed
-                    Candidate c;
-                    c.endpoint = mapped;
-                    c.type = CandidateType::ServerReflexive;
-                    c.foundation = "srflx";
-                    c.transport = "UDP";
-                    c.component_id = 1;
-                    c.priority = calculate_priority(c);
-                    local_candidates_.push_back(c);
-                    if (candidate_callback_){
-                        candidate_callback_(c);
+                    if (!mapped.address().is_unspecified()) {
+                        Candidate c;
+                        c.endpoint = mapped;
+                        c.type = CandidateType::ServerReflexive;
+                        c.foundation = "srflx";
+                        c.transport = "UDP";
+                        c.component_id = 1;
+                        c.priority = calculate_priority(c);
+                        local_candidates_.push_back(c);
+                        if (candidate_callback_){
+                            candidate_callback_(c);
+                        }
+                        log(LogLevel::DEBUG, "Gathered SRFLX candidate: " + c.to_sdp());
                     }
-                    log(LogLevel::DEBUG, "Gathered SRFLX candidate: " + c.to_sdp());
                 }
             } catch(const std::exception& ex) {
                 log(LogLevel::WARNING, "Failed to gather SRFLX candidate from " + stun_ep.address().to_string() + ":" + std::to_string(stun_ep.port()) + " | " + ex.what());
@@ -553,7 +548,7 @@ private:
         req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
         std::string uname = remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag;
         req.add_attribute(StunAttributeType::USERNAME, uname);
-        if (role_ == IceRole::Controller) {
+        if (local_ice_attributes_.role == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -729,9 +724,13 @@ private:
         entry.is_nominated = true;
         nominated_pair_ = entry.pair; // Set the nominated pair
 
-        asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
+        asio::ip::udp::endpoint target = entry.pair.remote_candidate.endpoint;
+        // If relay is allocated and pair uses relay, use relay endpoint
+        if (entry.pair.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
+            target = relay_endpoint_;
+        }
 
-        if (role_ == IceRole::Controller) {
+        if (local_ice_attributes_.role == IceRole::Controller) {
             // Create and send BINDING_INDICATION with USE-CANDIDATE attribute
             StunMessage ind(StunMessageType::BINDING_INDICATION, StunMessage::generate_transaction_id());
             ind.add_attribute(StunAttributeType::USE_CANDIDATE, {});
@@ -775,6 +774,10 @@ private:
 
     asio::awaitable<bool> send_consent_binding_request() {
         asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
+        // If relay is allocated and the nominated pair uses relay, use relay endpoint
+        if (nominated_pair_.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
+            target = relay_endpoint_;
+        }
 
         if (target.address().is_unspecified()) {
             co_return false;
@@ -782,7 +785,7 @@ private:
         // BINDING_REQUEST
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
         req.add_attribute(StunAttributeType::USERNAME, remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag);
-        if (role_ == IceRole::Controller) {
+        if (local_ice_attributes_.role == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -1041,14 +1044,14 @@ private:
                 negotiate_role(rattr.tie_breaker);
 
                 // Validate roles to prevent both being Controllers
-                if (rattr.role == IceRole::Controller && role_ == IceRole::Controller) {
+                if (rattr.role == IceRole::Controller && local_ice_attributes_.role == IceRole::Controller) {
                     log(LogLevel::ERROR, "Both sides are Controller => fail");
                     transition_to_state(IceConnectionState::Failed);
                     co_return;
                 }
 
                 // Add remote candidates
-                co_await add_remote_candidate(rcands);
+                add_remote_candidate(rcands);
 
                 // If trickle ICE is enabled, handle additional candidates as they arrive
                 if (local_ice_attributes_.options.find("trickle") != local_ice_attributes_.options.end()) {
@@ -1065,7 +1068,7 @@ private:
     }
 
     // Add remote candidates received via signaling
-    asio::awaitable<void> add_remote_candidate(const std::vector<Candidate>& cands) {
+    void add_remote_candidate(const std::vector<Candidate>& cands) {
         for (auto& c: cands) {
             remote_candidates_.push_back(c);
             if (candidate_callback_){
@@ -1073,27 +1076,16 @@ private:
             }
             log(LogLevel::DEBUG, "Added remote candidate: " + c.to_sdp());
         }
-        if (mode_ == IceMode::Full) {
-            co_await perform_connectivity_checks();
-        }
-        co_return;
     }
 
     // Role negotiation based on tie-breaker values
     void negotiate_role(uint64_t remote_tie_breaker) {
-        if (tie_breaker_ > remote_tie_breaker) {
-            role_ = IceRole::Controller;
-        } else if (tie_breaker_ < remote_tie_breaker) {
-            role_ = IceRole::Controlled;
-        } else {
-            // Tie-breaker collision, use lexicographical order of ufrag
-            if (local_ice_attributes_.ufrag < remote_ice_attributes_.ufrag) {
-                role_ = IceRole::Controller;
-            } else {
-                role_ = IceRole::Controlled;
-            }
+        if (local_ice_attributes_.tie_breaker > remote_tie_breaker) {
+            local_ice_attributes_.role = IceRole::Controller;
+        } else if (local_ice_attributes_.tie_breaker < remote_tie_breaker) {
+            local_ice_attributes_.role = IceRole::Controlled;
         }
-        log(LogLevel::INFO, "Negotiated role => " + ice_role_to_string(role_));
+        log(LogLevel::INFO, "Negotiated role => " + ice_role_to_string(local_ice_attributes_.role));
     }
 
     // Convert IceRole to string for logging
@@ -1201,66 +1193,59 @@ private:
             co_return;
         }
 
-        asio::ip::udp::endpoint turn_ep = turn_endpoints_[0]; // Use first TURN server
+        for (const auto& turn_ep : turn_endpoints_) {
+            try {
+                // Create TURN Allocate request
+                StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                // Add necessary attributes
+                alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
+                alloc_req.add_attribute(StunAttributeType::REALM, "example.com"); // Replace with actual realm
+                alloc_req.add_attribute(StunAttributeType::NONCE, "nonce"); // Replace with actual nonce
+                // Indicate it's an allocation request (specific TURN attributes may be needed)
+                alloc_req.add_message_integrity(turn_password_);
+                alloc_req.add_fingerprint();
 
-        try {
-            // Create TURN Allocate request
-            StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-            // Add necessary attributes
-            alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-            alloc_req.add_attribute(StunAttributeType::REALM, "example.com"); // Replace with actual realm
-            alloc_req.add_attribute(StunAttributeType::NONCE, "nonce"); // Replace with actual nonce
-            // Indicate it's an allocation request (specific TURN attributes may be needed)
-            alloc_req.add_message_integrity(turn_password_);
-            alloc_req.add_fingerprint();
+                // Send Allocate request and await response
+                auto resp_opt = co_await send_stun_request(alloc_req, turn_password_, turn_ep, std::chrono::milliseconds(1000), 5);
+                if (resp_opt.has_value()) {
+                    StunMessage resp = resp_opt.value();
+                    // Extract relay endpoint from response
+                    asio::ip::udp::endpoint relay = resp.get_relay_address(); // Implement this method as needed
+                    if (!relay.address().is_unspecified()) {
+                        relay_endpoint_ = relay;
+                        log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
+                        
+                        // Create Relay candidate
+                        Candidate c;
+                        c.endpoint = relay;
+                        c.type = CandidateType::Relay;
+                        c.foundation = "relay";
+                        c.transport = "UDP";
+                        c.component_id = 1;
+                        c.priority = calculate_priority(c);
+                        local_candidates_.push_back(c);
+                        if (candidate_callback_){
+                            candidate_callback_(c);
+                        }
+                        log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
 
-            // Send Allocate request and await response
-            auto resp_opt = co_await send_stun_request(alloc_req, turn_password_, turn_ep, std::chrono::milliseconds(1000), 5);
-            if (resp_opt.has_value()) {
-                StunMessage resp = resp_opt.value();
-                // Extract relay endpoint from response
-                asio::ip::udp::endpoint relay = resp.get_relay_address(); // Implement this method as needed
-                relay_endpoint_ = relay;
-                log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
-                
-                // Create Relay candidate
-                Candidate c;
-                c.endpoint = relay;
-                c.type = CandidateType::Relay;
-                c.foundation = "relay";
-                c.transport = "UDP";
-                c.component_id = 1;
-                c.priority = calculate_priority(c);
-                local_candidates_.push_back(c);
-                if (candidate_callback_){
-                    candidate_callback_(c);
+                        // Start periodic TURN refresh
+                        asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+
+                        // Allocation successful, exit the loop
+                        co_return;
+                    }
                 }
-                log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
-
-                // Start periodic TURN refresh
-                asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+            } catch(const std::exception& ex) {
+                log(LogLevel::WARNING, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" + std::to_string(turn_ep.port()) + " | " + ex.what());
+                // Continue to next TURN server
             }
-        } catch(const std::exception& ex) {
-            log(LogLevel::WARNING, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" + std::to_string(turn_ep.port()) + " | " + ex.what());
         }
 
+        // If allocation failed for all TURN servers
+        log(LogLevel::WARNING, "Failed to allocate TURN relay from all TURN servers.");
         co_return;
     }
 
     // ---------- END TURN Operations Integrated ----------
-
-    // Handle inbound STUN messages (e.g., BINDING_REQUEST, BINDING_INDICATION)
-    asio::awaitable<void> handle_inbound_stun(const StunMessage& sm, const asio::ip::udp::endpoint& sender) {
-        switch(sm.get_type()) {
-            case StunMessageType::BINDING_REQUEST:
-                co_await handle_inbound_binding_request(sm, sender);
-                break;
-            case StunMessageType::BINDING_INDICATION:
-                co_await handle_binding_indication(sm, sender);
-                break;
-            default:
-                break;
-        }
-        co_return;
-    }
 };
