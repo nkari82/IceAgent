@@ -536,7 +536,7 @@ private:
 	
 		// 제한된 동시성으로 병렬 검사 수행
 		try {
-			asio::experimental::parallel_group parallel;
+			asio::experimental::parallel_group group;
 			size_t max_concurrency = 5;
 			size_t active_tasks = 0;
 			size_t next_pair = 0;
@@ -546,13 +546,16 @@ private:
 					CheckListEntry& entry = check_list_[next_pair];
 					if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
 						entry.state = CandidatePairState::InProgress;
-						parallel.add(perform_single_connectivity_check(entry));
+						group.add(perform_single_connectivity_check(entry));
 						++active_tasks;
 					}
 					++next_pair;
 				}
-				co_await parallel.wait(); // 어떤 작업이라도 완료될 때까지 대기
-				--active_tasks;
+	
+				if (active_tasks > 0) {
+					co_await group.wait();
+					active_tasks--;
+				}
 			}
 	
 			co_await evaluate_connectivity_results();
@@ -696,7 +699,9 @@ private:
                             StunMessage resp = StunMessage::parse(received_data);
                             if (resp.get_transaction_id() == txn_id &&
                                 (resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS ||
-                                 resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR)) {
+                                 resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR) || 
+								 resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS ||
+								 resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR)) {
                                 // Verify message integrity and fingerprint only if remote_pwd is provided
                                 bool integrity_ok = true;
                                 bool fingerprint_ok = true;
@@ -919,10 +924,12 @@ private:
 	
 					// STUN 메시지로 처리
 					co_await handle_inbound_stun(sm, sender);
-				} catch(...) {
+				} catch(const std::exception& ex) {
 					// STUN 메시지 파싱 실패 시, 응용 프로그램 데이터로 처리
+					// 추가: 로그에 예외 정보 포함
+					log(LogLevel::DEBUG, std::string("Failed to parse STUN message: ") + ex.what());
 	
-					// **노미네이트된 원격 후보자로부터 온 데이터인지 확인**
+					// 노미네이트된 원격 후보자로부터 온 데이터인지 확인
 					if (sender == nominated_pair_.remote_candidate.endpoint) {
 						// 응용 프로그램 콜백을 통해 데이터 전달
 						if (data_callback_) {
@@ -931,8 +938,7 @@ private:
 								+ sender.address().to_string() + ":" + std::to_string(sender.port()));
 						}
 					} else {
-						// **선택 사항:** 비노미네이트된 엔드포인트로부터 온 데이터 처리
-						// 보안상 이유로 예상치 못한 출처의 데이터는 무시하거나 로그로 남김
+						// 비노미네이트된 엔드포인트로부터 온 데이터 무시 및 경고 로그
 						log(LogLevel::WARNING, "Received application data from unknown endpoint: " 
 							+ sender.address().to_string() + ":" + std::to_string(sender.port()));
 					}
@@ -1111,25 +1117,56 @@ private:
 
     // Add remote candidates received via signaling
     void add_remote_candidate(const std::vector<Candidate>& cands) {
-        for (auto& c: cands) {
-            remote_candidates_.push_back(c);
-            if (candidate_callback_){
-                candidate_callback_(c);
-            }
-            log(LogLevel::DEBUG, "Added remote candidate: " + c.to_sdp());
-        }
+    	auto size = remote_candidates_.size();
+		for (auto& c: cands) {
+			// 중복된 후보자 체크
+			bool exists = false;
+			for (const auto& existing_cand : remote_candidates_) {
+				if (existing_cand.endpoint == c.endpoint && existing_cand.type == c.type) {
+					exists = true;
+					break;
+				}
+			}
+			if (!exists) {
+				remote_candidates_.push_back(c);
+				if (candidate_callback_){
+					candidate_callback_(c);
+				}
+				log(LogLevel::DEBUG, "Added remote candidate: " + c.to_sdp());
+	
+			}
+		}
+		
+		if (size != remote_candidates_.size()) {
+			// Full ICE 모드일 경우, 즉시 연결성 검사 수행 (필요에 따라 구현.)
+			// if (mode_ == IceMode::Full) {
+			//  	co_spawn(strand_, perform_connectivity_checks(), asio::detached);
+			// }
+		}
+		
     }
 
-	// 역할 협상 (tie-breaker 값에 기반)
+	// 고유 식별자 기반 역할 결정 (IP 주소와 포트 합산)
 	void negotiate_role(uint64_t remote_tie_breaker) {
 		if (local_ice_attributes_.tie_breaker > remote_tie_breaker) {
 			local_ice_attributes_.role = IceRole::Controller;
 		} else if (local_ice_attributes_.tie_breaker < remote_tie_breaker) {
 			local_ice_attributes_.role = IceRole::Controlled;
 		} else {
-			// Tie-breaker가 동일할 경우, IP 주소를 기반으로 역할 결정
-			if (socket_.local_endpoint().address().to_v4().to_uint() > 
-				socket_.remote_endpoint().address().to_v4().to_uint()) {
+			// Tie-breaker가 동일할 경우, IP 주소와 포트의 합으로 결정
+			uint64_t local_id = 0;
+			for(auto byte : socket_.local_endpoint().address().to_v4().to_bytes()) {
+				local_id = (local_id << 8) | byte;
+			}
+			local_id += socket_.local_endpoint().port();
+	
+			uint64_t remote_id = 0;
+			for(auto byte : remote_endpoint_.address().to_v4().to_bytes()) {
+				remote_id = (remote_id << 8) | byte;
+			}
+			remote_id += remote_endpoint_.port();
+	
+			if (local_id > remote_id) {
 				local_ice_attributes_.role = IceRole::Controller;
 			} else {
 				local_ice_attributes_.role = IceRole::Controlled;
@@ -1137,7 +1174,6 @@ private:
 		}
 		log(LogLevel::INFO, "Negotiated role => " + ice_role_to_string(local_ice_attributes_.role));
 	}
-
 
     // Convert IceRole to string for logging
     std::string ice_role_to_string(IceRole role) const {
@@ -1236,7 +1272,7 @@ private:
 
     // ---------- TURN Operations Integrated ----------
 
-	// TURN 릴레이 할당
+	// TURN 릴레이 할당 (RFC 5766)
 	asio::awaitable<void> allocate_turn_relay() {
 		if (turn_endpoints_.empty()) {
 			log(LogLevel::WARNING, "No TURN servers available for allocation.");
@@ -1245,18 +1281,17 @@ private:
 	
 		for (const auto& turn_ep : turn_endpoints_) {
 			try {
-				// Step 1: 인증 없이 초기 Allocate 요청
+				// Step 1: 초기 Allocate 요청 (AUTHENTICATION 없음)
 				StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
 				alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT, serialize_uint32(17)); // UDP
 	
 				// Allocate 요청 전송
-				auto resp_opt = co_await send_stun_request(alloc_req, "", turn_ep, true, std::chrono::milliseconds(1000), 3);
+				auto resp_opt = co_await send_stun_request(alloc_req, turn_ep, "",  true, std::chrono::milliseconds(1000), 3);
 				if (resp_opt.has_value()) {
 					StunMessage resp = resp_opt.value();
-					// 성공 응답 확인
 					if (resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS) {
 						// 릴레이 주소 추출
-						asio::ip::udp::endpoint relay = resp.get_relay_address(); // 필요에 따라 구현
+						asio::ip::udp::endpoint relay = resp.get_attribute_as_mapped_address(StunMessageType::RELAYED_ADDRESS);
 						if (!relay.address().is_unspecified()) {
 							relay_endpoint_ = relay;
 							log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
@@ -1282,7 +1317,7 @@ private:
 							co_return;
 						}
 					} else if (resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR) {
-						// 인증 챌린지 처리
+						// 인증 필요: REALM과 NONCE 추출
 						std::string realm = resp.get_attribute_as_string(StunAttributeType::REALM);
 						std::string nonce = resp.get_attribute_as_string(StunAttributeType::NONCE);
 						if (realm.empty() || nonce.empty()) {
@@ -1292,23 +1327,24 @@ private:
 						turn_realm_ = realm;
 						turn_nonce_ = nonce;
 	
-						// Step 2: MESSAGE-INTEGRITY를 포함한 재요청 Allocate
+						// Step 2: AUTHENTICATED Allocate 요청
 						StunMessage auth_alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
 						auth_alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT, serialize_uint32(17)); // UDP
 						auth_alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
 						auth_alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
-						// "username:realm" 형식의 USERNAME 생성
-						std::string username = turn_username_;
+						// USERNAME는 "username:realm" 형식
+						std::string username = turn_username_ + ":" + turn_realm_;
 						auth_alloc_req.add_attribute(StunAttributeType::USERNAME, username);
 						auth_alloc_req.add_message_integrity(turn_password_);
 						auth_alloc_req.add_fingerprint();
 	
-						// 인증된 Allocate 요청 전송
+						// AUTHENTICATED Allocate 요청 전송
 						auto auth_resp_opt = co_await send_stun_request(auth_alloc_req, turn_password_, turn_ep, true, std::chrono::milliseconds(1000), 3);
 						if (auth_resp_opt.has_value()) {
 							StunMessage auth_resp = auth_resp_opt.value();
 							if (auth_resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS) {
-								asio::ip::udp::endpoint relay = auth_resp.get_relay_address(); // 필요에 따라 구현
+								// 릴레이 주소 추출
+								asio::ip::udp::endpoint relay = resp.get_attribute_as_mapped_address(StunMessageType::RELAYED_ADDRESS);
 								if (!relay.address().is_unspecified()) {
 									relay_endpoint_ = relay;
 									log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));

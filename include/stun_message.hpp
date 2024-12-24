@@ -21,8 +21,11 @@ enum class StunMessageType : uint16_t {
     BINDING_REQUEST = 0x0001,
     BINDING_RESPONSE_SUCCESS = 0x0101,
     BINDING_RESPONSE_ERROR = 0x0111,
-    BINDING_INDICATION = 0x0011,
-    // Add more types as needed
+    BINDING_INDICATION = 0x0011, //
+    ALLOCATE = 0x0003,
+    ALLOCATE_RESPONSE_SUCCESS = 0x0103,
+    ALLOCATE_RESPONSE_ERROR = 0x0113,
+    // 추가 STUN/TURN 메시지 타입
 };
 
 // STUN Attribute Types (RFC 5389)
@@ -34,9 +37,13 @@ enum class StunAttributeType : uint16_t {
     FINGERPRINT = 0x8028,
     ICE_CONTROLLING = 0x8029,
     ICE_CONTROLLED = 0x802A,
-    USE_CANDIDATE = 0x0025,
-    PRIORITY = 0x0024,
-    // Add more attributes as needed
+    USE_CANDIDATE = 0x802B, //
+    REALM = 0x0014,
+    NONCE = 0x0015,
+    REQUESTED_TRANSPORT = 0x0019,
+    RELAYED_ADDRESS = 0x0016, // RFC 5766
+    REFRESH = 0x802C,
+    // 기타 속성 타입
 };
 
 // STUN Magic Cookie (RFC 5389)
