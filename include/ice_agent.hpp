@@ -52,7 +52,7 @@ enum class CandidateType {
     Relay
 };
 
-// Candidate
+// Candidate Structure
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
     CandidateType type;
@@ -61,7 +61,7 @@ struct Candidate {
     std::string foundation;
     std::string transport;
 
-    // SDP 변환
+    // Convert to SDP format
     std::string to_sdp() const {
         std::ostringstream oss;
         oss << "a=candidate:" << foundation << " " << component_id << " " 
@@ -130,7 +130,7 @@ struct CheckListEntry {
         : pair(cp), state(CandidatePairState::New), is_nominated(false) {}
 };
 
-// 콜백
+// Callbacks
 using StateCallback = std::function<void(IceConnectionState)>;
 using CandidateCallback = std::function<void(const Candidate&)>;
 using DataCallback = std::function<void(const std::vector<uint8_t>&, const asio::ip::udp::endpoint&)>;
@@ -142,7 +142,6 @@ struct IceAttributes {
     std::string pwd;
     IceRole role;
     uint64_t tie_breaker;
-    std::string session_id; // 로컬 또는 원격 세션 ID
     std::set<std::string> options; // {"ice-lite","ice2","trickle"}
 };
 
@@ -172,8 +171,11 @@ public:
       connectivity_check_timeout_(connectivity_check_timeout),
       connectivity_check_retries_(connectivity_check_retries)
     {
-        // Random session id
-        session_id_ = generate_random_string(12);
+        // Initialize tie_breaker with a random value
+        tie_breaker_ = generate_random_uint64();
+
+        // Generate random ICE credentials
+        local_ice_attributes_ = generate_ice_attributes();
 
         // Resolve STUN servers and store endpoints
         asio::ip::udp::resolver resolver(io_context);
@@ -224,7 +226,7 @@ public:
             socket_.set_option(opt, ec);
         }
         if (ec) {
-            // fallback IPv4
+            // Fallback to IPv4 if IPv6 fails
             socket_.open(asio::ip::udp::v4(), ec);
         }
         if (!ec) {
@@ -244,20 +246,22 @@ public:
         socket_.close(ec);
     }
 
-    // 콜백 설정
+    // Set Callbacks
     void set_on_state_change_callback(StateCallback cb) { state_callback_ = std::move(cb); }
     void set_candidate_callback(CandidateCallback cb) { candidate_callback_ = std::move(cb); }
     void set_data_callback(DataCallback cb) { data_callback_ = std::move(cb); }
     void set_nominate_callback(NominateCallback cb) { nominate_callback_ = std::move(cb); }
     void set_signaling_client(std::shared_ptr<SignalingClient> sc) { signaling_client_ = sc; }
 
-    // 로그
+    // Set Log Level
     void set_log_level(LogLevel level) { log_level_ = level; }
 
-    // ICE 시작
+    // Start ICE Process
     void start() {
-        if (current_state_==IceConnectionState::New) return;
-        local_ice_attributes_ = generate_ice_attributes();
+        if (current_state_ != IceConnectionState::New) return;
+            log(LogLevel::WARNING, "ICE is already started");
+            return;
+        }
 
         asio::co_spawn(strand_,
             [this, self=shared_from_this()]() -> asio::awaitable<void> {
@@ -267,15 +271,15 @@ public:
                     remote_candidates_.clear();
                     local_candidates_.clear();
 
-                    // 후보 수집
+                    // Gather candidates
                     co_await gather_candidates();
 
-                    // 시그널링 송신
+                    // Signaling: Send SDP and handle incoming messages
                     if (signaling_client_) {
                         std::string sdp = signaling_client_->create_sdp(local_ice_attributes_, local_candidates_);
                         co_await signaling_client_->send_sdp(sdp);
 
-                        // 수신 대기
+                        // Await incoming signaling messages
                         asio::co_spawn(strand_, handle_incoming_signaling_messages(), asio::detached);
                     }
 
@@ -283,25 +287,25 @@ public:
                         transition_to_state(IceConnectionState::Checking);
                         co_await perform_connectivity_checks();
                     } else {
-                        // Lite
+                        // Lite Mode: Skip local checks
                         log(LogLevel::INFO, "ICE Lite mode => skipping local checks, waiting for remote side to check.");
                         transition_to_state(IceConnectionState::Connected);
                     }
 
                     if (current_state_ == IceConnectionState::Connected || current_state_ == IceConnectionState::Completed) {
-                        // Keep-alive
+                        // Start consent freshness for Full ICE mode
                         if (mode_ == IceMode::Full) {
                             asio::co_spawn(strand_, perform_consent_freshness(), asio::detached);
                         }
-                        // TURN refresh
-                        if (!relay_endpoint_.address().is_unspecified()) { // [**Modified**] Check if TURN allocation exists
+                        // Start TURN relay refresh if allocated
+                        if (!relay_endpoint_.address().is_unspecified()) {
                             asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
                         }
-                        // 수신
+                        // Start data reception
                         asio::co_spawn(strand_, start_data_receive(), asio::detached);
                     }
                 } catch (const std::exception& ex) {
-                    log(LogLevel::ERROR, std::string("start() exception: ")+ex.what());
+                    log(LogLevel::ERROR, std::string("start() exception: ") + ex.what());
                     transition_to_state(IceConnectionState::Failed);
                 }
                 co_return;
@@ -309,13 +313,14 @@ public:
         );
     }
 
-    // ICE 재시작
+    // Restart ICE Process
     void restart_ice() {
         log(LogLevel::INFO, "Restarting ICE...");
+        transition_to_state(IceConnectionState::New);
         start();
     }
 
-    // 데이터 전송
+    // Send Data
     void send_data(const std::vector<uint8_t>& data) {
         if (current_state_ != IceConnectionState::Connected && current_state_ != IceConnectionState::Completed) {
             log(LogLevel::WARNING,"send_data() => not connected");
@@ -323,22 +328,16 @@ public:
         }
         asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
 
-        // If relay is allocated, use relay endpoint
-        if (!relay_endpoint_.address().is_unspecified()) {
-            target = relay_endpoint_;
-        }
-
-        socket_.async_send_to(asio::buffer(data),
-                              target,
-        [this](std::error_code ec, std::size_t){
-            if (ec) {
-                log(LogLevel::ERROR, "send_data failed: " + ec.message());
-            }
-        });
+        socket_.async_send_to(asio::buffer(data), target,
+            [this](std::error_code ec, std::size_t){
+                if (ec) {
+                    log(LogLevel::ERROR, "send_data failed: " + ec.message());
+                }
+            });
     }
 
 private:
-    // 멤버들
+    // Members
     asio::strand<asio::io_context::executor_type> strand_;
     asio::ip::udp::socket socket_;
     IceRole role_;
@@ -346,10 +345,10 @@ private:
     uint64_t tie_breaker_;
     std::vector<std::string> stun_servers_;
     std::vector<asio::ip::udp::endpoint> stun_endpoints_; // Resolved STUN server endpoints
-    std::vector<asio::ip::udp::endpoint> turn_endpoints_; // Resolved TURN server endpoints
     std::string turn_server_;
     std::string turn_username_;
     std::string turn_password_;
+    std::vector<asio::ip::udp::endpoint> turn_endpoints_; // Resolved TURN server endpoints
     std::atomic<IceConnectionState> current_state_;
     LogLevel log_level_;
 
@@ -370,28 +369,39 @@ private:
     std::chrono::seconds connectivity_check_timeout_;
     size_t connectivity_check_retries_;
 
-    // ICE 자격
+    // ICE Attributes
     IceAttributes local_ice_attributes_;
     IceAttributes remote_ice_attributes_;
 
-    // ---------- 내부 함수들 ----------
+    // ---------- Internal Functions ----------
+
+    // Transition to a new state
     bool transition_to_state(IceConnectionState new_state) {
         if (current_state_ == new_state) return false;
         current_state_ = new_state;
         if (state_callback_) {
             state_callback_(new_state);
         }
-        log(LogLevel::INFO, "ICE State => " + std::to_string(static_cast<int>(new_state)));
+        log(LogLevel::INFO, "ICE State => " + ice_state_to_string(new_state));
         return true;
     }
 
-    // 로컬 ICE 자격 생성
+    // Convert IceConnectionState to string for logging
+    std::string ice_state_to_string(IceConnectionState state) const {
+        switch(state) {
+            case IceConnectionState::New: return "New";
+            case IceConnectionState::Gathering: return "Gathering";
+            case IceConnectionState::Checking: return "Checking";
+            case IceConnectionState::Connected: return "Connected";
+            case IceConnectionState::Completed: return "Completed";
+            case IceConnectionState::Failed: return "Failed";
+            default: return "Unknown";
+        }
+    }
+
+    // Generate random ICE attributes
     IceAttributes generate_ice_attributes() {
         IceAttributes attrs;
-        static std::random_device rd;
-        static std::mt19937_64 gen(rd());
-        std::uniform_int_distribution<uint64_t> dist;
-        tie_breaker_ = dist(gen);
         attrs.tie_breaker = tie_breaker_;
         attrs.ufrag = generate_random_string(8);
         attrs.pwd = generate_random_string(24);
@@ -405,7 +415,7 @@ private:
         return attrs;
     }
 
-    // gather_candidates()
+    // Gather all candidates
     asio::awaitable<void> gather_candidates() {
         transition_to_state(IceConnectionState::Gathering);
         co_await gather_local_candidates();
@@ -414,6 +424,7 @@ private:
         co_return;
     }
 
+    // Gather local host candidates
     asio::awaitable<void> gather_local_candidates() {
         asio::ip::udp::resolver resolver(strand_);
         auto results4 = co_await resolver.async_resolve(asio::ip::udp::v4(), "0.0.0.0","0", asio::use_awaitable);
@@ -438,6 +449,7 @@ private:
         co_return;
     }
 
+    // Gather server reflexive candidates via STUN
     asio::awaitable<void> gather_srflx_candidates() {
         for (const auto& stun_ep : stun_endpoints_) { // Iterate over resolved STUN endpoints
             try {
@@ -455,13 +467,10 @@ private:
                 req.add_fingerprint();
 
                 // Send STUN request and await response
-                auto resp_opt = co_await send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, stun_ep,
-                                                                         std::chrono::milliseconds(500),
-                                                                         7);
+                auto resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, stun_ep);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
                     // Extract mapped address from response
-                    // Assuming StunMessage has a method to get mapped address
                     asio::ip::udp::endpoint mapped = resp.get_mapped_address(); // Implement this method as needed
                     Candidate c;
                     c.endpoint = mapped;
@@ -483,62 +492,18 @@ private:
         co_return;
     }
 
+    // Gather relay candidates via TURN
     asio::awaitable<void> gather_relay_candidates() {
         // Handle TURN allocation if TURN servers are available
         if (!turn_endpoints_.empty()) {
-            for (const auto& turn_ep : turn_endpoints_) { // Iterate over resolved TURN endpoints
-                try {
-                    // Create TURN Allocate request (a type of STUN request with specific attributes)
-                    StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-                    // Add necessary attributes for TURN allocation
-                    alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-                    alloc_req.add_attribute(StunAttributeType::REALM, "example.com"); // Replace with actual realm
-                    alloc_req.add_attribute(StunAttributeType::NONCE, "nonce"); // Replace with actual nonce
-                    // Add message integrity using TURN password
-                    alloc_req.add_message_integrity(turn_password_);
-                    alloc_req.add_fingerprint();
-
-                    // Send Allocate request and await response
-                    auto resp_opt = co_await send_stun_request_with_retransmit(alloc_req, turn_password_, turn_ep,
-                                                                             std::chrono::milliseconds(1000),
-                                                                             5);
-                    if (resp_opt.has_value()) {
-                        StunMessage resp = resp_opt.value();
-                        // Extract relay endpoint from response
-                        // Assuming StunMessage has a method to get relay address
-                        asio::ip::udp::endpoint relay = resp.get_relay_address(); // Implement this method as needed
-                        relay_endpoint_ = relay;
-                        log(LogLevel::DEBUG, "Allocated TURN relay: " + relay.address().to_string() + ":" + std::to_string(relay.port()));
-                        
-                        // Create Relay candidate
-                        Candidate c;
-                        c.endpoint = relay;
-                        c.type = CandidateType::Relay;
-                        c.foundation = "relay";
-                        c.transport = "UDP";
-                        c.component_id = 1;
-                        c.priority = calculate_priority(c);
-                        local_candidates_.push_back(c);
-                        if (candidate_callback_){
-                            candidate_callback_(c);
-                        }
-                        log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
-
-                        // Start periodic refresh
-                        asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
-                        break; // Assume one TURN server for simplicity
-                    }
-                } catch(const std::exception& ex) {
-                    log(LogLevel::WARNING, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" + std::to_string(turn_ep.port()) + " | " + ex.what());
-                }
-            }
+            co_await allocate_turn_relay();
         }
         co_return;
     }
 
-    // ConnCheck
+    // Perform connectivity checks
     asio::awaitable<void> perform_connectivity_checks() {
-        // Pair 생성
+        // Pair creation
         check_list_.clear();
         for (auto& rc : remote_candidates_) {
             for (auto& lc : local_candidates_) {
@@ -549,10 +514,10 @@ private:
                 }
             }
         }
-        // 정렬
+        // Sort candidate pairs based on priority
         sort_candidate_pairs();
 
-        // 병렬 검사
+        // Parallel checks (limit concurrency to 5)
         try {
             std::vector<asio::awaitable<void>> tasks;
             size_t concurrency = std::min<size_t>(5, check_list_.size());
@@ -577,24 +542,22 @@ private:
         co_return;
     }
 
+    // Perform a single connectivity check
     asio::awaitable<void> perform_single_connectivity_check(CheckListEntry& entry) {
         const auto& pair = entry.pair;
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
-        // STUN Binding Request
+        // Create STUN Binding Request
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-        // priority
+        // Add necessary attributes
         req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
-        // username => remoteUfrag:localUfrag
         std::string uname = remote_ice_attributes_.ufrag + ":" + local_ice_attributes_.ufrag;
         req.add_attribute(StunAttributeType::USERNAME, uname);
-        // role
         if (role_ == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
         } else {
             req.add_attribute(StunAttributeType::ICE_CONTROLLED, serialize_uint64(local_ice_attributes_.tie_breaker));
         }
-        // message integrity(송신자는 remote pwd)
         req.add_message_integrity(remote_ice_attributes_.pwd);
         req.add_fingerprint();
 
@@ -604,19 +567,56 @@ private:
         try {
             if (is_relay && !relay_endpoint_.address().is_unspecified()) {
                 // Send STUN request via TURN relay
-                resp_opt = co_await send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, relay_endpoint_,
-                                                                         std::chrono::milliseconds(500),
-                                                                         7);
+                resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, relay_endpoint_);
             } else {
                 // Send direct STUN request
-                resp_opt = co_await send_stun_request_with_retransmit(req, remote_ice_attributes_.pwd, dest,
-                                                                     std::chrono::milliseconds(500),
-                                                                     7);
+                resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, dest);
             }
 
             if (resp_opt.has_value()) {
                 entry.state = CandidatePairState::Succeeded;
                 log(LogLevel::DEBUG, "Connectivity check succeeded for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp());
+
+                // Handle PRFLX Candidate Discovery
+                StunMessage resp = resp_opt.value();
+                asio::ip::udp::endpoint mapped = resp.get_mapped_address(); // Implement this method as needed
+
+                // Check if the mapped endpoint is already known
+                bool known = false;
+                for (const auto& rc : remote_candidates_) {
+                    if (rc.endpoint == mapped) {
+                        known = true;
+                        break;
+                    }
+                }
+
+                if (!known && !mapped.address().is_unspecified()) {
+                    // Create a new PRFLX candidate
+                    Candidate prflx;
+                    prflx.endpoint = mapped;
+                    prflx.type = CandidateType::PeerReflexive;
+                    prflx.foundation = "prflx";
+                    prflx.transport = "UDP";
+                    prflx.component_id = 1;
+                    prflx.priority = calculate_priority(prflx);
+
+                    // Add to remote_candidates_ and notify via callback
+                    remote_candidates_.push_back(prflx);
+                    if (candidate_callback_) {
+                        candidate_callback_(prflx);
+                    }
+                    log(LogLevel::DEBUG, "Discovered new PeerReflexive candidate: " + prflx.to_sdp());
+
+                    // Pair the new PRFLX candidate with local candidates for connectivity checks
+                    for (auto& lc : local_candidates_) {
+                        if (lc.component_id == prflx.component_id) {
+                            CandidatePair new_pair(lc, prflx);
+                            new_pair.priority = calculate_priority_pair(lc, prflx);
+                            check_list_.emplace_back(new_pair);
+                            log(LogLevel::DEBUG, "Added new CandidatePair for PRFLX: " + lc.to_sdp() + " <-> " + prflx.to_sdp());
+                        }
+                    }
+                }
             } else {
                 entry.state = CandidatePairState::Failed;
                 log(LogLevel::DEBUG, "Connectivity check failed for pair: " + pair.local_candidate.to_sdp() + " <-> " + pair.remote_candidate.to_sdp());
@@ -629,13 +629,13 @@ private:
         co_return;
     }
 
-    // STUN 재전송 및 응답 반환
-    asio::awaitable<std::optional<StunMessage>> send_stun_request_with_retransmit(
+    // Send STUN request with retransmission and await response
+    asio::awaitable<std::optional<StunMessage>> send_stun_request(
         const StunMessage& request,
         const std::string& remote_pwd,
         const asio::ip::udp::endpoint& dest,
-        std::chrono::milliseconds initial_timeout,
-        int max_tries)
+        std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500),
+        int max_tries = 7)
     {
         using namespace asio::experimental::awaitable_operators;
 
@@ -644,9 +644,11 @@ private:
 
         std::chrono::milliseconds timeout = initial_timeout;
         for (int attempt = 0; attempt < max_tries; ++attempt) {
+            // Send the STUN request
             co_await socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
             log(LogLevel::DEBUG, "Sent STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
 
+            // Set up a timer for the response timeout
             asio::steady_timer timer(strand_);
             timer.expires_after(timeout);
 
@@ -655,6 +657,7 @@ private:
 
             std::optional<StunMessage> response = std::nullopt;
 
+            // Await either a STUN response or the timer expiration
             co_await (
                 (
                     [&]() -> asio::awaitable<void> {
@@ -665,7 +668,7 @@ private:
                             if (resp.get_transaction_id() == txn_id &&
                                 resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS) {
                                 // Verify message integrity and fingerprint
-                                if (resp.verify_message_integrity(local_ice_attributes_.pwd) &&
+                                if (resp.verify_message_integrity(remote_pwd) &&
                                     resp.verify_fingerprint()) {
                                     response = resp;
                                 }
@@ -692,7 +695,7 @@ private:
                 co_return response;
             }
 
-            // Backoff
+            // Exponential backoff
             timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
             log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt + 1) + " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
         }
@@ -701,6 +704,7 @@ private:
         co_return std::nullopt;
     }
 
+    // Evaluate connectivity results after checks
     asio::awaitable<void> evaluate_connectivity_results() {
         bool any_success = false;
         for (auto& e: check_list_) {
@@ -720,34 +724,29 @@ private:
         co_return;
     }
 
-    // Nomination
+    // Nominate a candidate pair
     asio::awaitable<void> nominate_pair(CheckListEntry& entry) {
         entry.is_nominated = true;
-        nominated_pair_ = entry.pair;
+        nominated_pair_ = entry.pair; // Set the nominated pair
 
-        asio::ip::udp::endpoint target = entry.pair.remote_candidate.endpoint;
-        // If relay is allocated and pair uses relay, use relay endpoint
-        if (entry.pair.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
-            target = relay_endpoint_;
-        }
+        asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
 
         if (role_ == IceRole::Controller) {
-            // Binding Indication w/ USE-CANDIDATE
+            // Create and send BINDING_INDICATION with USE-CANDIDATE attribute
             StunMessage ind(StunMessageType::BINDING_INDICATION, StunMessage::generate_transaction_id());
             ind.add_attribute(StunAttributeType::USE_CANDIDATE, {});
             ind.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
             ind.add_message_integrity(remote_ice_attributes_.pwd);
             ind.add_fingerprint();
 
-            co_await socket_.async_send_to(asio::buffer(ind.serialize()),
-                                           target,
-                                           asio::use_awaitable);
+            co_await socket_.async_send_to(asio::buffer(ind.serialize()), target, asio::use_awaitable);
             log(LogLevel::DEBUG, "Sent BINDING_INDICATION with USE-CANDIDATE to " + target.to_string());
+
             if (nominate_callback_) {
                 nominate_callback_(entry.pair);
             }
         } else {
-            // Controlled
+            // For Controlled role
             if (nominate_callback_) {
                 nominate_callback_(entry.pair);
             }
@@ -776,10 +775,6 @@ private:
 
     asio::awaitable<bool> send_consent_binding_request() {
         asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
-        // If relay is allocated, use relay endpoint
-        if (nominated_pair_.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
-            target = relay_endpoint_;
-        }
 
         if (target.address().is_unspecified()) {
             co_return false;
@@ -797,7 +792,7 @@ private:
 
         bool ok = false;
         try {
-            std::optional<StunMessage> resp_opt = co_await send_stun_request_with_retransmit(
+            std::optional<StunMessage> resp_opt = co_await send_stun_request(
                 req, remote_ice_attributes_.pwd,
                 target,
                 std::chrono::milliseconds(500),
@@ -833,9 +828,9 @@ private:
                 refresh_req.add_fingerprint();
 
                 // Send Refresh request and await response
-                auto resp_opt = co_await send_stun_request_with_retransmit(refresh_req, turn_password_, turn_endpoints_[0],
-                                                                         std::chrono::milliseconds(1000),
-                                                                         5);
+                auto resp_opt = co_await send_stun_request(refresh_req, turn_password_, turn_endpoints_[0],
+                                                         std::chrono::milliseconds(1000),
+                                                         5);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
                     // Validate response if necessary
@@ -851,33 +846,50 @@ private:
         co_return;
     }
 
-    // 데이터 수신
+    // Start data reception and handle user data
     asio::awaitable<void> start_data_receive() {
         while (current_state_ == IceConnectionState::Connected
             || current_state_ == IceConnectionState::Completed)
         {
-            std::vector<uint8_t> buf(2048);
-            asio::ip::udp::endpoint sender;
-            size_t bytes=0;
+            std::vector<uint8_t> buf(2048); // Buffer to store incoming data
+            asio::ip::udp::endpoint sender;    // Endpoint of the sender
+            size_t bytes = 0;
+
             try {
+                // Asynchronously receive data from any endpoint
                 bytes = co_await socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
             } catch(...) {
+                // On exception, transition to Failed state and log the error
                 transition_to_state(IceConnectionState::Failed);
                 log(LogLevel::ERROR, "Data receive failed.");
                 break;
             }
+
             if (bytes > 0) {
-                buf.resize(bytes);
-                // STUN vs Application data
+                buf.resize(bytes); // Resize buffer to actual data size
+
                 try {
+                    // Attempt to parse the incoming data as a STUN message
                     StunMessage sm = StunMessage::parse(buf);
-                    // handle inbound STUN
+
+                    // If parsing is successful, handle it as a STUN message
                     co_await handle_inbound_stun(sm, sender);
                 } catch(...) {
-                    // not STUN => app data
-                    if (data_callback_) {
-                        data_callback_(buf, sender);
-                        log(LogLevel::DEBUG, "Received application data from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
+                    // If parsing fails, treat the data as user/application data
+
+                    // **Check if the sender is the nominated remote candidate**
+                    if (sender == nominated_pair_.remote_candidate.endpoint) {
+                        // Forward the user data to the application via the callback
+                        if (data_callback_) {
+                            data_callback_(buf, sender);
+                            log(LogLevel::DEBUG, "Received application data from nominated endpoint: " 
+                                + sender.address().to_string() + ":" + std::to_string(sender.port()));
+                        }
+                    } else {
+                        // **Optional:** Handle data from non-nominated endpoints
+                        // For security reasons, it's recommended to ignore or log unexpected data
+                        log(LogLevel::WARNING, "Received application data from unknown endpoint: " 
+                            + sender.address().to_string() + ":" + std::to_string(sender.port()));
                     }
                 }
             }
@@ -885,7 +897,7 @@ private:
         co_return;
     }
 
-    // STUN 수신 처리
+    // Handle inbound STUN messages
     asio::awaitable<void> handle_inbound_stun(const StunMessage& sm, const asio::ip::udp::endpoint& sender) {
         switch(sm.get_type()) {
             case StunMessageType::BINDING_REQUEST:
@@ -900,19 +912,19 @@ private:
         co_return;
     }
 
-    // Binding Request => Triggered Check
+    // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
     asio::awaitable<void> handle_inbound_binding_request(const StunMessage& req, const asio::ip::udp::endpoint& sender) {
-        // username => "ourUfrag:theirUfrag"
+        // Extract username attribute: "remoteUfrag:localUfrag"
         auto uname = req.get_attribute_as_string(StunAttributeType::USERNAME);
         auto delim = uname.find(':');
         if (delim == std::string::npos) co_return;
         std::string rcv_ufrag = uname.substr(0, delim);
         std::string snd_ufrag = uname.substr(delim+1);
 
-        // 우리가 수신자 => rcv_ufrag == local_ice_attributes_.ufrag
+        // Verify that the receiver is indeed this agent
         if (rcv_ufrag != local_ice_attributes_.ufrag) co_return;
 
-        // 무결성 => local pwd로 검증
+        // Verify message integrity and fingerprint
         if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
             log(LogLevel::WARNING, "Invalid message integrity in inbound binding request.");
             co_return;
@@ -922,16 +934,52 @@ private:
             co_return;
         }
 
-        // PeerReflexive Candidate 생성 가능
-        Candidate prflx;
-        prflx.type = CandidateType::PeerReflexive;
-        prflx.endpoint = sender;
-        prflx.component_id = 1; 
-        prflx.foundation = "prflx";
-        prflx.transport = "UDP";
-        prflx.priority = (110 << 24);
+        // Extract mapped address from the request
+        asio::ip::udp::endpoint mapped = req.get_mapped_address(); // Implement this method as needed
 
-        // check list에 페어 없으면 추가 ...
+        // Check if the mapped endpoint is already known
+        bool known = false;
+        for (const auto& rc : remote_candidates_) {
+            if (rc.endpoint == mapped) {
+                known = true;
+                break;
+            }
+        }
+
+        if (!known && !mapped.address().is_unspecified()) {
+            // Create a new PRFLX candidate
+            Candidate prflx;
+            prflx.endpoint = mapped;
+            prflx.type = CandidateType::PeerReflexive;
+            prflx.foundation = "prflx";
+            prflx.transport = "UDP";
+            prflx.component_id = 1;
+            prflx.priority = calculate_priority(prflx);
+
+            // Add to remote_candidates_ and notify via callback
+            remote_candidates_.push_back(prflx);
+            if (candidate_callback_) {
+                candidate_callback_(prflx);
+            }
+            log(LogLevel::DEBUG, "Discovered new PeerReflexive candidate: " + prflx.to_sdp());
+
+            // Pair the new PRFLX candidate with local candidates for connectivity checks
+            for (auto& lc : local_candidates_) {
+                if (lc.component_id == prflx.component_id) {
+                    CandidatePair new_pair(lc, prflx);
+                    new_pair.priority = calculate_priority_pair(lc, prflx);
+                    check_list_.emplace_back(new_pair);
+                    log(LogLevel::DEBUG, "Added new CandidatePair for PRFLX: " + lc.to_sdp() + " <-> " + prflx.to_sdp());
+                }
+            }
+
+            // Perform connectivity checks for the new PRFLX candidate if in Full ICE mode
+            if (mode_ == IceMode::Full) {
+                co_await perform_connectivity_checks();
+            }
+        }
+
+        // Triggered Connectivity Check for the incoming request
         bool found_pair = false;
         for (auto& e: check_list_) {
             if (e.pair.remote_candidate.endpoint == sender) {
@@ -940,22 +988,24 @@ private:
             }
         }
         if (!found_pair && !sender.address().is_unspecified()) {
-            // local candidate 선택
+            // Select a local candidate (e.g., first host candidate)
             Candidate local_cand;
-            // 임시로 첫 host candidate 사용 (실제론 family·component matching)
             if (!local_candidates_.empty()) {
                 local_cand = local_candidates_[0];
+            } else {
+                log(LogLevel::ERROR, "No local candidates available for pairing.");
+                co_return;
             }
-            CandidatePair newp(local_cand, prflx);
-            newp.priority = calculate_priority_pair(local_cand, prflx);
+            CandidatePair newp(local_cand, mapped);
+            newp.priority = calculate_priority_pair(local_cand, mapped);
             check_list_.emplace_back(newp);
-            log(LogLevel::DEBUG, "Added new PeerReflexive pair: " + local_cand.to_sdp() + " <-> " + prflx.to_sdp());
+            log(LogLevel::DEBUG, "Added new PeerReflexive pair: " + local_cand.to_sdp() + " <-> " + mapped.to_sdp());
 
-            // Optionally, trigger connectivity check for the new pair
-            // For simplicity, not implemented here
+            // Perform connectivity check for the new pair
+            co_await perform_connectivity_checks();
         }
 
-        // BINDING RESPONSE
+        // Send BINDING RESPONSE
         StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
         resp.add_message_integrity(remote_ice_attributes_.pwd);
         resp.add_fingerprint();
@@ -966,10 +1016,10 @@ private:
         co_return;
     }
 
-    // Binding Indication => USE-CANDIDATE
+    // Handle STUN Binding Indication (USE-CANDIDATE)
     asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) {
         if (ind.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-            // 첫 Succeeded & 미지명 Pair nominate
+            // Nominate the first succeeded and un-nominated pair
             for (auto& e: check_list_) {
                 if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
                     co_await nominate_pair(e);
@@ -981,7 +1031,7 @@ private:
         co_return;
     }
 
-    // 신호 메시지 받기
+    // Handle incoming signaling messages (e.g., SDP)
     asio::awaitable<void> handle_incoming_signaling_messages() {
         while (current_state_ != IceConnectionState::Failed && current_state_ != IceConnectionState::Completed) {
             try {
@@ -990,18 +1040,14 @@ private:
                 remote_ice_attributes_ = rattr;
                 negotiate_role(rattr.tie_breaker);
 
-                if (mode_ == IceMode::Lite && role_ == IceRole::Controller) {
-                    log(LogLevel::ERROR, "Lite agent cannot be Controller => fail");
-                    transition_to_state(IceConnectionState::Failed);
-                    co_return;
-                }
-
+                // Validate roles to prevent both being Controllers
                 if (rattr.role == IceRole::Controller && role_ == IceRole::Controller) {
                     log(LogLevel::ERROR, "Both sides are Controller => fail");
                     transition_to_state(IceConnectionState::Failed);
                     co_return;
                 }
 
+                // Add remote candidates
                 co_await add_remote_candidate(rcands);
 
                 // If trickle ICE is enabled, handle additional candidates as they arrive
@@ -1018,6 +1064,7 @@ private:
         co_return;
     }
 
+    // Add remote candidates received via signaling
     asio::awaitable<void> add_remote_candidate(const std::vector<Candidate>& cands) {
         for (auto& c: cands) {
             remote_candidates_.push_back(c);
@@ -1032,18 +1079,35 @@ private:
         co_return;
     }
 
-    // role 협상
+    // Role negotiation based on tie-breaker values
     void negotiate_role(uint64_t remote_tie_breaker) {
         if (tie_breaker_ > remote_tie_breaker) {
-            role_=IceRole::Controller;
+            role_ = IceRole::Controller;
+        } else if (tie_breaker_ < remote_tie_breaker) {
+            role_ = IceRole::Controlled;
         } else {
-            role_=IceRole::Controlled;
+            // Tie-breaker collision, use lexicographical order of ufrag
+            if (local_ice_attributes_.ufrag < remote_ice_attributes_.ufrag) {
+                role_ = IceRole::Controller;
+            } else {
+                role_ = IceRole::Controlled;
+            }
         }
-        log(LogLevel::INFO, "Negotiated role => " + std::to_string(static_cast<int>(role_)));
+        log(LogLevel::INFO, "Negotiated role => " + ice_role_to_string(role_));
     }
 
+    // Convert IceRole to string for logging
+    std::string ice_role_to_string(IceRole role) const {
+        switch(role) {
+            case IceRole::Controller: return "Controller";
+            case IceRole::Controlled: return "Controlled";
+            default: return "Unknown";
+        }
+    }
+
+    // Calculate candidate priority based on RFC 8445
     uint32_t calculate_priority(const Candidate& c) const {
-        // RFC 8445
+        // RFC 8445 Section 5.7.1
         uint32_t type_pref=0;
         switch(c.type){
             case CandidateType::Host: type_pref=126; break;
@@ -1056,25 +1120,38 @@ private:
         return (type_pref << 24) | (local_pref << 8) | (256 - comp);
     }
 
+    // Calculate pair priority based on RFC 8445 Section 5.7.2
     uint64_t calculate_priority_pair(const Candidate& l, const Candidate& r) const {
         uint32_t min_priority = std::min(l.priority, r.priority);
         uint32_t max_priority = std::max(l.priority, r.priority);
         return (static_cast<uint64_t>(min_priority) << 32) + (static_cast<uint64_t>(max_priority) * 2) + ((l.priority > r.priority) ? 1 : 0);
     }
 
+    // Sort candidate pairs based on priority
     void sort_candidate_pairs() {
         std::sort(check_list_.begin(), check_list_.end(), [&](auto& a, auto& b){
             return a.pair.priority > b.pair.priority;
         });
     }
 
-    // 로깅
+    // Logging function
     void log(LogLevel lvl, const std::string& msg) {
         if (lvl < log_level_) return;
-        std::cout << "[IceAgent][" << static_cast<int>(lvl) << "] " << msg << std::endl;
+        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << msg << std::endl;
     }
 
-    // 랜덤 스트링
+    // Convert LogLevel to string
+    std::string log_level_to_string(LogLevel lvl) const {
+        switch(lvl){
+            case LogLevel::DEBUG: return "DEBUG";
+            case LogLevel::INFO: return "INFO";
+            case LogLevel::WARNING: return "WARNING";
+            case LogLevel::ERROR: return "ERROR";
+            default: return "UNKNOWN";
+        }
+    }
+
+    // Generate random string for ufrag and pwd
     static std::string generate_random_string(size_t len){
         static const char* chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
         static std::random_device rd;
@@ -1087,7 +1164,15 @@ private:
         return s;
     }
 
-    // 직렬화 uint32
+    // Generate random uint64 for tie-breaker
+    static uint64_t generate_random_uint64(){
+        static std::random_device rd;
+        static std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        return dist(gen);
+    }
+
+    // Serialize uint32 to byte vector
     std::vector<uint8_t> serialize_uint32(uint32_t val) {
         std::vector<uint8_t> out(4);
         for(int i=0;i<4;++i){
@@ -1097,7 +1182,7 @@ private:
         return out;
     }
 
-    // 직렬화 uint64
+    // Serialize uint64 to byte vector
     std::vector<uint8_t> serialize_uint64(uint64_t val) {
         std::vector<uint8_t> out(8);
         for(int i=0;i<8;++i){
@@ -1125,15 +1210,12 @@ private:
             alloc_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
             alloc_req.add_attribute(StunAttributeType::REALM, "example.com"); // Replace with actual realm
             alloc_req.add_attribute(StunAttributeType::NONCE, "nonce"); // Replace with actual nonce
-            // Indicate it's an allocation request
-            // This might require specific TURN attributes not covered here
+            // Indicate it's an allocation request (specific TURN attributes may be needed)
             alloc_req.add_message_integrity(turn_password_);
             alloc_req.add_fingerprint();
 
             // Send Allocate request and await response
-            auto resp_opt = co_await send_stun_request_with_retransmit(alloc_req, turn_password_, turn_ep,
-                                                                     std::chrono::milliseconds(1000),
-                                                                     5);
+            auto resp_opt = co_await send_stun_request(alloc_req, turn_password_, turn_ep, std::chrono::milliseconds(1000), 5);
             if (resp_opt.has_value()) {
                 StunMessage resp = resp_opt.value();
                 // Extract relay endpoint from response
@@ -1155,7 +1237,7 @@ private:
                 }
                 log(LogLevel::DEBUG, "Gathered Relay candidate: " + c.to_sdp());
 
-                // Start periodic refresh
+                // Start periodic TURN refresh
                 asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
             }
         } catch(const std::exception& ex) {
@@ -1166,4 +1248,19 @@ private:
     }
 
     // ---------- END TURN Operations Integrated ----------
+
+    // Handle inbound STUN messages (e.g., BINDING_REQUEST, BINDING_INDICATION)
+    asio::awaitable<void> handle_inbound_stun(const StunMessage& sm, const asio::ip::udp::endpoint& sender) {
+        switch(sm.get_type()) {
+            case StunMessageType::BINDING_REQUEST:
+                co_await handle_inbound_binding_request(sm, sender);
+                break;
+            case StunMessageType::BINDING_INDICATION:
+                co_await handle_binding_indication(sm, sender);
+                break;
+            default:
+                break;
+        }
+        co_return;
+    }
 };
