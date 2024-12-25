@@ -326,6 +326,10 @@ public:
         return std::nullopt; // Attribute not found
     }
 
+	std::optional<asio::ip::udp::endpoint> StunMessage::get_mapped_address() const {
+		return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
+	}
+	
 	// Get attribute as optional MAPPED_ADDRESS
 	std::optional<asio::ip::udp::endpoint> get_attribute_as_mapped_address(StunAttributeType attr_type) const {
 		for (const auto& attr : attributes_) {
@@ -359,6 +363,10 @@ public:
 		return std::nullopt; // Attribute not found
 	}
 
+	std::optional<asio::ip::udp::endpoint> StunMessage::get_xor_mapped_address() const {
+		return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
+	}
+	
 	// Get attribute as optional XOR-MAPPED_ADDRESS
 	std::optional<asio::ip::udp::endpoint> get_attribute_as_xor_mapped_address(StunAttributeType attr_type, const asio::ip::udp::endpoint& request_endpoint) const {
 		for (const auto& attr : attributes_) {

@@ -751,20 +751,25 @@ private:
 							std::size_t bytes = co_await udp_socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
 							std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
 							StunMessage resp = StunMessage::parse(received_data);
-							if (resp.get_transaction_id() == txn_id &&
-								(resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS ||
-								resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR || 
-								resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS ||
-								resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR)) {
-								// 메시지 무결성 및 핑거프린트 검증
-								bool integrity_ok = true;
-								bool fingerprint_ok = true;
-								if (!remote_pwd.empty()) {
-									integrity_ok = resp.verify_message_integrity(remote_pwd);
-									fingerprint_ok = resp.verify_fingerprint();
-								}
-								if (integrity_ok && fingerprint_ok) {
-									response = resp;
+							if (resp.get_transaction_id() == txn_id) {
+								switch (resp.get_type()) {
+									case StunMessageType::BINDING_RESPONSE_SUCCESS:
+									case StunMessageType::BINDING_RESPONSE_ERROR:
+									case StunMessageType::ALLOCATE_RESPONSE_SUCCESS:
+									case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
+										// 메시지 무결성 및 핑거프린트 검증
+										bool integrity_ok = true;
+										bool fingerprint_ok = true;
+										if (!remote_pwd.empty()) {
+											integrity_ok = resp.verify_message_integrity(remote_pwd);
+											fingerprint_ok = resp.verify_fingerprint();
+										}
+										if (integrity_ok && fingerprint_ok) {
+											response = resp;
+										}
+										break;
+									}
+									default: break;
 								}
 							}
 						} catch(...) {
