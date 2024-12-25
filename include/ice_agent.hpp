@@ -3,7 +3,6 @@
 #include <asio.hpp>
 #include <asio/awaitable.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
-#include <asio/experimental/parallel_group.hpp>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -177,7 +176,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
              const std::vector<std::string> &turn_servers,  // Changed to vector
              const std::string &turn_username = "", const std::string &turn_password = "",
              const std::string &signaling_server_address = "", unsigned short signaling_server_port = 0)
-        : strand_(io_context.get_executor()),
+        : io_context_(io_context),
+          strand_(io_context.get_executor()),
           udp_socket_(strand_),
           tcp_socket_(strand_),
           mode_(mode),
@@ -388,6 +388,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
    private:
     // Members
+    asio::io_context &io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
     asio::ip::udp::socket udp_socket_;
     asio::ip::tcp::socket tcp_socket_;  // TCP socket for signaling
@@ -408,6 +409,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     std::vector<Candidate> local_candidates_;
     std::vector<Candidate> remote_candidates_;
     std::vector<CheckListEntry> check_list_;
+    std::atomic<bool> connectivity_check_in_progress_{false};  // 중복 호출 방지 변수
 
     asio::ip::udp::endpoint relay_endpoint_;  // Allocated relay endpoint
 
@@ -557,10 +559,10 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // 연결성 검사 수행
     asio::awaitable<void> perform_connectivity_checks() {
-        if (!transition_to_state(IceConnectionState::Checking))
-            co_return;
+        if (connectivity_check_in_progress_.exchange(true)) {
+            co_return;  // 이미 실행 중이면 종료
+        }
 
-        // 후보자 쌍 생성
         check_list_.clear();
         for (auto &rc : remote_candidates_) {
             for (auto &lc : local_candidates_) {
@@ -571,41 +573,56 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 }
             }
         }
-        // 우선순위에 따라 후보자 쌍 정렬
+
         sort_candidate_pairs();
 
-        // 제한된 동시성으로 병렬 검사 수행
-        try {
-            asio::experimental::parallel_group group;
-            size_t max_concurrency = 5;
-            size_t active_tasks = 0;
-            size_t next_pair = 0;
+        size_t next_pair = 0;                 // 단순히 증가만 하므로 atomic 필요 없음
+        std::atomic<size_t> active_tasks{0};  // 경합 방지를 위해 atomic 사용
+        const size_t max_concurrency = 5;
 
-            while (next_pair < check_list_.size() || active_tasks > 0) {
-                while (active_tasks < max_concurrency && next_pair < check_list_.size()) {
-                    CheckListEntry &entry = check_list_[next_pair];
+        try {
+            while (true) {
+                bool progress = false;
+
+                while (active_tasks < max_concurrency) {
+                    if (next_pair >= check_list_.size()) {
+                        break;
+                    }
+
+                    CheckListEntry &entry = check_list_[next_pair++];
                     if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
                         entry.state = CandidatePairState::InProgress;
-                        group.add([&]() -> asio::awaitable<void> {
-                            co_await perform_single_connectivity_check(entry);
-                            if (entry.state == CandidatePairState::Succeeded)
-                                transition_to_state(IceConnectionState::Connected);
-                        });
-                        ++active_tasks;
+                        active_tasks.fetch_add(1, std::memory_order_relaxed);  // 작업 증가
+                        progress = true;
+
+                        asio::co_spawn(io_context_, perform_single_connectivity_check(entry),
+                                       [&, index = next_pair - 1](std::exception_ptr eptr) {
+                                           if (!eptr && check_list_[index].state == CandidatePairState::Succeeded) {
+                                               transition_to_state(IceConnectionState::Connected);
+                                           }
+                                           active_tasks.fetch_sub(1, std::memory_order_relaxed);  // 작업 감소
+                                       });
                     }
-                    ++next_pair;
                 }
 
-                if (active_tasks > 0) {
-                    co_await group.wait();
-                    active_tasks--;
+                // 새 항목 추가 확인
+                if (next_pair < check_list_.size()) {
+                    progress = true;  // 새 항목이 추가되었으므로 다시 시도
                 }
+
+                if (!progress && active_tasks == 0) {
+                    break;  // 더 이상 처리할 항목이 없고 활성 작업이 없으면 종료
+                }
+
+                co_await asio::steady_timer(co_await asio::this_coro::executor, std::chrono::milliseconds(10))
+                    .async_wait();
             }
 
             co_await evaluate_connectivity_results();
         } catch (...) {
             transition_to_state(IceConnectionState::Failed);
         }
+        connectivity_check_in_progress_ = false;  // 실행 완료 표시
     }
 
     // Perform a single connectivity check
@@ -758,6 +775,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                    " failed after " + std::to_string(max_tries) + " attempts.");
         co_return std::nullopt;
     }
+
     // Evaluate connectivity results after checks
     asio::awaitable<void> evaluate_connectivity_results() {
         bool any_success = false;
@@ -769,12 +787,13 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 }
             }
         }
-        if (!any_success) {
-            transition_to_state(IceConnectionState::Failed);
-            log(LogLevel::Error, "All connectivity checks failed.");
-        } else {
+        if (any_success) {
             transition_to_state(IceConnectionState::Completed);
             log(LogLevel::Info, "ICE completed established.");
+
+        } else {
+            transition_to_state(IceConnectionState::Failed);
+            log(LogLevel::Error, "All connectivity checks failed.");
         }
     }
 
@@ -1077,39 +1096,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         log(LogLevel::Info, "Negotiated role => " + ice_role_to_string(local_ice_attributes_.role));
     }
 
-    // Helper Function to Add Peer-Reflexive (PRFLX) Candidate
-    void add_prflx_candidate(const asio::ip::udp::endpoint &mapped) {
-        bool known = false;
-        for (const auto &rc : remote_candidates_) {
-            if (rc.endpoint == mapped) {
-                known = true;
-                break;
-            }
-        }
-
-        if (!known && !mapped.address().is_unspecified()) {
-            // Create a new Peer-Reflexive (PRFLX) candidate
-            Candidate prflx;
-            prflx.endpoint = mapped;
-            prflx.type = CandidateType::PeerReflexive;
-            prflx.foundation = "prflx";
-            prflx.transport = "UDP";
-            prflx.component_id = 1;
-            prflx.priority = calculate_priority(prflx);
-
-            // Add to remote candidates and notify via callback
-            remote_candidates_.push_back(prflx);
-            if (candidate_callback_) {
-                candidate_callback_(prflx);
-            }
-            log(LogLevel::Debug, "Discovered new Peer-Reflexive candidate: " + prflx.to_sdp());
-
-            if (mode_ == IceMode::Full) {
-                // asio::co_spawn(perform_connectivity_checks(), asio::dispatch);
-            }
-        }
-    }
-
     // Helper Function to Create Binding Response
     StunMessage create_binding_response(const StunMessage &req, const asio::ip::udp::endpoint &mapped) {
         StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
@@ -1185,6 +1171,39 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             // If trickle ICE is enabled or Full Ice, handle additional candidates as they arrive
             if (mode_ == IceMode::Full || local_ice_attributes_.has_option(IceOption::Trickle)) {
                 asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
+            }
+        }
+    }
+
+    // Helper Function to Add Peer-Reflexive (PRFLX) Candidate
+    void add_prflx_candidate(const asio::ip::udp::endpoint &mapped) {
+        bool known = false;
+        for (const auto &rc : remote_candidates_) {
+            if (rc.endpoint == mapped) {
+                known = true;
+                break;
+            }
+        }
+
+        if (!known && !mapped.address().is_unspecified()) {
+            // Create a new Peer-Reflexive (PRFLX) candidate
+            Candidate prflx;
+            prflx.endpoint = mapped;
+            prflx.type = CandidateType::PeerReflexive;
+            prflx.foundation = "prflx";
+            prflx.transport = "UDP";
+            prflx.component_id = 1;
+            prflx.priority = calculate_priority(prflx);
+
+            // Add to remote candidates and notify via callback
+            remote_candidates_.push_back(prflx);
+            if (candidate_callback_) {
+                candidate_callback_(prflx);
+            }
+            log(LogLevel::Debug, "Discovered new Peer-Reflexive candidate: " + prflx.to_sdp());
+
+            if (mode_ == IceMode::Full) {
+                // asio::co_spawn(perform_connectivity_checks(), asio::dispatch);
             }
         }
     }
@@ -1339,74 +1358,31 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
 
         for (const auto &turn_ep : turn_endpoints_) {
-            try {
-                // Step 1: 초기 Allocate 요청 (AUTHENTICATION 없음)
-                StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-                alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT, serialize_uint32(17));  // UDP
+            uint32_t retry{0};
 
-                // Allocate 요청 전송
-                auto resp_opt = co_await send_stun_request(turn_ep, alloc_req, "", std::chrono::milliseconds(1000), 3);
-                if (resp_opt.has_value()) {
-                    StunMessage resp = resp_opt.value();
-                    if (resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS) {
-                        // 릴레이 주소 추출
-                        auto relay_opt = resp.get_relayed_address();
-                        if (relay_opt.has_value()) {
-                            relay_endpoint_ = relay_opt.value();
-                            log(LogLevel::Debug, "Allocated TURN relay: " + relay_endpoint_.address().to_string() +
-                                                     ":" + std::to_string(relay_endpoint_.port()));
-
-                            // 릴레이 후보자 생성
-                            Candidate c;
-                            c.endpoint = relay_opt.value();
-                            c.type = CandidateType::Relay;
-                            c.foundation = "relay";
-                            c.transport = "UDP";
-                            c.component_id = 1;
-                            c.priority = calculate_priority(c);
-                            local_candidates_.push_back(c);
-                            if (candidate_callback_) {
-                                candidate_callback_(c);
-                            }
-                            log(LogLevel::Debug, "Gathered Relay candidate: " + c.to_sdp());
-
-                            // 주기적인 TURN 갱신 시작
-                            asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
-
-                            // 할당 성공, 루프 종료
-                            co_return;
-                        }
-                    } else if (resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR) {
-                        // 인증 필요: REALM과 NONCE 추출
-                        auto realm_opt = resp.get_attribute_as_string(StunAttributeType::REALM);
-                        auto nonce_opt = resp.get_attribute_as_string(StunAttributeType::NONCE);
-                        if (!realm_opt.has_value() || !nonce_opt.has_value()) {
-                            log(LogLevel::Warning, "TURN Allocate response missing REALM or NONCE.");
-                            continue;
-                        }
-                        turn_realm_ = realm_opt.value();
-                        turn_nonce_ = nonce_opt.value();
-
-                        // Step 2: AUTHENTICATED Allocate 요청
-                        StunMessage auth_alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
-                        auth_alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT,
-                                                     serialize_uint32(17));  // UDP
-                        auth_alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
-                        auth_alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
-                        // USERNAME는 "username:realm" 형식
+            do {
+                try {
+                    // STUN Allocate 요청 생성
+                    StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                    alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT, serialize_uint32(17));  // UDP
+                    if (!turn_realm_.empty() && !turn_nonce_.empty()) {
                         std::string username = turn_username_ + ":" + turn_realm_;
-                        auth_alloc_req.add_attribute(StunAttributeType::USERNAME, username);
-                        auth_alloc_req.add_message_integrity(turn_password_);
-                        auth_alloc_req.add_fingerprint();
+                        alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
+                        alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
+                        alloc_req.add_attribute(StunAttributeType::USERNAME, username);
+                        alloc_req.add_message_integrity(turn_password_);
+                        alloc_req.add_fingerprint();
+                    }
 
-                        // AUTHENTICATED Allocate 요청 전송
-                        auto auth_resp_opt = co_await send_stun_request(turn_ep, auth_alloc_req, turn_password_,
-                                                                        std::chrono::milliseconds(1000), 3);
-                        if (auth_resp_opt.has_value()) {
-                            StunMessage auth_resp = auth_resp_opt.value();
-                            if (auth_resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS) {
-                                // 릴레이 주소 추출
-                                auto relay_opt = auth_resp.get_relayed_address();
+                    // Allocate 요청 전송
+                    auto resp_opt = co_await send_stun_request(turn_ep, alloc_req, turn_password_,
+                                                               std::chrono::milliseconds(1000), 3);
+
+                    if (resp_opt.has_value()) {
+                        StunMessage resp = resp_opt.value();
+                        switch (resp.get_type()) {
+                            case StunMessageType::ALLOCATE_RESPONSE_SUCCESS: {
+                                auto relay_opt = resp.get_relayed_address();
                                 if (relay_opt.has_value()) {
                                     relay_endpoint_ = relay_opt.value();
                                     log(LogLevel::Debug,
@@ -1427,26 +1403,37 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                     }
                                     log(LogLevel::Debug, "Gathered Relay candidate: " + c.to_sdp());
 
-                                    // 주기적인 TURN 갱신 시작
+                                    // 주기적인 TURN 갱신 시작 (TODO: 나중에 정리)
                                     // asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
-
-                                    // 할당 성공, 루프 종료
-                                    co_return;
+                                    co_return;  // 할당 성공
                                 }
-                            } else {
-                                log(LogLevel::Warning, "TURN Allocate authenticated request failed.");
+                                break;
                             }
+                            case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
+                                // 인증 필요: REALM과 NONCE 추출
+                                auto realm_opt = resp.get_attribute_as_string(StunAttributeType::REALM);
+                                auto nonce_opt = resp.get_attribute_as_string(StunAttributeType::NONCE);
+                                if (realm_opt.has_value() && nonce_opt.has_value()) {
+                                    turn_realm_ = realm_opt.value();
+                                    turn_nonce_ = nonce_opt.value();
+                                } else {
+                                    log(LogLevel::Warning, "TURN Allocate response missing REALM or NONCE.");
+                                }
+                                break;
+                            }
+                            default:
+                                log(LogLevel::Warning, "Unexpected STUN message type.");
+                                break;
                         }
                     }
+                } catch (const std::exception &ex) {
+                    log(LogLevel::Warning, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" +
+                                               std::to_string(turn_ep.port()) + " | " + ex.what());
+                    break;  // 현재 TURN 서버 시도 중단, 다음 서버로 이동
                 }
-            } catch (const std::exception &ex) {
-                log(LogLevel::Warning, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" +
-                                           std::to_string(turn_ep.port()) + " | " + ex.what());
-                // 다음 TURN 서버로 계속
-            }
+            } while (retry++ > 1);
         }
 
-        // 모든 TURN 서버에서 할당 실패 시
         log(LogLevel::Warning, "Failed to allocate TURN relay from all TURN servers.");
     }
 
