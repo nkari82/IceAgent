@@ -1,58 +1,63 @@
 // test/test_ice_agent.cpp
 
-#include "ice_agent.hpp"
-#include "stun_client.hpp"
-#include "turn_client.hpp"
-#include "signaling_client.hpp"
+#include <ice_agent.hpp>
 #include <asio.hpp>
 #include <iostream>
 #include <thread>
 
 // Callback functions
-void on_state_change(IceConnectionState state) {
+void on_state_change(IceConnectionState state)
+{
     std::cout << "ICE State Changed: " << static_cast<int>(state) << std::endl;
 }
 
-void on_candidate(const Candidate& candidate) {
+void on_candidate(const Candidate &candidate)
+{
     std::cout << "Candidate gathered: " << candidate.to_sdp() << std::endl;
 }
 
-void on_data(const std::vector<uint8_t>& data, const asio::ip::udp::endpoint& sender) {
+void on_data(const std::vector<uint8_t> &data, const asio::ip::udp::endpoint &sender)
+{
     std::string msg(data.begin(), data.end());
     std::cout << "Received data from " << sender.address().to_string() << ":" << sender.port() << " - " << msg << std::endl;
 }
 
-void on_nat_type_detected(NatType nat_type) {
+void on_nat_type_detected(NatType nat_type)
+{
     std::cout << "NAT Type Detected: ";
-    switch(nat_type) {
-        case NatType::FullCone:
-            std::cout << "Full Cone";
-            break;
-        case NatType::RestrictedCone:
-            std::cout << "Restricted Cone";
-            break;
-        case NatType::PortRestrictedCone:
-            std::cout << "Port Restricted Cone";
-            break;
-        case NatType::Symmetric:
-            std::cout << "Symmetric";
-            break;
-        case NatType::OpenInternet:
-            std::cout << "Open Internet";
-            break;
-        default:
-            std::cout << "Unknown";
-            break;
+    switch (nat_type)
+    {
+    case NatType::FullCone:
+        std::cout << "Full Cone";
+        break;
+    case NatType::RestrictedCone:
+        std::cout << "Restricted Cone";
+        break;
+    case NatType::PortRestrictedCone:
+        std::cout << "Port Restricted Cone";
+        break;
+    case NatType::Symmetric:
+        std::cout << "Symmetric";
+        break;
+    case NatType::OpenInternet:
+        std::cout << "Open Internet";
+        break;
+    default:
+        std::cout << "Unknown";
+        break;
     }
     std::cout << std::endl;
 }
 
-void on_nominate(const CandidatePair& pair) {
+void on_nominate(const CandidatePair &pair)
+{
     std::cout << "Nominated Pair: " << pair.remote_candidate.to_sdp() << std::endl;
 }
 
-int main() {
-    try {
+int main()
+{
+    try
+    {
         asio::io_context io_context;
 
         // Initialize Signaling Client
@@ -62,8 +67,8 @@ int main() {
 
         // Initialize IceAgent
         IceRole role = IceRole::Controller; // 또는 IceRole::Controlled
-        IceMode mode = IceMode::Full; // 또는 IceMode::Lite
-        std::vector<std::string> stun_servers = { "stun.l.google.com:19302" };
+        IceMode mode = IceMode::Full;       // 또는 IceMode::Lite
+        std::vector<std::string> stun_servers = {"stun.l.google.com:19302"};
         std::string turn_server = ""; // TURN 서버가 있다면 설정
         std::string turn_username = "";
         std::string turn_password = "";
@@ -85,13 +90,14 @@ int main() {
         asio::co_spawn(io_context, ice_agent->start(), asio::detached);
 
         // Run io_context in separate thread
-        std::thread io_thread([&io_context]() {
-            io_context.run();
-        });
+        std::thread io_thread([&io_context]()
+                              { io_context.run(); });
 
         // Keep the main thread alive
         io_thread.join();
-    } catch (const std::exception& ex) {
+    }
+    catch (const std::exception &ex)
+    {
         std::cerr << "Exception in main: " << ex.what() << std::endl;
     }
 

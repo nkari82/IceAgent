@@ -1,18 +1,19 @@
 #pragma once
 
-#include <asio.hpp>
-#include <vector>
-#include <string>
-#include <cstdint>
-#include <stdexcept>
 #include <algorithm>
 #include <array>
+#include <asio.hpp>
+#include <cstdint>
 #include <cstring>
-#include <openssl/hmac.h>
-#include <openssl/sha.h>
-#include <zlib.h> // For CRC32
-#include <unordered_map>
 #include <iostream>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "crc32.hpp"
+#include "hmac_sha1.hpp"
 
 // -------------------- ENUMS / CONSTANTS --------------------
 // 메시지 유형	             응답 필요	재시도 필요 	설명
@@ -23,8 +24,8 @@
 
 // STUN Message Types (RFC 5389)
 enum class StunMessageType : uint16_t {
-    BINDING_REQUEST = 0x0001, 
-    BINDING_RESPONSE_SUCCESS = 0x0101, 
+    BINDING_REQUEST = 0x0001,
+    BINDING_RESPONSE_SUCCESS = 0x0101,
     BINDING_RESPONSE_ERROR = 0x0111,
     BINDING_INDICATION = 0x0011,
     ALLOCATE = 0x0003,
@@ -37,16 +38,17 @@ enum class StunMessageType : uint16_t {
 enum class StunAttributeType : uint16_t {
     MAPPED_ADDRESS = 0x0001,
     XOR_MAPPED_ADDRESS = 0x0020,
+    PRIORITY = 0x0024,
     USERNAME = 0x0006,
     MESSAGE_INTEGRITY = 0x0008,
     FINGERPRINT = 0x8028,
     ICE_CONTROLLING = 0x8029,
     ICE_CONTROLLED = 0x802A,
-    USE_CANDIDATE = 0x802B, //
+    USE_CANDIDATE = 0x802B,  //
     REALM = 0x0014,
     NONCE = 0x0015,
     REQUESTED_TRANSPORT = 0x0019,
-    RELAYED_ADDRESS = 0x0016, // RFC 5766
+    RELAYED_ADDRESS = 0x0016,  // RFC 5766
     REFRESH = 0x802C,
     // 기타 속성 타입
 };
@@ -55,28 +57,20 @@ enum class StunAttributeType : uint16_t {
 constexpr uint32_t STUN_MAGIC_COOKIE = 0x2112A442;
 
 // Helper functions for byte order conversions
-inline uint16_t htons_custom(uint16_t hostshort) {
-    return htons(hostshort);
-}
+inline uint16_t htons_custom(uint16_t hostshort) { return asio::detail::socket_ops::host_to_network_short(hostshort); }
 
-inline uint16_t ntohs_custom(uint16_t netshort) {
-    return ntohs(netshort);
-}
+inline uint16_t ntohs_custom(uint16_t netshort) { return asio::detail::socket_ops::network_to_host_short(netshort); }
 
-inline uint32_t htonl_custom(uint32_t hostlong) {
-    return htonl(hostlong);
-}
+inline uint32_t htonl_custom(uint32_t hostlong) { return asio::detail::socket_ops::host_to_network_long(hostlong); }
 
-inline uint32_t ntohl_custom(uint32_t netlong) {
-    return ntohl(netlong);
-}
+inline uint32_t ntohl_custom(uint32_t netlong) { return asio::detail::socket_ops::host_to_network_long(netlong); }
 
 inline uint64_t htonll_custom(uint64_t hostlonglong) {
     // Convert host byte order to network byte order (big endian)
     // Since htonll is not standard, implement manually
     uint64_t net = 0;
-    for(int i = 0; i < 8; ++i){
-        net = (net << 8) | ((hostlonglong >> (56 - 8*i)) & 0xFF);
+    for (int i = 0; i < 8; ++i) {
+        net = (net << 8) | ((hostlonglong >> (56 - 8 * i)) & 0xFF);
     }
     return net;
 }
@@ -85,87 +79,84 @@ inline uint64_t ntohll_custom(uint64_t netlonglong) {
     // Convert network byte order to host byte order (big endian)
     // Implement manually
     uint64_t host = 0;
-    for(int i = 0; i < 8; ++i){
-        host = (host << 8) | ((netlonglong >> (56 - 8*i)) & 0xFF);
+    for (int i = 0; i < 8; ++i) {
+        host = (host << 8) | ((netlonglong >> (56 - 8 * i)) & 0xFF);
     }
     return host;
 }
 
-inline bool IsStunMessage(const std::vector<uint8_t>& data) {
-    if (data.size() < 20) return false; // 최소 STUN 헤더 크기
+inline bool IsStunMessage(const std::vector<uint8_t> &data) {
+    if (data.size() < 20)
+        return false;  // 최소 STUN 헤더 크기
     uint16_t type = (data[0] << 8) | data[1];
     return (type >= 0x0000 && type <= 0x3FFF);
 }
 
 // -------------------- STUN MESSAGE --------------------
 class StunMessage {
-public:
+   public:
     // Constructors
-    StunMessage() : type_(StunMessageType::BINDING_REQUEST), message_length_(0) {
-        transaction_id_.fill(0);
-    }
+    StunMessage() : type_(StunMessageType::BINDING_REQUEST), message_length_(0) { transaction_id_.fill(0); }
 
-    StunMessage(StunMessageType type, const std::vector<uint8_t>& transaction_id)
-        : type_(type), message_length_(0)
-    {
-        if(transaction_id.size() != 12){
+    StunMessage(StunMessageType type, const std::vector<uint8_t> &transaction_id) : type_(type), message_length_(0) {
+        if (transaction_id.size() != 12) {
             throw std::invalid_argument("Transaction ID must be 12 bytes");
         }
         std::copy(transaction_id.begin(), transaction_id.end(), transaction_id_.begin());
     }
 
     // Static method to generate a random transaction ID
-    static std::vector<uint8_t> generate_transaction_id(){
+    static std::vector<uint8_t> generate_transaction_id() {
         std::vector<uint8_t> txn_id(12);
         std::random_device rd;
         std::mt19937 gen(rd());
         std::uniform_int_distribution<> dis(0, 255);
-        for(auto &byte : txn_id){
+        for (auto &byte : txn_id) {
             byte = static_cast<uint8_t>(dis(gen));
         }
         return txn_id;
     }
 
     // Add attribute
-    void add_attribute(StunAttributeType attr_type, const std::vector<uint8_t>& value){
+    void add_attribute(StunAttributeType attr_type, const std::vector<uint8_t> &value = {}) {
         attributes_.emplace_back(Attribute{attr_type, value});
     }
 
     // Overloaded methods for specific attributes
-    void add_attribute(StunAttributeType attr_type, const std::string& value){
+    void add_attribute(StunAttributeType attr_type, const std::string &value) {
         std::vector<uint8_t> data(value.begin(), value.end());
         add_attribute(attr_type, data);
     }
 
-    void add_attribute(StunAttributeType attr_type, const uint32_t value){
+    void add_attribute(StunAttributeType attr_type, const uint32_t value) {
         std::vector<uint8_t> data(4);
         uint32_t network_order = htonl_custom(value);
         std::memcpy(data.data(), &network_order, 4);
         add_attribute(attr_type, data);
     }
 
-    void add_attribute(StunAttributeType attr_type, const uint64_t value){
+    void add_attribute(StunAttributeType attr_type, const uint64_t value) {
         std::vector<uint8_t> data(8);
         uint64_t network_order = htonll_custom(value);
         std::memcpy(data.data(), &network_order, 8);
         add_attribute(attr_type, data);
     }
 
-   // Add attribute (IPv4 or IPv6 endpoint)
-    void add_attribute(StunAttributeType attr_type, const asio::ip::udp::endpoint& endpoint) {
+    // Add attribute (IPv4 or IPv6 endpoint)
+    void add_attribute(StunAttributeType attr_type, const asio::ip::udp::endpoint &endpoint) {
         std::vector<uint8_t> data;
         if (endpoint.address().is_v4()) {
-            data.resize(8); // Family (1 byte) + Reserved (1 byte) + Port (2 bytes) + IPv4 (4 bytes)
-            data[0] = 0; // Reserved
-            data[1] = 0x01; // IPv4 family
+            data.resize(8);  // Family (1 byte) + Reserved (1 byte) + Port (2 bytes) + IPv4 (4 bytes)
+            data[0] = 0;     // Reserved
+            data[1] = 0x01;  // IPv4 family
             uint16_t port = htons_custom(endpoint.port());
             std::memcpy(&data[2], &port, sizeof(port));
             auto bytes = endpoint.address().to_v4().to_bytes();
             std::copy(bytes.begin(), bytes.end(), data.begin() + 4);
         } else if (endpoint.address().is_v6()) {
-            data.resize(20); // Family (1 byte) + Reserved (1 byte) + Port (2 bytes) + IPv6 (16 bytes)
-            data[0] = 0; // Reserved
-            data[1] = 0x02; // IPv6 family
+            data.resize(20);  // Family (1 byte) + Reserved (1 byte) + Port (2 bytes) + IPv6 (16 bytes)
+            data[0] = 0;      // Reserved
+            data[1] = 0x02;   // IPv6 family
             uint16_t port = htons_custom(endpoint.port());
             std::memcpy(&data[2], &port, sizeof(port));
             auto bytes = endpoint.address().to_v6().to_bytes();
@@ -175,37 +166,23 @@ public:
         }
         add_attribute(attr_type, data);
     }
-	
-    void add_fingerprint(){
+
+    void add_fingerprint() {
         // Calculate CRC32 over the entire message up to this point
         std::vector<uint8_t> data = serialize_without_fingerprint();
-        uint32_t crc = crc32(0L, Z_NULL, 0);
-        crc = crc32(crc, data.data(), data.size());
-        uint32_t fingerprint = crc ^ 0x5354554E; // XOR with 0x5354554E
+        uint32_t crc = CRC32::calculate(data);
+        uint32_t fingerprint = crc ^ 0x5354554E;  // XOR with 0x5354554E
 
         // Add FINGERPRINT attribute
         add_attribute(StunAttributeType::FINGERPRINT, fingerprint);
     }
 
-    void add_message_integrity(const std::string& key){
+    void add_message_integrity(const std::string &key) {
         // Serialize the message up to MESSAGE-INTEGRITY attribute
         std::vector<uint8_t> data = serialize_for_integrity();
 
-        // Compute HMAC-SHA1
-        unsigned int len = 0;
-        unsigned char* hmac_result = HMAC(EVP_sha1(),
-                                         key.data(),
-                                         static_cast<int>(key.size()),
-                                         data.data(),
-                                         data.size(),
-                                         NULL,
-                                         &len);
-        if(!hmac_result){
-            throw std::runtime_error("HMAC computation failed");
-        }
-
         // Truncate to first 20 bytes as per RFC 5389
-        std::vector<uint8_t> hmac_vec(hmac_result, hmac_result + len);
+        std::vector<uint8_t> hmac_vec = HmacSha1::calculate(key, data);
         add_attribute(StunAttributeType::MESSAGE_INTEGRITY, hmac_vec);
     }
 
@@ -220,11 +197,11 @@ public:
 
         // Calculate total message length (attributes only)
         uint16_t message_length = 0;
-        for(const auto& attr : attributes_){
-            message_length += 4; // Type (2 bytes) + Length (2 bytes)
+        for (const auto &attr : attributes_) {
+            message_length += 4;  // Type (2 bytes) + Length (2 bytes)
             message_length += attr.value.size();
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 message_length += 4 - (attr.value.size() % 4);
             }
         }
@@ -243,7 +220,7 @@ public:
         buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
 
         // Attributes
-        for(const auto& attr : attributes_){
+        for (const auto &attr : attributes_) {
             uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
             buffer.push_back(static_cast<uint8_t>(attr_type_network >> 8));
             buffer.push_back(static_cast<uint8_t>(attr_type_network & 0xFF));
@@ -255,7 +232,7 @@ public:
             buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
 
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 buffer.insert(buffer.end(), 4 - (attr.value.size() % 4), 0);
             }
         }
@@ -264,8 +241,8 @@ public:
     }
 
     // Parse a raw buffer into a StunMessage
-    static StunMessage parse(const std::vector<uint8_t>& data){
-        if(data.size() < 20){
+    static StunMessage parse(const std::vector<uint8_t> &data) {
+        if (data.size() < 20) {
             throw std::invalid_argument("STUN message too short");
         }
 
@@ -275,7 +252,7 @@ public:
         msg.type_ = static_cast<StunMessageType>((data[0] << 8) | data[1]);
         msg.message_length_ = (data[2] << 8) | data[3];
         uint32_t magic_cookie = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
-        if(magic_cookie != STUN_MAGIC_COOKIE){
+        if (magic_cookie != STUN_MAGIC_COOKIE) {
             throw std::invalid_argument("Invalid STUN magic cookie");
         }
 
@@ -284,12 +261,12 @@ public:
 
         // Parse attributes
         size_t offset = 20;
-        while(offset + 4 <= data.size() && offset < 20 + msg.message_length_){
+        while (offset + 4 <= data.size() && offset < 20 + msg.message_length_) {
             uint16_t attr_type = (data[offset] << 8) | data[offset + 1];
             uint16_t attr_length = (data[offset + 2] << 8) | data[offset + 3];
             offset += 4;
 
-            if(offset + attr_length > data.size()){
+            if (offset + attr_length > data.size()) {
                 throw std::invalid_argument("STUN attribute length exceeds message size");
             }
 
@@ -298,7 +275,7 @@ public:
             offset += attr_length;
 
             // Skip padding
-            if(attr_length % 4 != 0){
+            if (attr_length % 4 != 0) {
                 offset += 4 - (attr_length % 4);
             }
         }
@@ -308,145 +285,152 @@ public:
 
     // Getters
     StunMessageType get_type() const { return type_; }
-    std::vector<uint8_t> get_transaction_id() const { return std::vector<uint8_t>(transaction_id_.begin(), transaction_id_.end()); }
+    std::vector<uint8_t> get_transaction_id() const {
+        return std::vector<uint8_t>(transaction_id_.begin(), transaction_id_.end());
+    }
 
     // Check if attribute exists
     bool has_attribute(StunAttributeType attr_type) const {
         return std::any_of(attributes_.begin(), attributes_.end(),
-                           [&](const Attribute& attr){ return attr.type == attr_type; });
+                           [&](const Attribute &attr) { return attr.type == attr_type; });
     }
 
     // Get attribute as string
     std::optional<std::string> get_attribute_as_string(StunAttributeType attr_type) const {
-        for(const auto& attr : attributes_){
-            if(attr.type == attr_type){
+        for (const auto &attr : attributes_) {
+            if (attr.type == attr_type) {
                 return std::string(attr.value.begin(), attr.value.end());
             }
         }
-        return std::nullopt; // Attribute not found
+        return std::nullopt;  // Attribute not found
     }
 
-	std::optional<asio::ip::udp::endpoint> StunMessage::get_mapped_address() const {
-		return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
-	}
-	
-	// Get attribute as optional MAPPED_ADDRESS
-	std::optional<asio::ip::udp::endpoint> get_attribute_as_mapped_address(StunAttributeType attr_type) const {
-		for (const auto& attr : attributes_) {
-			if (attr.type == attr_type) {
-				if (attr.value.size() < 8) {
-					throw std::invalid_argument("MAPPED_ADDRESS attribute too short");
-				}
-				uint8_t family = attr.value[1];
-				uint16_t port = ntohs_custom((attr.value[2] << 8) | attr.value[3]);
-				if (family == 0x01) { // IPv4
-					if (attr.value.size() < 8) {
-						throw std::invalid_argument("MAPPED_ADDRESS IPv4 attribute too short");
-					}
-					asio::ip::address_v4::bytes_type bytes;
-					std::copy(attr.value.begin() + 4, attr.value.begin() + 8, bytes.begin());
-					asio::ip::address_v4 addr(bytes);
-					return asio::ip::udp::endpoint(addr, port);
-				} else if (family == 0x02) { // IPv6
-					if (attr.value.size() < 20) {
-						throw std::invalid_argument("MAPPED_ADDRESS IPv6 attribute too short");
-					}
-					asio::ip::address_v6::bytes_type bytes;
-					std::copy(attr.value.begin() + 4, attr.value.begin() + 20, bytes.begin());
-					asio::ip::address_v6 addr(bytes);
-					return asio::ip::udp::endpoint(addr, port);
-				} else {
-					throw std::invalid_argument("Unsupported address family in MAPPED_ADDRESS");
-				}
-			}
-		}
-		return std::nullopt; // Attribute not found
-	}
+    std::optional<asio::ip::udp::endpoint> get_mapped_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
+    }
+    std::optional<asio::ip::udp::endpoint> get_relayed_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::RELAYED_ADDRESS);
+    }
 
-	std::optional<asio::ip::udp::endpoint> StunMessage::get_xor_mapped_address() const {
-		return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
-	}
-	
-	// Get attribute as optional XOR-MAPPED_ADDRESS
-	std::optional<asio::ip::udp::endpoint> get_attribute_as_xor_mapped_address(StunAttributeType attr_type, const asio::ip::udp::endpoint& request_endpoint) const {
-		for (const auto& attr : attributes_) {
-			if (attr.type == attr_type) {
-				if (attr.value.size() < 8) {
-					throw std::invalid_argument("XOR_MAPPED_ADDRESS attribute too short");
-				}
-				uint8_t family = attr.value[1];
-				uint16_t xport = ntohs_custom((attr.value[2] << 8) | attr.value[3]);
-				uint16_t port = xport ^ (STUN_MAGIC_COOKIE >> 16);
-				if (family == 0x01) { // IPv4
-					if (attr.value.size() < 8) {
-						throw std::invalid_argument("XOR_MAPPED_ADDRESS IPv4 attribute too short");
-					}
-					std::array<uint8_t, 4> bytes;
-					for (int i = 0; i < 4; ++i) {
-						bytes[i] = attr.value[4 + i] ^ ((STUN_MAGIC_COOKIE >> (24 - 8 * i)) & 0xFF);
-					}
-					asio::ip::address_v4::bytes_type addr_bytes;
-					std::copy(bytes.begin(), bytes.end(), addr_bytes.begin());
-					asio::ip::address_v4 addr(addr_bytes);
-					return asio::ip::udp::endpoint(addr, port);
-				} else if (family == 0x02) { // IPv6
-					if (attr.value.size() < 20) {
-						throw std::invalid_argument("XOR_MAPPED_ADDRESS IPv6 attribute too short");
-					}
-					asio::ip::address_v6::bytes_type bytes;
-					for (int i = 0; i < 4; ++i) {
-						bytes[i] = attr.value[4 + i] ^ ((STUN_MAGIC_COOKIE >> (24 - 8 * i)) & 0xFF);
-					}
-					auto txn_id = get_transaction_id();
-					for (int i = 4; i < 16; ++i) {
-						bytes[i] = attr.value[4 + i] ^ txn_id[i - 4];
-					}
-					asio::ip::address_v6 addr(bytes);
-					return asio::ip::udp::endpoint(addr, port);
-				} else {
-					throw std::invalid_argument("Unsupported address family in XOR_MAPPED_ADDRESS");
-				}
-			}
-		}
-		return std::nullopt; // Attribute not found
-	}
+    // Get attribute as optional MAPPED_ADDRESS
+    std::optional<asio::ip::udp::endpoint> get_attribute_as_mapped_address(StunAttributeType attr_type) const {
+        for (const auto &attr : attributes_) {
+            if (attr.type == attr_type) {
+                if (attr.value.size() < 8) {
+                    throw std::invalid_argument("MAPPED_ADDRESS attribute too short");
+                }
+                uint8_t family = attr.value[1];
+                uint16_t port = ntohs_custom((attr.value[2] << 8) | attr.value[3]);
+                if (family == 0x01) {  // IPv4
+                    if (attr.value.size() < 8) {
+                        throw std::invalid_argument("MAPPED_ADDRESS IPv4 attribute too short");
+                    }
+                    asio::ip::address_v4::bytes_type bytes;
+                    std::copy(attr.value.begin() + 4, attr.value.begin() + 8, bytes.begin());
+                    asio::ip::address_v4 addr(bytes);
+                    return asio::ip::udp::endpoint(addr, port);
+                } else if (family == 0x02) {  // IPv6
+                    if (attr.value.size() < 20) {
+                        throw std::invalid_argument("MAPPED_ADDRESS IPv6 attribute too short");
+                    }
+                    asio::ip::address_v6::bytes_type bytes;
+                    std::copy(attr.value.begin() + 4, attr.value.begin() + 20, bytes.begin());
+                    asio::ip::address_v6 addr(bytes);
+                    return asio::ip::udp::endpoint(addr, port);
+                } else {
+                    throw std::invalid_argument("Unsupported address family in MAPPED_ADDRESS");
+                }
+            }
+        }
+        return std::nullopt;  // Attribute not found
+    }
 
-	// Get attribute as optional uint32
-	std::optional<uint32_t> get_attribute_as_uint32(StunAttributeType attr_type) const {
-		for (const auto& attr : attributes_) {
-			if (attr.type == attr_type) {
-				if (attr.value.size() < 4) {
-					throw std::invalid_argument("Attribute value too short for uint32");
-				}
-				uint32_t val = (attr.value[0] << 24) | (attr.value[1] << 16) | (attr.value[2] << 8) | attr.value[3];
-				return ntohl_custom(val);
-			}
-		}
-		return std::nullopt; // Attribute not found
-	}
-	
-	// Get attribute as optional uint64
-	std::optional<uint64_t> get_attribute_as_uint64(StunAttributeType attr_type) const {
-		for (const auto& attr : attributes_) {
-			if (attr.type == attr_type) {
-				if (attr.value.size() < 8) {
-					throw std::invalid_argument("Attribute value too short for uint64");
-				}
-				uint64_t val = 0;
-				for (int i = 0; i < 8; ++i) {
-					val = (val << 8) | attr.value[i];
-				}
-				return ntohll_custom(val);
-			}
-		}
-		return std::nullopt; // Attribute not found
-	}
+    std::optional<asio::ip::udp::endpoint> get_xor_mapped_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
+    }
+
+    // Get attribute as optional XOR-MAPPED_ADDRESS
+    std::optional<asio::ip::udp::endpoint> get_attribute_as_xor_mapped_address(
+        StunAttributeType attr_type, const asio::ip::udp::endpoint &request_endpoint) const {
+        for (const auto &attr : attributes_) {
+            if (attr.type == attr_type) {
+                if (attr.value.size() < 8) {
+                    throw std::invalid_argument("XOR_MAPPED_ADDRESS attribute too short");
+                }
+                uint8_t family = attr.value[1];
+                uint16_t xport = ntohs_custom((attr.value[2] << 8) | attr.value[3]);
+                uint16_t port = xport ^ (STUN_MAGIC_COOKIE >> 16);
+                if (family == 0x01) {  // IPv4
+                    if (attr.value.size() < 8) {
+                        throw std::invalid_argument("XOR_MAPPED_ADDRESS IPv4 attribute too short");
+                    }
+                    std::array<uint8_t, 4> bytes;
+                    for (int i = 0; i < 4; ++i) {
+                        bytes[i] = attr.value[4 + i] ^ ((STUN_MAGIC_COOKIE >> (24 - 8 * i)) & 0xFF);
+                    }
+                    asio::ip::address_v4::bytes_type addr_bytes;
+                    std::copy(bytes.begin(), bytes.end(), addr_bytes.begin());
+                    asio::ip::address_v4 addr(addr_bytes);
+                    return asio::ip::udp::endpoint(addr, port);
+                } else if (family == 0x02) {  // IPv6
+                    if (attr.value.size() < 20) {
+                        throw std::invalid_argument("XOR_MAPPED_ADDRESS IPv6 attribute too short");
+                    }
+                    asio::ip::address_v6::bytes_type bytes;
+                    for (int i = 0; i < 4; ++i) {
+                        bytes[i] = attr.value[4 + i] ^ ((STUN_MAGIC_COOKIE >> (24 - 8 * i)) & 0xFF);
+                    }
+                    auto txn_id = get_transaction_id();
+                    for (int i = 4; i < 16; ++i) {
+                        bytes[i] = attr.value[4 + i] ^ txn_id[i - 4];
+                    }
+                    asio::ip::address_v6 addr(bytes);
+                    return asio::ip::udp::endpoint(addr, port);
+                } else {
+                    throw std::invalid_argument("Unsupported address family in XOR_MAPPED_ADDRESS");
+                }
+            }
+        }
+        return std::nullopt;  // Attribute not found
+    }
+
+    // Get attribute as optional uint32
+    std::optional<uint32_t> get_attribute_as_uint32(StunAttributeType attr_type) const {
+        for (const auto &attr : attributes_) {
+            if (attr.type == attr_type) {
+                if (attr.value.size() < 4) {
+                    throw std::invalid_argument("Attribute value too short for uint32");
+                }
+                uint32_t val = (attr.value[0] << 24) | (attr.value[1] << 16) | (attr.value[2] << 8) | attr.value[3];
+                return ntohl_custom(val);
+            }
+        }
+        return std::nullopt;  // Attribute not found
+    }
+
+    // Get attribute as optional uint64
+    std::optional<uint64_t> get_attribute_as_uint64(StunAttributeType attr_type) const {
+        for (const auto &attr : attributes_) {
+            if (attr.type == attr_type) {
+                if (attr.value.size() < 8) {
+                    throw std::invalid_argument("Attribute value too short for uint64");
+                }
+                uint64_t val = 0;
+                for (int i = 0; i < 8; ++i) {
+                    val = (val << 8) | attr.value[i];
+                }
+                return ntohll_custom(val);
+            }
+        }
+        return std::nullopt;  // Attribute not found
+    }
     // Verify MESSAGE-INTEGRITY
-    bool verify_message_integrity(const std::string& key) const {
+    bool verify_message_integrity(const std::string &key) const {
         // Find MESSAGE-INTEGRITY attribute
-        auto it = std::find_if(attributes_.begin(), attributes_.end(),
-                               [&](const Attribute& attr){ return attr.type == StunAttributeType::MESSAGE_INTEGRITY; });
-        if(it == attributes_.end()){
+        auto it = std::find_if(attributes_.begin(), attributes_.end(), [&](const Attribute &attr) {
+            return attr.type == StunAttributeType::MESSAGE_INTEGRITY;
+        });
+        if (it == attributes_.end()) {
             return false;
         }
 
@@ -460,36 +444,26 @@ public:
         std::vector<uint8_t> data = msg_copy.serialize();
 
         // Compute HMAC-SHA1
-        unsigned int len = 0;
-        unsigned char* hmac_result = HMAC(EVP_sha1(),
-                                         key.data(),
-                                         static_cast<int>(key.size()),
-                                         data.data(),
-                                         data.size(),
-                                         NULL,
-                                         &len);
-        if(!hmac_result){
-            return false;
-        }
+        std::vector<uint8_t> hmac_result = HmacSha1::calculate(key, data);
 
         // Compare with MESSAGE-INTEGRITY value (first 20 bytes of HMAC-SHA1)
-        if(it->value.size() < 20){
+        if (it->value.size() < 20) {
             return false;
         }
 
-        return std::equal(it->value.begin(), it->value.begin() + 20, hmac_result);
+        return std::equal(it->value.begin(), it->value.begin() + 20, hmac_result.data());
     }
 
     // Verify FINGERPRINT
     bool verify_fingerprint() const {
         // Find FINGERPRINT attribute
         auto it = std::find_if(attributes_.begin(), attributes_.end(),
-                               [&](const Attribute& attr){ return attr.type == StunAttributeType::FINGERPRINT; });
-        if(it == attributes_.end()){
+                               [&](const Attribute &attr) { return attr.type == StunAttributeType::FINGERPRINT; });
+        if (it == attributes_.end()) {
             return false;
         }
 
-        if(it->value.size() != 4){
+        if (it->value.size() != 4) {
             return false;
         }
 
@@ -503,20 +477,19 @@ public:
         std::vector<uint8_t> data = msg_copy.serialize();
 
         // Compute CRC32
-        uint32_t crc = crc32(0L, Z_NULL, 0);
-        crc = crc32(crc, data.data(), data.size());
-        uint32_t fingerprint = crc ^ 0x5354554E; // XOR with 0x5354554E
+        uint32_t crc = CRC32::calculate(data);
+        uint32_t fingerprint = crc ^ 0x5354554E;  // XOR with 0x5354554E
 
         // Extract fingerprint from attribute
         uint32_t recv_fingerprint = 0;
-        for(int i = 0; i < 4; ++i){
+        for (int i = 0; i < 4; ++i) {
             recv_fingerprint = (recv_fingerprint << 8) | it->value[i];
         }
 
         return fingerprint == recv_fingerprint;
     }
 
-private:
+   private:
     // Internal representation of a STUN attribute
     struct Attribute {
         StunAttributeType type;
@@ -539,11 +512,11 @@ private:
 
         // Calculate total message length (attributes only)
         uint16_t message_length = 0;
-        for(const auto& attr : attributes_){
-            message_length += 4; // Type (2 bytes) + Length (2 bytes)
+        for (const auto &attr : attributes_) {
+            message_length += 4;  // Type (2 bytes) + Length (2 bytes)
             message_length += attr.value.size();
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 message_length += 4 - (attr.value.size() % 4);
             }
         }
@@ -562,12 +535,12 @@ private:
         buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
 
         // Attributes
-        for(const auto& attr : attributes_){
-            if(attr.type == StunAttributeType::FINGERPRINT){
-                continue; // Exclude FINGERPRINT
+        for (const auto &attr : attributes_) {
+            if (attr.type == StunAttributeType::FINGERPRINT) {
+                continue;  // Exclude FINGERPRINT
             }
-            if(attr.type == StunAttributeType::MESSAGE_INTEGRITY){
-                continue; // Exclude MESSAGE-INTEGRITY for HMAC calculation
+            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
+                continue;  // Exclude MESSAGE-INTEGRITY for HMAC calculation
             }
             uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
             buffer.push_back(static_cast<uint8_t>(attr_type_network >> 8));
@@ -580,7 +553,7 @@ private:
             buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
 
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 buffer.insert(buffer.end(), 4 - (attr.value.size() % 4), 0);
             }
         }
@@ -599,14 +572,14 @@ private:
 
         // Calculate total message length (attributes only, excluding MESSAGE-INTEGRITY and beyond)
         uint16_t message_length = 0;
-        for(const auto& attr : attributes_){
-            if(attr.type == StunAttributeType::MESSAGE_INTEGRITY){
-                break; // Stop before MESSAGE-INTEGRITY
+        for (const auto &attr : attributes_) {
+            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
+                break;  // Stop before MESSAGE-INTEGRITY
             }
-            message_length += 4; // Type (2 bytes) + Length (2 bytes)
+            message_length += 4;  // Type (2 bytes) + Length (2 bytes)
             message_length += attr.value.size();
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 message_length += 4 - (attr.value.size() % 4);
             }
         }
@@ -625,8 +598,8 @@ private:
         buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
 
         // Attributes up to MESSAGE-INTEGRITY
-        for(const auto& attr : attributes_){
-            if(attr.type == StunAttributeType::MESSAGE_INTEGRITY){
+        for (const auto &attr : attributes_) {
+            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
                 break;
             }
             uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
@@ -640,7 +613,7 @@ private:
             buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
 
             // Padding to 4-byte boundary
-            if(attr.value.size() % 4 != 0){
+            if (attr.value.size() % 4 != 0) {
                 buffer.insert(buffer.end(), 4 - (attr.value.size() % 4), 0);
             }
         }
@@ -693,4 +666,3 @@ int main(){
     return 0;
 }
 */
-
