@@ -529,7 +529,7 @@ private:
                 req.add_fingerprint();
 
                 // STUN 요청 전송 및 응답 대기
-                auto resp_opt = co_await send_stun_request(req, "", stun_ep);
+                auto resp_opt = co_await send_stun_request(stun_ep, req);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
                     // 응답에서 매핑된 주소 추출
@@ -641,10 +641,10 @@ private:
         try {
             if (is_relay && !relay_endpoint_.address().is_unspecified()) {
                 // Send STUN request via TURN relay
-                resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, relay_endpoint_);
+                resp_opt = co_await send_stun_request(relay_endpoint_, req, remote_ice_attributes_.pwd);
             } else {
                 // Send direct STUN request
-                resp_opt = co_await send_stun_request(req, remote_ice_attributes_.pwd, dest);
+                resp_opt = co_await send_stun_request(dest, req, remote_ice_attributes_.pwd);
             }
 
             if (resp_opt.has_value()) {
@@ -702,104 +702,106 @@ private:
     }
 
     // Send STUN request with optional message integrity verification
-    asio::awaitable<std::optional<StunMessage>> send_stun_request(
-        const StunMessage& request,
-        const std::string& remote_pwd,
-        const asio::ip::udp::endpoint& dest,
-        bool expect_response = true,
-        std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500),
-        int max_tries = 7)
-    {
-        using namespace asio::experimental::awaitable_operators;
-
-        auto data = request.serialize();
-        auto txn_id = request.get_transaction_id();
-
-        if (!expect_response) {
-            // Send the message without waiting for a response
-            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-            log(LogLevel::DEBUG, "Sent STUN message to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Not expecting response");
-            co_return std::nullopt;
-        }
-
-        std::chrono::milliseconds timeout = initial_timeout;
-        for (int attempt = 0; attempt < max_tries; ++attempt) {
-            // Send the STUN request
-            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-            log(LogLevel::DEBUG, "Sent STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
-
-            // Set up a timer for the response timeout
-            asio::steady_timer timer(strand_);
-            timer.expires_after(timeout);
-
-            std::vector<uint8_t> buf(2048);
-            asio::ip::udp::endpoint sender;
-
-            std::optional<StunMessage> response = std::nullopt;
-
-            // Await either a STUN response or the timer expiration
-            co_await (
-                (
-                    [&]() -> asio::awaitable<void> {
-                        try {
-                            std::size_t bytes = co_await udp_socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
-                            std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
-                            StunMessage resp = StunMessage::parse(received_data);
-                            if (resp.get_transaction_id() == txn_id &&
-                                (resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS ||
-                                 resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR || 
-                                 resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS ||
-                                 resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR)) {
-                                // Verify message integrity and fingerprint only if remote_pwd is provided
-                                bool integrity_ok = true;
-                                bool fingerprint_ok = true;
-                                if (!remote_pwd.empty()) {
-                                    integrity_ok = resp.verify_message_integrity(remote_pwd);
-                                    fingerprint_ok = resp.verify_fingerprint();
-                                }
-                                if (integrity_ok && fingerprint_ok) {
-                                    response = resp;
-                                }
-                            }
-                        } catch(...) {
-                            // Parsing failed or other errors; ignore and continue
-                        }
-                    }()
-                )
-                ||
-                (
-                    [&]() -> asio::awaitable<void> {
-                        try {
-                            co_await timer.async_wait(asio::use_awaitable);
-                        } catch(...) {
-                            // Ignore timer cancellation
-                        }
-                    }()
-                )
-            );
-
-            if (response.has_value()) {
-                log(LogLevel::DEBUG, "Received valid STUN response from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
-                co_return response;
-            }
-
-            // Exponential backoff
-            timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-            log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt + 1) + " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
-        }
-
-        log(LogLevel::WARNING, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " failed after " + std::to_string(max_tries) + " attempts.");
-        co_return std::nullopt;
-    }
-
+	asio::awaitable<std::optional<StunMessage>> send_stun_request(
+		const asio::ip::udp::endpoint& dest,
+		const StunMessage& request,
+		const std::string& remote_pwd = "",
+		std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500),
+		int max_tries = 7)
+	{
+		// 메시지 타입에 따라 응답을 기다릴지 결정
+		bool expect_response = (request.get_type() == StunMessageType::BINDING_REQUEST)
+		
+		using namespace asio::experimental::awaitable_operators;
+		
+		auto data = request.serialize();
+		auto txn_id = request.get_transaction_id();
+		
+		if (!expect_response) {
+			// 응답을 기다리지 않고 메시지 전송
+			co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+			log(LogLevel::DEBUG, "Sent STUN message to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Not expecting response");
+			co_return std::nullopt;
+		}
+		
+		std::chrono::milliseconds timeout = initial_timeout;
+		for (int attempt = 0; attempt < max_tries; ++attempt) {
+			// STUN 요청 전송
+			co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+			log(LogLevel::DEBUG, "Sent STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
+		
+			// 응답 타이머 설정
+			asio::steady_timer timer(strand_);
+			timer.expires_after(timeout);
+		
+			std::vector<uint8_t> buf(2048);
+			asio::ip::udp::endpoint sender;
+		
+			std::optional<StunMessage> response = std::nullopt;
+		
+			// STUN 응답 수신 또는 타이머 만료 중 하나를 기다림
+			co_await (
+				(
+					[&]() -> asio::awaitable<void> {
+						try {
+							std::size_t bytes = co_await udp_socket_.async_receive_from(asio::buffer(buf), sender, asio::use_awaitable);
+							std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
+							StunMessage resp = StunMessage::parse(received_data);
+							if (resp.get_transaction_id() == txn_id &&
+								(resp.get_type() == StunMessageType::BINDING_RESPONSE_SUCCESS ||
+								resp.get_type() == StunMessageType::BINDING_RESPONSE_ERROR || 
+								resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_SUCCESS ||
+								resp.get_type() == StunMessageType::ALLOCATE_RESPONSE_ERROR)) {
+								// 메시지 무결성 및 핑거프린트 검증
+								bool integrity_ok = true;
+								bool fingerprint_ok = true;
+								if (!remote_pwd.empty()) {
+									integrity_ok = resp.verify_message_integrity(remote_pwd);
+									fingerprint_ok = resp.verify_fingerprint();
+								}
+								if (integrity_ok && fingerprint_ok) {
+									response = resp;
+								}
+							}
+						} catch(...) {
+							// 오류 발생 시 무시
+						}
+					}()
+				)
+				||
+				(
+					[&]() -> asio::awaitable<void> {
+						try {
+							co_await timer.async_wait(asio::use_awaitable);
+						} catch(...) {
+							// 타이머 취소 시 무시
+						}
+					}()
+				)
+			);
+		
+			if (response.has_value()) {
+				log(LogLevel::DEBUG, "Received valid STUN response from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
+				co_return response;
+			}
+		
+			// 지수 백오프
+			timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+			log(LogLevel::DEBUG, "STUN retransmit attempt " + std::to_string(attempt + 1) + " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
+		}
+		
+		log(LogLevel::WARNING, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) + " failed after " + std::to_string(max_tries) + " attempts.");
+		co_return std::nullopt;
+	}
     // Evaluate connectivity results after checks
     asio::awaitable<void> evaluate_connectivity_results() {
         bool any_success = false;
         for (auto& e: check_list_) {
             if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
-                co_await nominate_pair(e);
-                any_success = true;
-                break;
+                if (co_await nominate_pair(e)) {
+					any_success = true;
+					break;
+				}
             }
         }
         if (!any_success) {
@@ -812,39 +814,32 @@ private:
     }
 
     // Nominate a candidate pair
-    asio::awaitable<void> nominate_pair(CheckListEntry& entry) {
-        entry.is_nominated = true;
-        nominated_pair_ = entry.pair; // Set the nominated pair
-
+    asio::awaitable<bool> nominate_pair(CheckListEntry& entry) {
         asio::ip::udp::endpoint target = entry.pair.remote_candidate.endpoint;
-        // If relay is allocated and pair uses relay, use relay endpoint
-        if (entry.pair.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
-            target = relay_endpoint_;
-        }
 
         if (local_ice_attributes_.role == IceRole::Controller) {
             // Create and send BINDING_INDICATION with USE-CANDIDATE attribute
-            StunMessage ind(StunMessageType::BINDING_INDICATION, StunMessage::generate_transaction_id());
+            StunMessage ind(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
             ind.add_attribute(StunAttributeType::USE_CANDIDATE, {});
             ind.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
             ind.add_message_integrity(remote_ice_attributes_.pwd);
             ind.add_fingerprint();
 
             // Send the BINDING_INDICATION without expecting a response
-            co_await send_stun_request(ind, "", target, false);
-            log(LogLevel::DEBUG, "Sent BINDING_INDICATION with USE-CANDIDATE to " + target.to_string());
+            auto resp_opt = co_await send_stun_request(target, ind);
+			if (!resp_opt.has_value()) co_return false;
+			
+			auto resp = resp.value();
+			if (resp.get_type() != StunMessageType::BINDING_RESPONSE_SUCCESS) co_return false;
+		}
+			
+		entry.is_nominated = true;
+		nominated_pair_ = entry.pair; // Set the nominated pair
+				
+		if (nominate_callback_) {
+			nominate_callback_(entry.pair);
 
-            if (nominate_callback_) {
-                nominate_callback_(entry.pair);
-            }
-        } else {
-            // For Controlled role
-            if (nominate_callback_) {
-                nominate_callback_(entry.pair);
-            }
-            transition_to_state(IceConnectionState::Completed);
-            log(LogLevel::INFO, "ICE connection completed.");
-        }
+		co_return true;
     }
 
     // Consent Freshness
@@ -887,9 +882,9 @@ private:
         bool ok = false;
         try {
             std::optional<StunMessage> resp_opt = co_await send_stun_request(
-                req, remote_ice_attributes_.pwd,
-                target,
-                true,
+				target,
+                req, 
+				remote_ice_attributes_.pwd,
                 std::chrono::milliseconds(500),
                 5
             );
@@ -922,8 +917,8 @@ private:
                 refresh_req.add_message_integrity(turn_password_);
                 refresh_req.add_fingerprint();
 
-                // Send Refresh request and await response
-                auto resp_opt = co_await send_stun_request(refresh_req, turn_password_, turn_endpoints_[0],
+                // Send Refresh request and await response TODO: 여러개이의 턴서버 지원.
+                auto resp_opt = co_await send_stun_request(turn_endpoints_[0], refresh_req, turn_password_,
                                                          std::chrono::milliseconds(1000),
                                                          5);
                 if (resp_opt.has_value()) {
@@ -1028,7 +1023,7 @@ private:
         }
 
         // Extract mapped address from the request
-        asio::ip::udp::endpoint mapped = req.get_mapped_address(); // Implement this method as needed
+        asio::ip::udp::endpoint mapped = req.get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS); // Implement this method as needed
 
         // Check if the mapped endpoint is already known
         bool known = false;
@@ -1103,23 +1098,39 @@ private:
         resp.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
         resp.add_fingerprint();
 
-        co_await send_stun_request(resp, "", sender, false);
+        co_await send_stun_request(sender, resp);
         log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
     }
 
-    // Handle STUN Binding Indication (USE-CANDIDATE)
-    asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) {
-        if (ind.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-            // Nominate the first succeeded and un-nominated pair
-            for (auto& e: check_list_) {
-                if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
-                    co_await nominate_pair(e);
-                    break;
-                }
-            }
-            log(LogLevel::DEBUG, "Processed BINDING_INDICATION with USE-CANDIDATE from " + sender.address().to_string() + ":" + std::to_string(sender.port()));
-        }
-    }
+    // TODO: Stun Message의 처리 메시지 타입별 속성별 핸들링
+	asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) {
+		if (ind.has_attribute(StunAttributeType::USE_CANDIDATE)) {
+			// Find the exact pair corresponding to the sender's endpoint
+			for (auto& e : check_list_) {
+				// Match the remote candidate with the sender
+				if (e.remote_candidate.endpoint == sender &&
+					e.state == CandidatePairState::Succeeded &&
+					!e.is_nominated) {
+					
+					// Nominate the candidate pair
+					co_await nominate_pair(e);
+					transition_to_state(IceConnectionState::Completed);
+
+	
+					log(LogLevel::DEBUG, "Nominated pair: " + e.to_string() +
+						" based on BINDING_INDICATION with USE-CANDIDATE from " +
+						sender.address().to_string() + ":" +
+						std::to_string(sender.port()));
+	
+					break;
+				}
+			}
+		} else {
+			log(LogLevel::WARN, "BINDING_INDICATION received without USE-CANDIDATE from " +
+				sender.address().to_string() + ":" +
+				std::to_string(sender.port()));
+		}
+	}
 
     // Handle inbound signaling messages (e.g., SDP)
     asio::awaitable<void> handle_incoming_signaling_messages() {

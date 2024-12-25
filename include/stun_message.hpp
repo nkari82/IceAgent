@@ -15,13 +15,18 @@
 #include <iostream>
 
 // -------------------- ENUMS / CONSTANTS --------------------
+// 메시지 유형	             응답 필요	재시도 필요 	설명
+// BINDING_REQUEST	         예	        예	            연결 테스트 및 IP/포트 확인 요청.
+// BINDING_RESPONSE_SUCCESS	 아니오	    아니오	        성공 응답. 추가 작업 불필요.
+// BINDING_RESPONSE_ERROR	 아니오	    조건부	        실패 응답. 오류에 따라 재시도 가능.
+// BINDING_INDICATION	     아니오	    아니오	        상태 정보 전달. 단방향 메시지.
 
 // STUN Message Types (RFC 5389)
 enum class StunMessageType : uint16_t {
-    BINDING_REQUEST = 0x0001,
-    BINDING_RESPONSE_SUCCESS = 0x0101,
+    BINDING_REQUEST = 0x0001, 
+    BINDING_RESPONSE_SUCCESS = 0x0101, 
     BINDING_RESPONSE_ERROR = 0x0111,
-    BINDING_INDICATION = 0x0011, //
+    BINDING_INDICATION = 0x0011,
     ALLOCATE = 0x0003,
     ALLOCATE_RESPONSE_SUCCESS = 0x0103,
     ALLOCATE_RESPONSE_ERROR = 0x0113,
