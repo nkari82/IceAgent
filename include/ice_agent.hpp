@@ -44,10 +44,36 @@ struct Candidate {
     asio::ip::udp::endpoint endpoint;
     CandidateType type;
     uint32_t priority;
-    int component_id;
-    std::string foundation;
+    uint32_t component_id;
     std::string transport;
-    int generation = 0;  // RFC에 따른 generation 추가
+    std::string foundation;
+
+    Candidate(const asio::ip::udp::endpoint &ep, CandidateType type, uint32_t comp_id = 1,
+              const std::string &tp = "UDP", const std::string &fnd = "")
+        : endpoint(ep), type(type), component_id(comp_id), transport(tp), foundation(fnd) {
+        // RFC 8445 Section 5.7.1에 따른 후보자 우선순위 계산
+        uint32_t type_pref = 0;
+        switch (type) {
+            case CandidateType::Host:
+                type_pref = 126;
+                foundation = "host";
+                break;
+            case CandidateType::PeerReflexive:
+                foundation = "prflx";
+                type_pref = 110;
+                break;
+            case CandidateType::ServerReflexive:
+                foundation = "srflx";
+                type_pref = 100;
+                break;
+            case CandidateType::Relay:
+                foundation = "relay";
+                type_pref = 0;
+                break;
+        }
+        uint32_t local_pref = 65535;
+        priority = (type_pref << 24) | (local_pref << 8) | (256 - component_id);
+    }
 
     // SDP 형식으로 변환
     std::string to_sdp() const {
@@ -68,12 +94,10 @@ struct Candidate {
                 oss << "relay";
                 break;
         }
-        oss << " generation:" << generation;
         return oss.str();
     }
 
     static std::optional<Candidate> from_sdp(const std::string &sdp_line) {
-        Candidate c;
         std::istringstream iss(sdp_line);
         std::string prefix;
         iss >> prefix;  // "a=candidate:..."
@@ -84,15 +108,19 @@ struct Candidate {
         if (colon + 1 >= prefix.size())
             return std::nullopt;  // foundation 누락
 
-        c.foundation = prefix.substr(colon + 1);
-        iss >> c.component_id;
-        iss >> c.transport;
-        iss >> c.priority;
+        std::string foundation = prefix.substr(colon + 1);
+        asio::ip::udp::endpoint endpoint;
+        CandidateType type;
+        std::string transport;
+        uint32_t component_id, priority, component_id;
+        iss >> component_id;
+        iss >> transport;
+        iss >> priority;
         std::string ip;
         uint16_t port;
         iss >> ip >> port;
         try {
-            c.endpoint = asio::ip::udp::endpoint(asio::ip::make_address(ip), port);
+            endpoint = asio::ip::udp::endpoint(asio::ip::make_address(ip), port);
         } catch (const std::exception &) {
             return std::nullopt;  // 잘못된 IP 주소
         }
@@ -102,32 +130,20 @@ struct Candidate {
         if (typ != "typ")
             return std::nullopt;  // 예상되는 "typ" 키워드
         std::string type_str;
+
         iss >> type_str;
         if (type_str == "host")
-            c.type = CandidateType::Host;
+            type = CandidateType::Host;
         else if (type_str == "prflx")
-            c.type = CandidateType::PeerReflexive;
+            type = CandidateType::PeerReflexive;
         else if (type_str == "srflx")
-            c.type = CandidateType::ServerReflexive;
+            type = CandidateType::ServerReflexive;
         else if (type_str == "relay")
-            c.type = CandidateType::Relay;
+            type = CandidateType::Relay;
         else
             return std::nullopt;  // 알 수 없는 candidate 타입
 
-        // 선택적 generation 속성
-        std::string attr;
-        while (iss >> attr) {
-            size_t pos = attr.find("generation:");
-            if (pos != std::string::npos) {
-                try {
-                    c.generation = std::stoi(attr.substr(pos + std::string("generation:").size()));
-                } catch (...) {
-                    // invalid generation은 무시
-                }
-            }
-        }
-
-        return c;
+        return Candidate(endpoint, type, component_id, transport, foundation);
     }
 };
 
@@ -310,7 +326,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             [this, self = shared_from_this()]() -> asio::awaitable<void> {
                 try {
                     // 상태 초기화
-                    nominated_pair_ = CandidatePair();
+                    nominated_pair_ = std::nullopt;
+
                     check_list_.clear();
                     remote_candidates_.clear();
                     local_candidates_.clear();
@@ -371,11 +388,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             log(LogLevel::Warning, "send_data() => not connected");
             return;
         }
-        asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
+        const auto &pair = nominated_pair_.value();
+        asio::ip::udp::endpoint target = pair.remote_candidate.endpoint;
 
         // If relay is allocated and the nominated pair uses relay, use relay endpoint
-        if (nominated_pair_.remote_candidate.type == CandidateType::Relay &&
-            !relay_endpoint_.address().is_unspecified()) {
+        if (pair.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
             target = relay_endpoint_;
         }
 
@@ -424,7 +441,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     DataCallback data_callback_;
     NominateCallback nominate_callback_;
 
-    CandidatePair nominated_pair_;
+    std::optional<CandidatePair> nominated_pair_;
 
     // ICE Attributes
     IceAttributes local_ice_attributes_;
@@ -495,14 +512,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         auto results6 = co_await resolver.async_resolve(asio::ip::udp::v6(), "::", "0", asio::use_awaitable);
 
         auto add_candidate = [&](const asio::ip::udp::endpoint &ep) {
-            Candidate c;
-            c.endpoint = ep;
-            c.type = CandidateType::Host;
-            c.foundation = "host";
-            c.transport = "UDP";
-            c.component_id = 1;
-            c.priority = calculate_priority(c);
-            local_candidates_.push_back(c);
+            const auto &c = local_candidates_.emplace_back((ep, CandidateType::Host));
             if (candidate_callback_) {
                 candidate_callback_(c);
             }
@@ -528,14 +538,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     // 응답에서 매핑된 주소 추출
                     auto mapped_opt = resp.get_mapped_address();  // 필요에 따라 구현
                     if (mapped_opt.has_value()) {
-                        Candidate c;
-                        c.endpoint = mapped_opt.value();
-                        c.type = CandidateType::ServerReflexive;
-                        c.foundation = "srflx";
-                        c.transport = "UDP";
-                        c.component_id = 1;
-                        c.priority = calculate_priority(c);
-                        local_candidates_.push_back(c);
+                        const auto &c =
+                            local_candidates_.emplace_back((mapped_opt.value(), CandidateType::ServerReflexive));
                         if (candidate_callback_) {
                             candidate_callback_(c);
                         }
@@ -842,10 +846,10 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     asio::awaitable<bool> send_consent_binding_request() {
-        asio::ip::udp::endpoint target = nominated_pair_.remote_candidate.endpoint;
+        const auto &pair = nominated_pair_.value();
+        asio::ip::udp::endpoint target = pair.remote_candidate.endpoint;
         // If relay is allocated and the nominated pair uses relay, use relay endpoint
-        if (nominated_pair_.remote_candidate.type == CandidateType::Relay &&
-            !relay_endpoint_.address().is_unspecified()) {
+        if (pair.remote_candidate.type == CandidateType::Relay && !relay_endpoint_.address().is_unspecified()) {
             target = relay_endpoint_;
         }
 
@@ -945,7 +949,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     log(LogLevel::Debug, std::string("Failed to parse STUN message: ") + ex.what());
 
                     // 노미네이트된 원격 후보자로부터 온 데이터인지 확인
-                    if (sender == nominated_pair_.remote_candidate.endpoint) {
+                    if (nominated_pair_.has_value() && sender == nominated_pair_.value().remote_candidate.endpoint) {
                         // 응용 프로그램 콜백을 통해 데이터 전달
                         if (data_callback_) {
                             data_callback_(buf, sender);
@@ -1186,17 +1190,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
 
         if (!known && !mapped.address().is_unspecified()) {
-            // Create a new Peer-Reflexive (PRFLX) candidate
-            Candidate prflx;
-            prflx.endpoint = mapped;
-            prflx.type = CandidateType::PeerReflexive;
-            prflx.foundation = "prflx";
-            prflx.transport = "UDP";
-            prflx.component_id = 1;
-            prflx.priority = calculate_priority(prflx);
-
             // Add to remote candidates and notify via callback
-            remote_candidates_.push_back(prflx);
+            const auto &prflx = remote_candidates_.emplace_back((mapped, CandidateType::PeerReflexive));
             if (candidate_callback_) {
                 candidate_callback_(prflx);
             }
@@ -1247,28 +1242,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             default:
                 return "Unknown";
         }
-    }
-
-    // RFC 8445 Section 5.7.1에 따른 후보자 우선순위 계산
-    uint32_t calculate_priority(const Candidate &c) const {
-        uint32_t type_pref = 0;
-        switch (c.type) {
-            case CandidateType::Host:
-                type_pref = 126;
-                break;
-            case CandidateType::PeerReflexive:
-                type_pref = 110;
-                break;
-            case CandidateType::ServerReflexive:
-                type_pref = 100;
-                break;
-            case CandidateType::Relay:
-                type_pref = 0;
-                break;
-        }
-        uint32_t local_pref = 65535;
-        uint32_t comp_id = static_cast<uint32_t>(c.component_id);
-        return (type_pref << 24) | (local_pref << 8) | (256 - comp_id);
     }
 
     // RFC 8445 Section 5.7.2에 따른 쌍 우선순위 계산
@@ -1390,13 +1363,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                             std::to_string(relay_endpoint_.port()));
 
                                     // 릴레이 후보자 생성
-                                    Candidate c;
-                                    c.endpoint = relay_opt.value();
-                                    c.type = CandidateType::Relay;
-                                    c.foundation = "relay";
-                                    c.transport = "UDP";
-                                    c.component_id = 1;
-                                    c.priority = calculate_priority(c);
+                                    Candidate c(relay_opt.value(), CandidateType::Relay);
                                     local_candidates_.push_back(c);
                                     if (candidate_callback_) {
                                         candidate_callback_(c);
