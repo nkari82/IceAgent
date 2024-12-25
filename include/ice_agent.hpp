@@ -41,7 +41,9 @@ enum class IceConnectionState {
     Checking, // 로컬 후보와 원격 후보 간의 연결성 검사를 수행합니다.
     Connected, // 하나 이상의 후보 쌍이 성공했지만 검사가 아직 진행 중일 수 있습니다.
     Completed, // 모든 후보 쌍이 확인되었으며 하나 이상의 쌍이 성공했습니다.
-    Failed // 유효한 후보 쌍을 설정할 수 없습니다.
+    Failed, // 유효한 후보 쌍을 설정할 수 없습니다.
+	Disconnected, // 이전에 연결되었던 경로가 끊어진 상태로, 재시도를 통해 복구를 시도할 수 있습니다.
+	Closed // ICE 프로세스가 완전히 종료되어 더 이상 동작하지 않는 상태입니다.
 };
 
 enum class LogLevel {
@@ -710,7 +712,9 @@ private:
 		int max_tries = 7)
 	{
 		// 메시지 타입에 따라 응답을 기다릴지 결정
-		bool expect_response = (request.get_type() == StunMessageType::BINDING_REQUEST)
+		bool expect_response = 
+			(request.get_type() == StunMessageType::BINDING_REQUEST || 
+			 request.get_type() == StunMessageType::ALLOCATE);
 		
 		using namespace asio::experimental::awaitable_operators;
 		
@@ -825,7 +829,6 @@ private:
             ind.add_message_integrity(remote_ice_attributes_.pwd);
             ind.add_fingerprint();
 
-            // Send the BINDING_INDICATION without expecting a response
             auto resp_opt = co_await send_stun_request(target, ind);
 			if (!resp_opt.has_value()) co_return false;
 			
@@ -990,7 +993,7 @@ private:
     asio::awaitable<void> handle_inbound_stun(const StunMessage& sm, const asio::ip::udp::endpoint& sender) {
         switch(sm.get_type()) {
             case StunMessageType::BINDING_REQUEST:
-                co_await handle_inbound_binding_request(sm, sender);
+                co_await handle_binding_request(sm, sender);
                 break;
             case StunMessageType::BINDING_INDICATION:
                 co_await handle_binding_indication(sm, sender);
@@ -1000,136 +1003,217 @@ private:
         }
     }
 
-    // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
-    asio::awaitable<void> handle_inbound_binding_request(const StunMessage& req, const asio::ip::udp::endpoint& sender) {
-        // Extract username attribute: "remoteUfrag:localUfrag"
-        auto uname = req.get_attribute_as_string(StunAttributeType::USERNAME);
-        auto delim = uname.find(':');
-        if (delim == std::string::npos) co_return;
-        std::string rcv_ufrag = uname.substr(0, delim);
-        std::string snd_ufrag = uname.substr(delim+1);
-
-        // Verify that the receiver is indeed this agent
-        if (rcv_ufrag != local_ice_attributes_.ufrag) co_return;
-
-        // Verify message integrity and fingerprint
-        if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
-            log(LogLevel::WARNING, "Invalid message integrity in inbound binding request.");
-            co_return;
-        }
-        if (!req.verify_fingerprint()) {
-            log(LogLevel::WARNING, "Invalid fingerprint in inbound binding request.");
-            co_return;
-        }
-
-        // Extract mapped address from the request
-        asio::ip::udp::endpoint mapped = req.get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS); // Implement this method as needed
-
-        // Check if the mapped endpoint is already known
-        bool known = false;
-        for (const auto& rc : remote_candidates_) {
-            if (rc.endpoint == mapped) {
-                known = true;
-                break;
-            }
-        }
-
-        if (!known && !mapped.address().is_unspecified()) {
-            // Create a new PRFLX candidate
-            Candidate prflx;
-            prflx.endpoint = mapped;
-            prflx.type = CandidateType::PeerReflexive;
-            prflx.foundation = "prflx";
-            prflx.transport = "UDP";
-            prflx.component_id = 1;
-            prflx.priority = calculate_priority(prflx);
-
-            // Add to remote_candidates_ and notify via callback
-            remote_candidates_.push_back(prflx);
-            if (candidate_callback_) {
-                candidate_callback_(prflx);
-            }
-            log(LogLevel::DEBUG, "Discovered new PeerReflexive candidate: " + prflx.to_sdp());
-
-            // Pair the new PRFLX candidate with local candidates for connectivity checks
-            for (auto& lc : local_candidates_) {
-                if (lc.component_id == prflx.component_id) {
-                    CandidatePair new_pair(lc, prflx);
-                    new_pair.priority = calculate_priority_pair(lc, prflx);
-                    check_list_.emplace_back(new_pair);
-                    log(LogLevel::DEBUG, "Added new CandidatePair for PRFLX: " + lc.to_sdp() + " <-> " + prflx.to_sdp());
-                }
-            }
-
-            // Perform connectivity checks for the new PRFLX candidate if in Full ICE mode
-            if (mode_ == IceMode::Full) {
-                co_await perform_connectivity_checks();
-            }
-        }
-
-        // Triggered Connectivity Check for the incoming request
-        bool found_pair = false;
-        for (auto& e: check_list_) {
-            if (e.pair.remote_candidate.endpoint == sender) {
-                found_pair = true;
-                break;
-            }
-        }
-        if (!found_pair && !sender.address().is_unspecified()) {
-            // Select a local candidate (e.g., first host candidate)
-            Candidate local_cand;
-            if (!local_candidates_.empty()) {
-                local_cand = local_candidates_[0];
-            } else {
-                log(LogLevel::ERROR, "No local candidates available for pairing.");
-                co_return;
-            }
-            CandidatePair newp(local_cand, mapped);
-            newp.priority = calculate_priority_pair(local_cand, mapped);
-            check_list_.emplace_back(newp);
-            log(LogLevel::DEBUG, "Added new PeerReflexive pair: " + local_cand.to_sdp() + " <-> " + mapped.to_sdp());
-
-            // Perform connectivity check for the new pair
-            co_await perform_connectivity_checks();
-        }
-
-        // Send BINDING RESPONSE
-        StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
-        resp.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
-        resp.add_fingerprint();
-
-        co_await send_stun_request(sender, resp);
-        log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
-    }
-
-    // TODO: Stun Message의 처리 메시지 타입별 속성별 핸들링
-	asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) {
-		if (ind.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-			// Find the exact pair corresponding to the sender's endpoint
-			for (auto& e : check_list_) {
-				// Match the remote candidate with the sender
-				if (e.remote_candidate.endpoint == sender &&
-					e.state == CandidatePairState::Succeeded &&
-					!e.is_nominated) {
-					
-					// Nominate the candidate pair
-					co_await nominate_pair(e);
-					transition_to_state(IceConnectionState::Completed);
-
+	// Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
+	asio::awaitable<void> handle_binding_request(const StunMessage& req, const asio::ip::udp::endpoint& sender) {
+		// Step 1: Handle USE-CANDIDATE Attribute for Nomination
+		if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
+			co_await handle_use_candidate(req, sender);
+		}
 	
-					log(LogLevel::DEBUG, "Nominated pair: " + e.to_string() +
-						" based on BINDING_INDICATION with USE-CANDIDATE from " +
-						sender.address().to_string() + ":" +
-						std::to_string(sender.port()));
+		// Step 2: Extract and Validate USERNAME Attribute
+		auto uname_opt = req.get_attribute_as_string(StunAttributeType::USERNAME);
+		if (!uname_opt.has_value()) {
+			log(LogLevel::WARNING, "Binding request missing USERNAME attribute.");
+			co_return;
+		}
 	
-					break;
+		std::string uname = uname_opt.value();
+		size_t delim = uname.find(':');
+		if (delim == std::string::npos) {
+			log(LogLevel::WARNING, "Invalid USERNAME format in binding request.");
+			co_return;
+		}
+	
+		std::string rcv_ufrag = uname.substr(0, delim);
+		std::string snd_ufrag = uname.substr(delim + 1);
+	
+		// Verify that the receiver ufrag matches this agent's ufrag
+		if (rcv_ufrag != local_ice_attributes_.ufrag) {
+			log(LogLevel::WARNING, "Received binding request with incorrect ufrag.");
+			co_return;
+		}
+	
+		// Step 3: Verify MESSAGE-INTEGRITY and FINGERPRINT
+		if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
+			log(LogLevel::WARNING, "Invalid MESSAGE-INTEGRITY in inbound binding request.");
+			co_return;
+		}
+		if (!req.verify_fingerprint()) {
+			log(LogLevel::WARNING, "Invalid FINGERPRINT in inbound binding request.");
+			co_return;
+		}
+	
+		// Step 4: Extract and Handle PRIORITY Attribute
+		auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
+		uint32_t remote_priority = 0;
+		if (priority_opt.has_value()) {
+			remote_priority = priority_opt.value();
+		} else {
+			log(LogLevel::WARNING, "Binding request missing PRIORITY attribute.");
+			co_return;
+		}
+	
+		// Step 5: Extract and Handle ICE-CONTROLLING or ICE-CONTROLLED Attributes
+		handle_role_negotiation(req);
+	
+		// Step 6: Extract MAPPED-ADDRESS or XOR-MAPPED-ADDRESS
+		asio::ip::udp::endpoint mapped;
+		if (req.has_attribute(StunAttributeType::MAPPED_ADDRESS)) {
+			mapped = req.get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
+		} else if (req.has_attribute(StunAttributeType::XOR_MAPPED_ADDRESS)) {
+			mapped = req.get_attribute_as_xor_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS, sender);
+		} else {
+			log(LogLevel::WARNING, "Binding request missing MAPPED-ADDRESS or XOR-MAPPED-ADDRESS.");
+			co_return;
+		}
+	
+		// Step 7: Add PRFLX Candidate if Mapped Address is New
+		if (add_prflx_candidate(mapped)) {
+			if (mode_ == IceMode::Full) {
+				co_await perform_connectivity_checks();
+			}
+		}
+	
+		// Step 8: Triggered Connectivity Check for the Incoming Request
+		bool found_pair = false;
+		for (auto& e : check_list_) {
+			if (e.pair.remote_candidate.endpoint == sender) {
+				found_pair = true;
+				break;
+			}
+		}
+	
+		if (!found_pair && !sender.address().is_unspecified()) {
+			// Select a local candidate (e.g., first host candidate)
+			Candidate local_cand;
+			if (!local_candidates_.empty()) {
+				local_cand = local_candidates_[0];
+			} else {
+				log(LogLevel::ERROR, "No local candidates available for pairing.");
+				co_return;
+			}
+	
+			// Create a new CandidatePair with the mapped endpoint
+			CandidatePair newp(local_cand, mapped);
+			newp.priority = calculate_priority_pair(local_cand, mapped);
+			check_list_.emplace_back(newp);
+			log(LogLevel::DEBUG, "Added new Peer-Reflexive pair: " + local_cand.to_sdp() + " <-> " + mapped.to_sdp());
+	
+			// Perform connectivity check for the new pair
+			asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
+		}
+	
+		// Step 9: Send BINDING RESPONSE to the Sender
+		StunMessage resp = create_binding_response(req, mapped);
+		co_await send_stun_request(sender, resp);
+		log(LogLevel::DEBUG, "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
+	}
+	
+	// Helper Function to Handle USE-CANDIDATE Attribute
+	asio::awaitable<void> handle_use_candidate(const StunMessage& req, const asio::ip::udp::endpoint& sender) {
+		for (auto& e : check_list_) {
+			if (e.pair.remote_candidate.endpoint == sender &&
+				e.state == CandidatePairState::Succeeded &&
+				!e.is_nominated) {
+	
+				// Nominate the candidate pair
+				co_await nominate_pair(e);
+				transition_to_state(IceConnectionState::Completed);
+				break; // Exit after nominating the pair
+			}
+		}
+	}
+	
+	// Helper Function to Handle Role Negotiation
+	void handle_role_negotiation(const StunMessage& req) {
+		bool is_controlling = false;
+		bool is_controlled = false;
+		auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
+		auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
+	
+		if (ice_controlling_opt.has_value()) {
+			is_controlling = true;
+			uint64_t remote_tie_breaker = ice_controlling_opt.value();
+			// Compare tie-breakers to negotiate roles
+			if (remote_tie_breaker > local_ice_attributes_.tie_breaker) {
+				local_ice_attributes_.role = IceRole::Controlled;
+			} else if (remote_tie_breaker < local_ice_attributes_.tie_breaker) {
+				local_ice_attributes_.role = IceRole::Controller;
+			}
+		}
+	
+		if (ice_controlled_opt.has_value()) {
+			is_controlled = true;
+			uint64_t remote_tie_breaker = ice_controlled_opt.value();
+			// Compare tie-breakers to negotiate roles
+			if (remote_tie_breaker > local_ice_attributes_.tie_breaker) {
+				local_ice_attributes_.role = IceRole::Controller;
+			} else if (remote_tie_breaker < local_ice_attributes_.tie_breaker) {
+				local_ice_attributes_.role = IceRole::Controlled;
+			}
+		}
+	
+		log(LogLevel::INFO, "Negotiated role => " + ice_role_to_string(local_ice_attributes_.role));
+	}
+	
+	// Helper Function to Add Peer-Reflexive (PRFLX) Candidate
+	bool add_prflx_candidate(const asio::ip::udp::endpoint& mapped) {
+		bool known = false;
+		for (const auto& rc : remote_candidates_) {
+			if (rc.endpoint == mapped) {
+				known = true;
+				break;
+			}
+		}
+	
+		if (!known && !mapped.address().is_unspecified()) {
+			// Create a new Peer-Reflexive (PRFLX) candidate
+			Candidate prflx;
+			prflx.endpoint = mapped;
+			prflx.type = CandidateType::PeerReflexive;
+			prflx.foundation = "prflx";
+			prflx.transport = "UDP";
+			prflx.component_id = 1;
+			prflx.priority = calculate_priority(prflx);
+	
+			// Add to remote candidates and notify via callback
+			remote_candidates_.push_back(prflx);
+			if (candidate_callback_) {
+				candidate_callback_(prflx);
+			}
+			log(LogLevel::DEBUG, "Discovered new Peer-Reflexive candidate: " + prflx.to_sdp());
+	
+			// Pair the new PRFLX candidate with local candidates for connectivity checks
+			for (auto& lc : local_candidates_) {
+				if (lc.component_id == prflx.component_id) {
+					CandidatePair new_pair(lc, prflx);
+					new_pair.priority = calculate_priority_pair(lc, prflx);
+					check_list_.emplace_back(new_pair);
+					log(LogLevel::DEBUG, "Added new CandidatePair for PRFLX: " + lc.to_sdp() + " <-> " + prflx.to_sdp());
 				}
 			}
-		} else {
-			log(LogLevel::WARN, "BINDING_INDICATION received without USE-CANDIDATE from " +
-				sender.address().to_string() + ":" +
-				std::to_string(sender.port()));
+	
+			return true; // Indicates that a new PRFLX candidate was added
 		}
+	
+		return false; // No new candidate added
+	}
+	
+	// Helper Function to Create Binding Response
+	StunMessage create_binding_response(const StunMessage& req, const asio::ip::udp::endpoint& mapped) {
+		StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
+	
+		// Add MAPPED-ADDRESS attribute
+		resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
+	
+		// Add MESSAGE-INTEGRITY and FINGERPRINT
+		resp.add_message_integrity(local_ice_attributes_.pwd); // Use local pwd
+		resp.add_fingerprint();
+	
+		return resp;
+	}
+
+	asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) {
 	}
 
     // Handle inbound signaling messages (e.g., SDP)
