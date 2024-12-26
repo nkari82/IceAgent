@@ -397,6 +397,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         asio::co_spawn(strand_, handle_incoming_signaling_messages(), asio::detached);
                     } else {
                         if (mode_ == IceMode::Full) {
+                            create_check_list();
                             co_await perform_connectivity_checks();
                         } else {
                             // Lite 모드: 로컬 검사를 건너뜀
@@ -612,24 +613,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // 연결성 검사 수행 #TODO (perform_connectivity_checks 동시에 처리해야함.)
+    // (io_context) 연결성 검사 수행 #TODO (perform_connectivity_checks 동시에 처리해야함.)
     asio::awaitable<void> perform_connectivity_checks() {
         if (connectivity_check_in_progress_.exchange(true)) {
             co_return;  // 이미 실행 중이면 종료
         }
-
-        // #TODO check_list 동기화
-        check_list_.clear();
-        for (auto &rc : remote_candidates_) {
-            for (auto &lc : local_candidates_) {
-                if (lc.component_id == rc.component_id) {
-                    CandidatePair cp(lc, rc);
-                    check_list_.emplace_back(cp);
-                }
-            }
-        }
-
-        sort_candidate_pairs();
 
         size_t next_pair = 0;                 // 단순히 증가만 하므로 atomic 필요 없음
         std::atomic<size_t> active_tasks{0};  // 경합 방지를 위해 atomic 사용
@@ -639,18 +627,19 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             while (true) {
                 bool progress = false;
 
-                // #TODO check_list 동기화
                 while (active_tasks < max_concurrency) {
                     if (next_pair >= check_list_.size()) {
                         break;
                     }
 
+                    // #TODO check_list 동기화
                     CheckListEntry &entry = check_list_[next_pair++];
                     if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
                         entry.state = CandidatePairState::InProgress;
                         active_tasks.fetch_add(1, std::memory_order_relaxed);  // 작업 증가
                         progress = true;
 
+                        // #FIXME 하나씩 스폰되는게 맞아
                         asio::co_spawn(io_context_, perform_single_connectivity_check(entry),
                                        [&, index = next_pair - 1](std::exception_ptr eptr) {
                                            if (!eptr && check_list_[index].state == CandidatePairState::Succeeded) {
@@ -669,42 +658,56 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 if (!progress && active_tasks == 0) {
                     break;  // 더 이상 처리할 항목이 없고 활성 작업이 없으면 종료
                 }
-
-                co_await asio::steady_timer(co_await asio::this_coro::executor, std::chrono::milliseconds(10))
-                    .async_wait();
-            }
-
-            // Evaluate connectivity results after checks
-            bool any_success = false;
-            if (any_success) {
-                transition_to_state(IceConnectionState::Completed);
-                log(LogLevel::Info, "ICE completed established.");
-
-                // Freeze remaining candidate pairs
-                for (auto &entry : check_list_) {
-                    if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
-                        entry.state = CandidatePairState::Frozen;
-                        log(LogLevel::Debug, "Candidate pair frozen: {} <-> {}", entry.pair.local_candidate.to_sdp(),
-                            entry.pair.remote_candidate.to_sdp());
-                    }
-                }
-
-                // #TODO 여기도 정리 Start consent freshness and TURN refresh if applicable
-                if (mode_ == IceMode::Full) {
-                    asio::co_spawn(strand_, perform_consent_freshness(), asio::detached);
-                }
-                if (!relay_endpoint_.address().is_unspecified()) {
-                    asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
-                }
-                asio::co_spawn(strand_, start_data_receive(), asio::detached);
-            } else {
-                transition_to_state(IceConnectionState::Failed);
-                log(LogLevel::Error, "All connectivity checks failed.");
             }
         } catch (...) {
             transition_to_state(IceConnectionState::Failed);
         }
         connectivity_check_in_progress_ = false;  // 실행 완료 표시
+    }
+
+    // (strand)
+    void create_check_list() {
+        check_list_.clear();
+        for (auto &rc : remote_candidates_) {
+            for (auto &lc : local_candidates_) {
+                if (lc.component_id == rc.component_id) {
+                    CandidatePair cp(lc, rc);
+                    check_list_.emplace_back(cp);
+                }
+            }
+        }
+
+        sort_candidate_pairs();
+    }
+
+    // (strand) Evaluate connectivity results after checks
+    asio::awaitable<void> evaluate_connectivity_results() {
+        bool any_success = false;
+        if (any_success) {
+            transition_to_state(IceConnectionState::Completed);
+            log(LogLevel::Info, "ICE completed established.");
+
+            // Freeze remaining candidate pairs
+            for (auto &entry : check_list_) {
+                if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
+                    entry.state = CandidatePairState::Frozen;
+                    log(LogLevel::Debug, "Candidate pair frozen: {} <-> {}", entry.pair.local_candidate.to_sdp(),
+                        entry.pair.remote_candidate.to_sdp());
+                }
+            }
+
+            // #TODO 여기도 정리 Start consent freshness and TURN refresh if applicable
+            if (mode_ == IceMode::Full) {
+                asio::co_spawn(strand_, perform_consent_freshness(), asio::detached);
+            }
+            if (!relay_endpoint_.address().is_unspecified()) {
+                asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+            }
+            asio::co_spawn(strand_, start_data_receive(), asio::detached);
+        } else {
+            transition_to_state(IceConnectionState::Failed);
+            log(LogLevel::Error, "All connectivity checks failed.");
+        }
     }
 
     // Perform a single connectivity check
@@ -1195,8 +1198,10 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // TODO: 동일 candidate가 추가되지 않게 옵션으로 변수추가.
-    void add_remote_candidate(const Candidate &cand) {
+    // (strand) TODO: 동일 candidate가 추가되지 않게 옵션으로 변수추가.
+    asio::awaitable<void> add_remote_candidate(const Candidate &cand) {
+        co_await asio::dispatch(bind_executor(strand_, asio::use_awaitable));
+
         bool known = std::any_of(remote_candidates_.begin(), remote_candidates_.end(),
                                  [&](const auto &rc) { return cand == rc; });
 
@@ -1218,6 +1223,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     check_list_.push_back(entry);
                     sort_candidate_pairs();
                 } else {
+                    create_check_list();
                     asio::co_spawn(io_context_, perform_connectivity_checks(), asio::detached);
                 }
             }
@@ -1265,7 +1271,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // Sort candidate pairs based on priority
+    // (strand) Sort candidate pairs based on priority
     void sort_candidate_pairs() {
         std::sort(check_list_.begin(), check_list_.end(),  // TODO check_list 동기화
                   [&](auto &a, auto &b) { return a.pair.priority > b.pair.priority; });
