@@ -39,35 +39,42 @@ enum class LogLevel { Debug = 0, Info, Warning, Error };
 
 enum class CandidateType { Host, PeerReflexive, ServerReflexive, Relay };
 
+enum class Transport {
+    Unknown,  // 알 수 없는 전송 프로토콜
+    UDP,      // User Datagram Protocol
+    TCP,      // Transmission Control Protocol
+    TLS       // Transport Layer Security
+};
+
 // Candidate Structure
 struct Candidate {
     asio::ip::udp::endpoint endpoint;
     CandidateType type;
     uint32_t priority;
     uint32_t component_id;
-    std::string transport;
+    Transport transport;
     std::string foundation;
 
     Candidate(const asio::ip::udp::endpoint &ep, CandidateType type, uint32_t comp_id = 1,
-              const std::string &tp = "UDP", const std::string &fnd = "")
-        : endpoint(ep), type(type), component_id(comp_id), transport(tp), foundation(fnd) {
+              Transport tp = Transport::UDP, const std::string &fnd = "")
+        : endpoint(ep), type(type), component_id(comp_id), transport(tp) {
         // RFC 8445 Section 5.7.1에 따른 후보자 우선순위 계산
         uint32_t type_pref = 0;
         switch (type) {
             case CandidateType::Host:
+                foundation = fnd.empty() ? "host" : fnd;
                 type_pref = 126;
-                foundation = "host";
                 break;
             case CandidateType::PeerReflexive:
-                foundation = "prflx";
+                foundation = fnd.empty() ? "prflx" : fnd;
                 type_pref = 110;
                 break;
             case CandidateType::ServerReflexive:
-                foundation = "srflx";
+                foundation = fnd.empty() ? "srflx" : fnd;
                 type_pref = 100;
                 break;
             case CandidateType::Relay:
-                foundation = "relay";
+                foundation = fnd.empty() ? "relay" : fnd;
                 type_pref = 0;
                 break;
         }
@@ -78,8 +85,8 @@ struct Candidate {
     // SDP 형식으로 변환
     std::string to_sdp() const {
         std::ostringstream oss;
-        oss << "a=candidate:" << foundation << " " << component_id << " " << transport << " " << priority << " "
-            << endpoint.address().to_string() << " " << endpoint.port() << " typ ";
+        oss << "a=candidate:" << foundation << " " << component_id << " " << transport_to_string(transport) << " "
+            << priority << " " << endpoint.address().to_string() << " " << endpoint.port() << " typ ";
         switch (type) {
             case CandidateType::Host:
                 oss << "host";
@@ -111,8 +118,7 @@ struct Candidate {
         std::string foundation = prefix.substr(colon + 1);
         asio::ip::udp::endpoint endpoint;
         CandidateType type;
-        std::string transport;
-        uint32_t component_id, priority, component_id;
+        uint32_t component_id, transport, priority;
         iss >> component_id;
         iss >> transport;
         iss >> priority;
@@ -132,19 +138,44 @@ struct Candidate {
         std::string type_str;
 
         iss >> type_str;
-        if (type_str == "host")
-            type = CandidateType::Host;
-        else if (type_str == "prflx")
-            type = CandidateType::PeerReflexive;
-        else if (type_str == "srflx")
-            type = CandidateType::ServerReflexive;
-        else if (type_str == "relay")
-            type = CandidateType::Relay;
-        else
-            return std::nullopt;  // 알 수 없는 candidate 타입
-
-        return Candidate(endpoint, type, component_id, transport, foundation);
+        switch (type_str[0]) {
+            case 'h':
+                type = CandidateType::Host;
+                break;
+            case 'p':
+                type = CandidateType::PeerReflexive;
+                break;
+            case 's':
+                type = CandidateType::ServerReflexive;
+                break;
+            case 'r':
+                type = CandidateType::Relay;
+                break;
+            default:
+                return std::nullopt;  // 알 수 없는 candidate 타입
+        }
+        return Candidate(endpoint, type, component_id, (Transport)transport, foundation);
     }
+
+    static std::string transport_to_string(Transport tp) {
+        switch (tp) {
+            case Transport::UDP:
+                return "UDP";
+            case Transport::TCP:
+                return "TCP";
+            case Transport::TLS:
+                return "TLS";
+            default:
+                return "Unknown";
+        }
+    }
+
+    bool operator==(const Candidate &other) const {
+        return endpoint == other.endpoint && type == other.type && foundation == other.foundation &&
+               priority == other.priority && transport == other.transport && component_id == other.component_id;
+    }
+
+    bool operator!=(const Candidate &other) const { return !(*this == other); }
 };
 
 struct CandidatePair {
@@ -622,7 +653,24 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     .async_wait();
             }
 
-            co_await evaluate_connectivity_results();
+            // Evaluate connectivity results after checks
+            bool any_success = false;
+            for (auto &e : check_list_) {
+                if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
+                    if (co_await nominate_pair(e)) {
+                        any_success = true;
+                        break;
+                    }
+                }
+            }
+            if (any_success) {
+                transition_to_state(IceConnectionState::Completed);
+                log(LogLevel::Info, "ICE completed established.");
+
+            } else {
+                transition_to_state(IceConnectionState::Failed);
+                log(LogLevel::Error, "All connectivity checks failed.");
+            }
         } catch (...) {
             transition_to_state(IceConnectionState::Failed);
         }
@@ -778,27 +826,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         log(LogLevel::Warning, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) +
                                    " failed after " + std::to_string(max_tries) + " attempts.");
         co_return std::nullopt;
-    }
-
-    // Evaluate connectivity results after checks
-    asio::awaitable<void> evaluate_connectivity_results() {
-        bool any_success = false;
-        for (auto &e : check_list_) {
-            if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
-                if (co_await nominate_pair(e)) {
-                    any_success = true;
-                    break;
-                }
-            }
-        }
-        if (any_success) {
-            transition_to_state(IceConnectionState::Completed);
-            log(LogLevel::Info, "ICE completed established.");
-
-        } else {
-            transition_to_state(IceConnectionState::Failed);
-            log(LogLevel::Error, "All connectivity checks failed.");
-        }
     }
 
     // Nominate a candidate pair
