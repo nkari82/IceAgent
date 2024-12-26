@@ -842,6 +842,20 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return std::nullopt;
     }
 
+    asio::awaitable<void> send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req,
+                                              StunErrorCode code, const std::string &reason_template, auto &&...args) {
+        try {
+            StunMessage error_resp(StunMessageType::BINDING_RESPONSE_ERROR, req.get_transaction_id());
+            error_resp.add_error_code(code, std::format(reason_template, std::forward<decltype(args)>(args)...));
+            error_resp.add_fingerprint();
+            co_await send_stun_request(sender, error_resp);
+            log(LogLevel::Warning, "Sent error response: {} ({}) to {}", get_error_reason(code), reason,
+                sender.address().to_string());
+        } catch (const std::exception &ex) {
+            log(LogLevel::Error, "Failed to send error response to {}: {}", sender.address().to_string(), ex.what());
+        }
+    }
+
     // Nominate a candidate pair
     asio::awaitable<bool> nominate_pair(CheckListEntry &entry) {
         asio::ip::udp::endpoint target = entry.pair.remote_candidate.endpoint;
@@ -1008,7 +1022,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // Handle inbound STUN messages
+    // Handle inbound STUN messages (level 1)
     asio::awaitable<void> handle_inbound_stun(const StunMessage &sm, const asio::ip::udp::endpoint &sender) {
         switch (sm.get_type()) {
             case StunMessageType::BINDING_REQUEST:
@@ -1022,39 +1036,59 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
+    // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery) (level 1)
     asio::awaitable<void> handle_binding_request(const StunMessage &req, const asio::ip::udp::endpoint &sender) {
         StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
 
-        if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-            co_await handle_use_candidate(req, sender);
-        }
-
+        // TODO send_error_response 와 send_stun_request return 타입을 맞춰보자.
+        // Step 1: USERNAME 속성 확인
         auto uname_opt = req.get_attribute_as_string(StunAttributeType::USERNAME);
-        if (uname_opt.has_value()) {
-            std::string uname = uname_opt.value();
-            size_t delim = uname.find(':');
-            if (delim == std::string::npos) {
-                log(LogLevel::Warning, "Invalid USERNAME format in binding request.");
-            }
-
-            std::string rcv_ufrag = uname.substr(0, delim);
-            std::string snd_ufrag = uname.substr(delim + 1);
-
-            // Verify that the receiver ufrag matches this agent's ufrag
-            if (rcv_ufrag != local_ice_attributes_.ufrag) {
-                log(LogLevel::Warning, "Received binding request with incorrect ufrag.");
-            }
+        if (!uname_opt.has_value()) {
+            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST,
+                                         "BINDING_REQUEST missing USERNAME attribute from {}",
+                                         sender.address().to_string());
+            co_return;
         }
 
-        if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
-            log(LogLevel::Warning, "Invalid MESSAGE-INTEGRITY in inbound binding request.");
+        // USERNAME 파싱 및 검증 (local_name : remote_name)
+        std::string uname = uname_opt.value();
+        size_t delim = uname.find(':');
+        if (delim == std::string::npos) {
+            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST,
+                                         "Invalid USERNAME format in BINDING_REQUEST from {}",
+                                         sender.address().to_string());
+            co_return;
         }
 
+        std::string rcv_ufrag = uname.substr(0, delim);
+        std::string snd_ufrag = uname.substr(delim + 1);
+
+        // 수신한 ufrag 검증
+        if (rcv_ufrag != local_ice_attributes_.ufrag) {
+            co_await send_error_response(sender, req, StunErrorCode::UNAUTHORIZED,
+                                         "BINDING_REQUEST has incorrect receiver ufrag from {}",
+                                         sender.address().to_string());
+            co_return;
+        }
+
+        // Step 2: MESSAGE-INTEGRITY 검증
+        if (req.has_attribute(StunAttributeType::MESSAGE_INTEGRITY) &&
+            !req.verify_message_integrity(local_ice_attributes_.pwd)) {
+            co_await send_error_response(sender, req, StunErrorCode::UNAUTHORIZED,
+                                         "Invalid MESSAGE-INTEGRITY in BINDING_REQUEST from {}",
+                                         sender.address().to_string());
+            co_return;
+        }
+
+        // Step 3: FINGERPRINT 검증
         if (!req.verify_fingerprint()) {
-            log(LogLevel::Warning, "Invalid FINGERPRINT in inbound binding request.");
+            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST,
+                                         "Invalid FINGERPRINT in BINDING_REQUEST from {}",
+                                         sender.address().to_string());
+            co_return;
         }
 
+        // Step 4: ROLE NEGOTIATION (ICE-CONTROLLING 또는 ICE-CONTROLLED 처리)
         auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
         auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
         if (ice_controlling_opt.has_value() || ice_controlled_opt.has_value()) {
@@ -1063,55 +1097,49 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             negotiate_role(remote_tie_breaker);
         }
 
-        auto mapped_opt = req.get_mapped_address();
+        // Step 5: MAPPED-ADDRESS 및 XOR-MAPPED-ADDRESS 처리
+        asio::ip::udp::endpoint mapped = sender;  // 기본적으로 송신자 주소를 사용
         auto xor_mapped_opt = req.get_xor_mapped_address();
-        if (mapped_opt.has_value() || xor_mapped_opt.has_value()) {
-            asio::ip::udp::endpoint mapped;
-            if (mapped_opt.has_value()) {
-                mapped = mapped_opt.value();
-                resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
-            }
+        if (xor_mapped_opt.has_value()) {
+            mapped = xor_mapped_opt.value();
+            resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, mapped);
+        } else {
+            resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
+        }
 
-            if (xor_mapped_opt.has_value()) {
-                mapped = xor_mapped_opt.value();
-                resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, mapped);
-            }
+        // Step 6: PRIORITY 처리 및 Peer-Reflexive 후보자 추가
+        auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
+        if (priority_opt.has_value()) {
+            Candidate prflx_candidate(mapped, CandidateType::PeerReflexive);
+            prflx_candidate.priority = priority_opt.value();
+            add_remote_candidate(prflx_candidate);
+            log(LogLevel::Info, "Added Peer-Reflexive candidate from {}", mapped.address().to_string());
+        }
 
-            if (!mapped.address().is_unspecified()) {
-                Candidate c = {mapped, CandidateType::PeerReflexive};
-                auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
-                if (priority_opt.has_value()) {
-                    c.priority = priority_opt.value();
+        // Step 7: USE-CANDIDATE 처리
+        if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
+            for (auto &entry : check_list_) {
+                if (entry.pair.remote_candidate.endpoint == sender && entry.state == CandidatePairState::Succeeded &&
+                    !entry.is_nominated) {
+                    // 후보자 쌍을 노미네이트
+                    co_await nominate_pair(entry);
+                    transition_to_state(IceConnectionState::Completed);
+                    log(LogLevel::Info, "Nominated candidate pair: {} <-> {}", entry.pair.local_candidate.to_sdp(),
+                        entry.pair.remote_candidate.to_sdp());
+                    break;
                 }
-
-                // 연걸성을 테스트 하다가 새로운 candidate가 발견 되었을 경우.
-                add_remote_candidate(c);
-
-                // signaling으로 키를 주고 받았을 경우.
-                resp.add_message_integrity(local_ice_attributes_.pwd);  // Use local p
             }
         }
 
+        // Step 8: BINDING_RESPONSE 전송
+        resp.add_message_integrity(local_ice_attributes_.pwd);
         resp.add_fingerprint();
-
         co_await send_stun_request(sender, resp);
-        log(LogLevel::Debug,
-            "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
+
+        log(LogLevel::Debug, "Sent BINDING_RESPONSE_SUCCESS to {}", sender.address().to_string());
     }
 
-    // Helper Function to Handle USE-CANDIDATE Attribute
-    asio::awaitable<void> handle_use_candidate(const StunMessage &req, const asio::ip::udp::endpoint &sender) {
-        for (auto &e : check_list_) {
-            if (e.pair.remote_candidate.endpoint == sender && e.state == CandidatePairState::Succeeded &&
-                !e.is_nominated) {
-                // Nominate the candidate pair
-                co_await nominate_pair(e);
-                transition_to_state(IceConnectionState::Completed);
-                break;  // Exit after nominating the pair
-            }
-        }
-    }
-
+    // (level 1)
     asio::awaitable<void> handle_binding_indication(const StunMessage &ind, const asio::ip::udp::endpoint &sender) {}
 
     // Handle inbound signaling messages (e.g., SDP)
@@ -1219,7 +1247,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // Sort candidate pairs based on priority
     void sort_candidate_pairs() {
-        std::sort(check_list_.begin(), check_list_.end(),
+        std::sort(check_list_.begin(), check_list_.end(),  // TODO check_list 동기화
                   [&](auto &a, auto &b) { return a.pair.priority > b.pair.priority; });
     }
 

@@ -44,13 +44,28 @@ enum class StunAttributeType : uint16_t {
     FINGERPRINT = 0x8028,
     ICE_CONTROLLING = 0x8029,
     ICE_CONTROLLED = 0x802A,
-    USE_CANDIDATE = 0x802B,  //
+    USE_CANDIDATE = 0x802B,
+    ERROR_CODE = 0x0009,
     REALM = 0x0014,
     NONCE = 0x0015,
     REQUESTED_TRANSPORT = 0x0019,
-    RELAYED_ADDRESS = 0x0016,  // RFC 5766
+    RELAYED_ADDRESS = 0x0016,
     REFRESH = 0x802C,
     // 기타 속성 타입
+};
+
+// STUN Error Codes (RFC 5389)
+enum class StunErrorCode : uint16_t {
+    NONE = 0,
+    TRY_ALTERNATE = 300,         // Alternate server recommendation
+    BAD_REQUEST = 400,           // Malformed request
+    UNAUTHORIZED = 401,          // Invalid credentials
+    FORBIDDEN = 403,             // Operation forbidden
+    UNKNOWN_ATTRIBUTE = 420,     // Unsupported attribute in request
+    ALLOCATION_MISMATCH = 437,   // TURN-specific error
+    STALE_NONCE = 438,           // Nonce expired
+    SERVER_ERROR = 500,          // Server encountered an error
+    INSUFFICIENT_CAPACITY = 508  // Insufficient resources
 };
 
 // STUN Magic Cookie (RFC 5389)
@@ -90,6 +105,31 @@ inline bool IsStunMessage(const std::vector<uint8_t> &data) {
         return false;  // 최소 STUN 헤더 크기
     uint16_t type = (data[0] << 8) | data[1];
     return (type >= 0x0000 && type <= 0x3FFF);
+}
+
+inline std::string get_error_reason(StunErrorCode code) {
+    switch (code) {
+        case StunErrorCode::TRY_ALTERNATE:
+            return "Try Alternate";
+        case StunErrorCode::BAD_REQUEST:
+            return "Bad Request";
+        case StunErrorCode::UNAUTHORIZED:
+            return "Unauthorized";
+        case StunErrorCode::FORBIDDEN:
+            return "Forbidden";
+        case StunErrorCode::UNKNOWN_ATTRIBUTE:
+            return "Unknown Attribute";
+        case StunErrorCode::ALLOCATION_MISMATCH:
+            return "Allocation Mismatch";
+        case StunErrorCode::STALE_NONCE:
+            return "Stale Nonce";
+        case StunErrorCode::SERVER_ERROR:
+            return "Server Error";
+        case StunErrorCode::INSUFFICIENT_CAPACITY:
+            return "Insufficient Capacity";
+        default:
+            return "Unknown Error";
+    }
 }
 
 // -------------------- STUN MESSAGE --------------------
@@ -184,6 +224,28 @@ class StunMessage {
         // Truncate to first 20 bytes as per RFC 5389
         std::vector<uint8_t> hmac_vec = HmacSha1::calculate(key, data);
         add_attribute(StunAttributeType::MESSAGE_INTEGRITY, hmac_vec);
+    }
+
+    void add_error_code(StunErrorCode code, const std::string &reason = "") {
+        // RFC 5389 Error-Code attribute structure
+        // Error-Code: 32-bit value (Class: upper 3 bits, Number: lower 8 bits)
+        uint16_t class_ = static_cast<uint16_t>(code) / 100;
+        uint16_t number = static_cast<uint16_t>(code) % 100;
+
+        std::vector<uint8_t> error_value(4);  // 4-byte structure: Reserved (1 byte) + Class (1 byte) + Number (1 byte)
+        error_value[0] = 0;                   // Reserved
+        error_value[1] = static_cast<uint8_t>(class_);
+        error_value[2] = static_cast<uint8_t>(number);
+
+        // Append the reason phrase as UTF-8 string
+        std::string reason_phrase = reason.empty() ? get_error_reason(code) : reason;
+        error_value.insert(error_value.end(), reason_phrase.begin(), reason_phrase.end());
+
+        // Add padding to align to 4-byte boundary
+        size_t padding = (4 - (error_value.size() % 4)) % 4;
+        error_value.insert(error_value.end(), padding, 0);
+
+        add_attribute(StunAttributeType::ERROR_CODE, error_value);
     }
 
     // Serialize the entire message
@@ -305,13 +367,6 @@ class StunMessage {
         return std::nullopt;  // Attribute not found
     }
 
-    std::optional<asio::ip::udp::endpoint> get_mapped_address() const {
-        return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
-    }
-    std::optional<asio::ip::udp::endpoint> get_relayed_address() const {
-        return get_attribute_as_mapped_address(StunAttributeType::RELAYED_ADDRESS);
-    }
-
     // Get attribute as optional MAPPED_ADDRESS
     std::optional<asio::ip::udp::endpoint> get_attribute_as_mapped_address(StunAttributeType attr_type) const {
         for (const auto &attr : attributes_) {
@@ -343,10 +398,6 @@ class StunMessage {
             }
         }
         return std::nullopt;  // Attribute not found
-    }
-
-    std::optional<asio::ip::udp::endpoint> get_xor_mapped_address() const {
-        return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
     }
 
     // Get attribute as optional XOR-MAPPED_ADDRESS
@@ -424,6 +475,48 @@ class StunMessage {
         }
         return std::nullopt;  // Attribute not found
     }
+
+    // Get Helpers
+    std::optional<asio::ip::udp::endpoint> get_mapped_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
+    }
+
+    std::optional<asio::ip::udp::endpoint> get_relayed_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::RELAYED_ADDRESS);
+    }
+
+    std::optional<asio::ip::udp::endpoint> get_xor_mapped_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
+    }
+
+    std::optional<std::pair<StunErrorCode, std::string>> get_error_code() const {
+        // ERROR_CODE 속성을 검색
+        for (const auto &attr : attributes_) {
+            if (attr.type == StunAttributeType::ERROR_CODE) {
+                // 속성 값의 길이가 최소 4바이트인지 확인
+                if (attr.value.size() < 4) {
+                    throw std::invalid_argument("ERROR-CODE attribute too short");
+                }
+
+                // Reserved (1 byte), Class (1 byte), Number (1 byte)
+                uint8_t error_class = attr.value[1];
+                uint8_t error_number = attr.value[2];
+                uint16_t error_code = static_cast<uint16_t>(error_class) * 100 + error_number;
+
+                // Reason Phrase (optional, UTF-8)
+                std::string reason_phrase;
+                if (attr.value.size() > 4) {
+                    reason_phrase = std::string(attr.value.begin() + 4, attr.value.end());
+                }
+
+                return std::make_pair(static_cast<StunErrorCode>(error_code), reason_phrase);
+            }
+        }
+
+        // ERROR-CODE 속성이 없는 경우 std::nullopt 반환
+        return std::nullopt;
+    }
+
     // Verify MESSAGE-INTEGRITY
     bool verify_message_integrity(const std::string &key) const {
         // Find MESSAGE-INTEGRITY attribute
