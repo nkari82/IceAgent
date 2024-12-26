@@ -170,12 +170,29 @@ struct Candidate {
         }
     }
 
+    static std::string type_to_string(CandidateType type) {
+        switch (type) {
+            case CandidateType::Host:
+                return "host";
+            case CandidateType::PeerReflexive:
+                return "prflx";
+            case CandidateType::ServerReflexive:
+                return "srflx";
+            case CandidateType::Relay:
+                return "relay";
+            default:
+                return "unknown";
+        }
+    }
+
     bool operator==(const Candidate &other) const {
         return endpoint == other.endpoint && type == other.type && foundation == other.foundation &&
                priority == other.priority && transport == other.transport && component_id == other.component_id;
     }
 
     bool operator!=(const Candidate &other) const { return !(*this == other); }
+
+    operator std::string() const { return to_sdp(); }
 };
 
 struct CandidatePair {
@@ -559,7 +576,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             try {
                 // 메시지 무결성 없이 바인딩 요청 STUN 메시지 생성
                 StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-                // 표준 STUN 요청에는 메시지 무결성 속성을 추가하지 않음
                 req.add_fingerprint();
 
                 // STUN 요청 전송 및 응답 대기
@@ -710,16 +726,14 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
             if (resp_opt.has_value()) {
                 entry.state = CandidatePairState::Succeeded;
-                log(LogLevel::Debug, "Connectivity check succeeded for pair: " + pair.local_candidate.to_sdp() +
-                                         " <-> " + pair.remote_candidate.to_sdp());
+                log(LogLevel::Debug, "Connectivity check succeeded for pair: {} <-> {}", pair.local_candidate.to_sdp(),
+                    pair.remote_candidate.to_sdp());
 
-                // Handle PRFLX Candidate Discovery
                 StunMessage resp = resp_opt.value();
-                auto mapped_opt = resp.get_mapped_address();  // Implement this method as needed
+                auto mapped_opt = resp.get_mapped_address();
 
                 if (mapped_opt.has_value()) {
-                    // Create a new PRFLX candidate
-                    add_prflx_candidate(mapped_opt.value());
+                    add_remote_candidate({mapped_opt.value(), CandidateType::PeerReflexive});
                 }
             } else {
                 entry.state = CandidatePairState::Failed;
@@ -1010,73 +1024,76 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // Handle inbound STUN Binding Request (Triggered Checks and PRFLX Discovery)
     asio::awaitable<void> handle_binding_request(const StunMessage &req, const asio::ip::udp::endpoint &sender) {
-        // Step 1: Handle USE-CANDIDATE Attribute for Nomination
+        StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
+
         if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
             co_await handle_use_candidate(req, sender);
         }
 
-        // Step 2: Extract and Validate USERNAME Attribute
         auto uname_opt = req.get_attribute_as_string(StunAttributeType::USERNAME);
-        if (!uname_opt.has_value()) {
-            log(LogLevel::Warning, "Binding request missing USERNAME attribute.");
-            co_return;
+        if (uname_opt.has_value()) {
+            std::string uname = uname_opt.value();
+            size_t delim = uname.find(':');
+            if (delim == std::string::npos) {
+                log(LogLevel::Warning, "Invalid USERNAME format in binding request.");
+            }
+
+            std::string rcv_ufrag = uname.substr(0, delim);
+            std::string snd_ufrag = uname.substr(delim + 1);
+
+            // Verify that the receiver ufrag matches this agent's ufrag
+            if (rcv_ufrag != local_ice_attributes_.ufrag) {
+                log(LogLevel::Warning, "Received binding request with incorrect ufrag.");
+            }
         }
 
-        std::string uname = uname_opt.value();
-        size_t delim = uname.find(':');
-        if (delim == std::string::npos) {
-            log(LogLevel::Warning, "Invalid USERNAME format in binding request.");
-            co_return;
-        }
-
-        std::string rcv_ufrag = uname.substr(0, delim);
-        std::string snd_ufrag = uname.substr(delim + 1);
-
-        // Verify that the receiver ufrag matches this agent's ufrag
-        if (rcv_ufrag != local_ice_attributes_.ufrag) {
-            log(LogLevel::Warning, "Received binding request with incorrect ufrag.");
-            co_return;
-        }
-
-        // Step 3: Verify MESSAGE-INTEGRITY and FINGERPRINT
         if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
             log(LogLevel::Warning, "Invalid MESSAGE-INTEGRITY in inbound binding request.");
-            co_return;
         }
+
         if (!req.verify_fingerprint()) {
             log(LogLevel::Warning, "Invalid FINGERPRINT in inbound binding request.");
-            co_return;
         }
 
-        // Step 4: Extract and Handle PRIORITY Attribute
-        auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
-        uint32_t remote_priority = 0;
-        if (priority_opt.has_value()) {
-            remote_priority = priority_opt.value();
-        } else {
-            log(LogLevel::Warning, "Binding request missing PRIORITY attribute.");
-            co_return;
+        auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
+        auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
+        if (ice_controlling_opt.has_value() || ice_controlled_opt.has_value()) {
+            uint64_t remote_tie_breaker =
+                ice_controlling_opt.has_value() ? ice_controlling_opt.value() : ice_controlled_opt.value();
+            negotiate_role(remote_tie_breaker);
         }
 
-        // Step 5: Extract and Handle ICE-CONTROLLING or ICE-CONTROLLED Attributes
-        handle_role_negotiation(req);
+        auto mapped_opt = req.get_mapped_address();
+        auto xor_mapped_opt = req.get_xor_mapped_address();
+        if (mapped_opt.has_value() || xor_mapped_opt.has_value()) {
+            asio::ip::udp::endpoint mapped;
+            if (mapped_opt.has_value()) {
+                mapped = mapped_opt.value();
+                resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
+            }
 
-        // Step 6: Extract MAPPED-ADDRESS or XOR-MAPPED-ADDRESS
-        asio::ip::udp::endpoint mapped;
-        if (req.has_attribute(StunAttributeType::MAPPED_ADDRESS)) {
-            mapped = req.get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS).value();
-        } else if (req.has_attribute(StunAttributeType::XOR_MAPPED_ADDRESS)) {
-            mapped = req.get_attribute_as_xor_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS, sender).value();
-        } else {
-            log(LogLevel::Warning, "Binding request missing MAPPED-ADDRESS or XOR-MAPPED-ADDRESS.");
-            co_return;
+            if (xor_mapped_opt.has_value()) {
+                mapped = xor_mapped_opt.value();
+                resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, mapped);
+            }
+
+            if (!mapped.address().is_unspecified()) {
+                Candidate c = {mapped, CandidateType::PeerReflexive};
+                auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
+                if (priority_opt.has_value()) {
+                    c.priority = priority_opt.value();
+                }
+
+                // 연걸성을 테스트 하다가 새로운 candidate가 발견 되었을 경우.
+                add_remote_candidate(c);
+
+                // signaling으로 키를 주고 받았을 경우.
+                resp.add_message_integrity(local_ice_attributes_.pwd);  // Use local p
+            }
         }
 
-        // Step 7: Add PRFLX Candidate if Mapped Address is New
-        add_prflx_candidate(mapped);
+        resp.add_fingerprint();
 
-        // Step 8: Send BINDING RESPONSE to the Sender
-        StunMessage resp = create_binding_response(req, mapped);
         co_await send_stun_request(sender, resp);
         log(LogLevel::Debug,
             "Sent BINDING_RESPONSE_SUCCESS to " + sender.address().to_string() + ":" + std::to_string(sender.port()));
@@ -1093,52 +1110,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 break;  // Exit after nominating the pair
             }
         }
-    }
-
-    // Helper Function to Handle Role Negotiation
-    void handle_role_negotiation(const StunMessage &req) {
-        bool is_controlling = false;
-        bool is_controlled = false;
-        auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
-        auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
-
-        if (ice_controlling_opt.has_value()) {
-            is_controlling = true;
-            uint64_t remote_tie_breaker = ice_controlling_opt.value();
-            // Compare tie-breakers to negotiate roles
-            if (remote_tie_breaker > local_ice_attributes_.tie_breaker) {
-                local_ice_attributes_.role = IceRole::Controlled;
-            } else if (remote_tie_breaker < local_ice_attributes_.tie_breaker) {
-                local_ice_attributes_.role = IceRole::Controller;
-            }
-        }
-
-        if (ice_controlled_opt.has_value()) {
-            is_controlled = true;
-            uint64_t remote_tie_breaker = ice_controlled_opt.value();
-            // Compare tie-breakers to negotiate roles
-            if (remote_tie_breaker > local_ice_attributes_.tie_breaker) {
-                local_ice_attributes_.role = IceRole::Controller;
-            } else if (remote_tie_breaker < local_ice_attributes_.tie_breaker) {
-                local_ice_attributes_.role = IceRole::Controlled;
-            }
-        }
-
-        log(LogLevel::Info, "Negotiated role => " + ice_role_to_string(local_ice_attributes_.role));
-    }
-
-    // Helper Function to Create Binding Response
-    StunMessage create_binding_response(const StunMessage &req, const asio::ip::udp::endpoint &mapped) {
-        StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
-
-        // Add MAPPED-ADDRESS attribute
-        resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
-
-        // Add MESSAGE-INTEGRITY and FINGERPRINT
-        resp.add_message_integrity(local_ice_attributes_.pwd);  // Use local pwd
-        resp.add_fingerprint();
-
-        return resp;
     }
 
     asio::awaitable<void> handle_binding_indication(const StunMessage &ind, const asio::ip::udp::endpoint &sender) {}
@@ -1169,63 +1140,32 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 }
 
                 // Add remote candidates
-                add_remote_candidate(rcands);
+                for (const auto &cand : rcands) add_remote_candidate(cand);
             } catch (const std::exception &ex) {
                 transition_to_state(IceConnectionState::Failed);
-                log(LogLevel::Error, std::string("handle_incoming_signaling_messages exception: ") + ex.what());
+                log(LogLevel::Error, "handle_incoming_signaling_messages exception: {}", ex.what());
             }
         }
     }
 
-    // Add remote candidates received via signaling
-    void add_remote_candidate(const std::vector<Candidate> &cands) {
-        auto size = remote_candidates_.size();
-        for (auto &c : cands) {
-            // 중복된 후보자 체크
-            bool exists = false;
-            for (const auto &existing_cand : remote_candidates_) {
-                if (existing_cand.endpoint == c.endpoint && existing_cand.type == c.type) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) {
-                remote_candidates_.push_back(c);
-                if (candidate_callback_) {
-                    candidate_callback_(c);
-                }
-                log(LogLevel::Debug, "Added remote candidate: " + c.to_sdp());
-            }
-        }
+    // TODO: 동일 candidate가 추가되지 않게 옵션으로 변수추가.
+    void add_remote_candidate(const Candidate &cand) {
+        bool known = std::any_of(remote_candidates_.begin(), remote_candidates_.end(),
+                                 [&](const auto &rc) { return cand == rc; });
 
-        if (size != remote_candidates_.size()) {
+        if (!known && !cand.endpoint.address().is_unspecified()) {
+            remote_candidates_.emplace_back(cand);
+            if (candidate_callback_) {
+                candidate_callback_(cand);
+            }
+            log(LogLevel::Debug, "new candidate: {}", cand);
+
             // If trickle ICE is enabled or Full Ice, handle additional candidates as they arrive
             if (mode_ == IceMode::Full || local_ice_attributes_.has_option(IceOption::Trickle)) {
-                asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
-            }
-        }
-    }
-
-    // Helper Function to Add Peer-Reflexive (PRFLX) Candidate
-    void add_prflx_candidate(const asio::ip::udp::endpoint &mapped) {
-        bool known = false;
-        for (const auto &rc : remote_candidates_) {
-            if (rc.endpoint == mapped) {
-                known = true;
-                break;
-            }
-        }
-
-        if (!known && !mapped.address().is_unspecified()) {
-            // Add to remote candidates and notify via callback
-            const auto &prflx = remote_candidates_.emplace_back((mapped, CandidateType::PeerReflexive));
-            if (candidate_callback_) {
-                candidate_callback_(prflx);
-            }
-            log(LogLevel::Debug, "Discovered new Peer-Reflexive candidate: " + prflx.to_sdp());
-
-            if (mode_ == IceMode::Full) {
-                // asio::co_spawn(perform_connectivity_checks(), asio::dispatch);
+                if (connectivity_check_in_progress_) {
+                } else {
+                    asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
+                }
             }
         }
     }
@@ -1284,10 +1224,12 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     // Logging function
-    void log(LogLevel lvl, const std::string &msg) {
+    void log(LogLevel lvl, const std::string &msg_template, auto &&...args) {
         if (static_cast<int>(lvl) < static_cast<int>(log_level_))
             return;
-        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << msg << std::endl;
+
+        std::string formatted_msg = std::format(msg_template, std::forward<decltype(args)>(args)...);
+        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << formatted_msg << std::endl;
     }
 
     // Convert LogLevel to string
