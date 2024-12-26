@@ -199,11 +199,15 @@ struct CandidatePair {
     Candidate local_candidate;
     Candidate remote_candidate;
     uint64_t priority;
-    CandidatePair() = default;
-    CandidatePair(const Candidate &l, const Candidate &r) : local_candidate(l), remote_candidate(r), priority(0) {}
+    CandidatePair(const Candidate &l, const Candidate &r)
+        : local_candidate(l),
+          remote_candidate(r),
+          priority(((std::min(l.priority, r.priority)) << 32) |  // RFC 8445 Section 5.7.2에 따른 쌍 우선순위 계산
+                   ((static_cast<uint64_t>(std::max(l.priority, r.priority)) * 2)) |
+                   ((l.priority > r.priority) ? 1 : 0)) {}
 };
 
-enum class CandidatePairState { New, InProgress, Failed, Succeeded, Nominated };
+enum class CandidatePairState { New, Frozen, InProgress, Failed, Succeeded, Nominated };
 
 struct CheckListEntry {
     CandidatePair pair;
@@ -375,7 +379,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 try {
                     // 상태 초기화
                     nominated_pair_ = std::nullopt;
-
+                    // #TODO check_list 동기화
                     check_list_.clear();
                     remote_candidates_.clear();
                     local_candidates_.clear();
@@ -608,18 +612,18 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // 연결성 검사 수행
+    // 연결성 검사 수행 #TODO (perform_connectivity_checks 동시에 처리해야함.)
     asio::awaitable<void> perform_connectivity_checks() {
         if (connectivity_check_in_progress_.exchange(true)) {
             co_return;  // 이미 실행 중이면 종료
         }
 
+        // #TODO check_list 동기화
         check_list_.clear();
         for (auto &rc : remote_candidates_) {
             for (auto &lc : local_candidates_) {
                 if (lc.component_id == rc.component_id) {
                     CandidatePair cp(lc, rc);
-                    cp.priority = calculate_priority_pair(lc, rc);
                     check_list_.emplace_back(cp);
                 }
             }
@@ -635,6 +639,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             while (true) {
                 bool progress = false;
 
+                // #TODO check_list 동기화
                 while (active_tasks < max_concurrency) {
                     if (next_pair >= check_list_.size()) {
                         break;
@@ -671,18 +676,27 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
             // Evaluate connectivity results after checks
             bool any_success = false;
-            for (auto &e : check_list_) {
-                if (e.state == CandidatePairState::Succeeded && !e.is_nominated) {
-                    if (co_await nominate_pair(e)) {
-                        any_success = true;
-                        break;
-                    }
-                }
-            }
             if (any_success) {
                 transition_to_state(IceConnectionState::Completed);
                 log(LogLevel::Info, "ICE completed established.");
 
+                // Freeze remaining candidate pairs
+                for (auto &entry : check_list_) {
+                    if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
+                        entry.state = CandidatePairState::Frozen;
+                        log(LogLevel::Debug, "Candidate pair frozen: {} <-> {}", entry.pair.local_candidate.to_sdp(),
+                            entry.pair.remote_candidate.to_sdp());
+                    }
+                }
+
+                // #TODO 여기도 정리 Start consent freshness and TURN refresh if applicable
+                if (mode_ == IceMode::Full) {
+                    asio::co_spawn(strand_, perform_consent_freshness(), asio::detached);
+                }
+                if (!relay_endpoint_.address().is_unspecified()) {
+                    asio::co_spawn(strand_, perform_turn_refresh(), asio::detached);
+                }
+                asio::co_spawn(strand_, start_data_receive(), asio::detached);
             } else {
                 transition_to_state(IceConnectionState::Failed);
                 log(LogLevel::Error, "All connectivity checks failed.");
@@ -695,6 +709,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // Perform a single connectivity check
     asio::awaitable<void> perform_single_connectivity_check(CheckListEntry &entry) {
+        if (entry.state == CandidatePairState::Frozen) {
+            co_return;  // Skip frozen pairs
+        }
         const auto &pair = entry.pair;
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
@@ -731,7 +748,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
                 StunMessage resp = resp_opt.value();
                 auto mapped_opt = resp.get_mapped_address();
-
                 if (mapped_opt.has_value()) {
                     add_remote_candidate({mapped_opt.value(), CandidateType::PeerReflexive});
                 }
@@ -747,6 +763,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
+    // thread1 shared socket send & receive
+    // thread2 shared socket send & receive
+    // thread3 shared socket send & receive
     // Send STUN request with optional message integrity verification
     asio::awaitable<std::optional<StunMessage>> send_stun_request(
         const asio::ip::udp::endpoint &dest, const StunMessage &request, const std::string &remote_pwd = "",
@@ -886,7 +905,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return true;
     }
 
-    // Consent Freshness
+    // Consent Freshness perform_consent_freshness
     asio::awaitable<void> perform_consent_freshness() {
         while (current_state_ == IceConnectionState::Connected || current_state_ == IceConnectionState::Completed) {
             asio::steady_timer t(strand_);
@@ -1191,8 +1210,15 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             // If trickle ICE is enabled or Full Ice, handle additional candidates as they arrive
             if (mode_ == IceMode::Full || local_ice_attributes_.has_option(IceOption::Trickle)) {
                 if (connectivity_check_in_progress_) {
+                    CandidatePair new_pair(local_candidates_.front(), cand);  // 기본적으로 로컬 후보와 매칭
+                    CheckListEntry entry(new_pair);
+                    entry.state = CandidatePairState::Frozen;
+
+                    // 체크리스트에 추가 및 재정렬
+                    check_list_.push_back(entry);
+                    sort_candidate_pairs();
                 } else {
-                    asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
+                    asio::co_spawn(io_context_, perform_connectivity_checks(), asio::detached);
                 }
             }
         }
@@ -1237,12 +1263,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             default:
                 return "Unknown";
         }
-    }
-
-    // RFC 8445 Section 5.7.2에 따른 쌍 우선순위 계산
-    uint64_t calculate_priority_pair(const Candidate &l, const Candidate &r) const {
-        return ((std::min(l.priority, r.priority)) << 32) |
-               ((static_cast<uint64_t>(std::max(l.priority, r.priority)) * 2)) | ((l.priority > r.priority) ? 1 : 0);
     }
 
     // Sort candidate pairs based on priority
