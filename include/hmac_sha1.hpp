@@ -195,30 +195,103 @@ class HmacSha1 {
 // AVX2 최적화된 HMAC-SHA1 구현
 #if __has_include(<immintrin.h>)
     static std::vector<uint8_t> hmac_avx2(const std::string &key, const std::vector<uint8_t> &data) {
-        // AVX2를 활용한 최적화된 HMAC-SHA1 구현
-        // 실제 구현에서는 AVX2 명령어를 활용하여 병렬 처리 등을 수행해야 합니다.
-        // 여기서는 예시로 기본 구현을 호출합니다.
-        return hmac_generic(key, data);
+        const size_t block_size = 64;  // SHA-1 block size
+        const size_t hash_size = 20;   // SHA-1 output size
+
+        std::vector<uint8_t> key_pad(block_size, 0);
+        if (key.size() > block_size) {
+            // Hash the key using AVX2-optimized SHA1
+            std::vector<uint8_t> hashed_key =
+                SHA1::sha1_avx2(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
+        } else {
+            // Pad the key with zeros
+            std::copy(key.begin(), key.end(), key_pad.begin());
+        }
+
+        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
+        std::vector<uint8_t> i_key_pad(block_size, 0x36);
+        for (size_t i = 0; i < block_size; ++i) {
+            o_key_pad[i] ^= key_pad[i];
+            i_key_pad[i] ^= key_pad[i];
+        }
+
+        // Compute inner hash using AVX2-optimized SHA1
+        std::vector<uint8_t> inner_hash = SHA1::sha1_avx2(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
+        // Compute outer hash using AVX2-optimized SHA1
+        std::vector<uint8_t> result =
+            SHA1::sha1_avx2(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+
+        return result;
     }
 #endif
 
 // SSE4.2 최적화된 HMAC-SHA1 구현
 #if __has_include(<nmmintrin.h>)
     static std::vector<uint8_t> hmac_sse42(const std::string &key, const std::vector<uint8_t> &data) {
-        // SSE4.2를 활용한 최적화된 HMAC-SHA1 구현
-        // 실제 구현에서는 SSE4.2 명령어를 활용하여 병렬 처리 등을 수행해야 합니다.
-        // 여기서는 예시로 기본 구현을 호출합니다.
-        return hmac_generic(key, data);
+        const size_t block_size = 64;  // SHA-1 block size
+        const size_t hash_size = 20;   // SHA-1 output size
+
+        std::vector<uint8_t> key_pad(block_size, 0);
+        if (key.size() > block_size) {
+            // Hash the key using SSE4.2-optimized SHA1
+            std::vector<uint8_t> hashed_key =
+                SHA1::sha1_sse42(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
+        } else {
+            // Pad the key with zeros
+            std::copy(key.begin(), key.end(), key_pad.begin());
+        }
+
+        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
+        std::vector<uint8_t> i_key_pad(block_size, 0x36);
+        for (size_t i = 0; i < block_size; ++i) {
+            o_key_pad[i] ^= key_pad[i];
+            i_key_pad[i] ^= key_pad[i];
+        }
+
+        // Compute inner hash using SSE4.2-optimized SHA1
+        std::vector<uint8_t> inner_hash =
+            SHA1::sha1_sse42(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
+        // Compute outer hash using SSE4.2-optimized SHA1
+        std::vector<uint8_t> result =
+            SHA1::sha1_sse42(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+
+        return result;
     }
 #endif
 
 // NEON 최적화된 HMAC-SHA1 구현
 #if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_SIMULATOR))
     static std::vector<uint8_t> hmac_neon(const std::string &key, const std::vector<uint8_t> &data) {
-        // NEON을 활용한 최적화된 HMAC-SHA1 구현
-        // 실제 구현에서는 NEON 명령어를 활용하여 병렬 처리 등을 수행해야 합니다.
-        // 여기서는 예시로 기본 구현을 호출합니다.
-        return hmac_generic(key, data);
+        const size_t block_size = 64;  // SHA-1 block size
+        const size_t hash_size = 20;   // SHA-1 output size
+
+        std::vector<uint8_t> key_pad(block_size, 0);
+        if (key.size() > block_size) {
+            // Hash the key using NEON-optimized SHA1
+            std::vector<uint8_t> hashed_key =
+                SHA1::sha1_neon(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
+        } else {
+            // Pad the key with zeros
+            std::copy(key.begin(), key.end(), key_pad.begin());
+        }
+
+        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
+        std::vector<uint8_t> i_key_pad(block_size, 0x36);
+        for (size_t i = 0; i < block_size; ++i) {
+            o_key_pad[i] ^= key_pad[i];
+            i_key_pad[i] ^= key_pad[i];
+        }
+
+        // Compute inner hash using NEON-optimized SHA1
+        std::vector<uint8_t> inner_hash = SHA1::sha1_neon(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
+        // Compute outer hash using NEON-optimized SHA1
+        std::vector<uint8_t> result =
+            SHA1::sha1_neon(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+
+        return result;
     }
 #endif
 
@@ -298,11 +371,6 @@ class HmacSha1 {
 
 #if __has_include(<immintrin.h>)
         static std::vector<uint8_t> sha1_avx2(const uint8_t *data, size_t size) {
-            // AVX2를 활용한 최적화된 SHA1 구현 예제
-            // 실제 구현에서는 256비트 레지스터를 활용하여 데이터 블록을 병렬로 처리합니다.
-            // 여기서는 기본 구현을 호출하지만, 실제로는 AVX2 명령어를 활용하여 병렬 처리를 구현해야 합니다.
-
-            // 예시: 데이터 블록을 32바이트씩 처리
             std::array<uint32_t, 5> h = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
             const uint64_t bit_length = size * 8;
 
@@ -319,46 +387,121 @@ class HmacSha1 {
 
             size_t chunk_count = padded_data.size() / 64;
             for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
-                __m256i w_avx = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&padded_data[chunk * 64]));
+                // Load the 64-byte chunk into two AVX2 registers (32 bytes each)
+                __m256i data_low_avx = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&padded_data[chunk * 64]));
+                __m256i data_high_avx =
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&padded_data[chunk * 64 + 32]));
 
-                // 실제로는 AVX2를 활용하여 w 배열을 벡터화하여 처리
-                // 여기서는 간단히 기본 구현을 호출
+                // Convert bytes to 32-bit words (big endian)
+                alignas(32) uint32_t w_temp[16];
+                // Use AVX2 to unpack bytes into 32-bit words
+                __m256i shuffled_low = _mm256_shuffle_epi8(
+                    data_low_avx, _mm256_set_epi8(28, 29, 30, 31, 24, 25, 26, 27, 20, 21, 22, 23, 16, 17, 18, 19, 12,
+                                                  13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3));
+                __m256i shuffled_high = _mm256_shuffle_epi8(
+                    data_high_avx, _mm256_set_epi8(28, 29, 30, 31, 24, 25, 26, 27, 20, 21, 22, 23, 16, 17, 18, 19, 12,
+                                                   13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3));
+
+                _mm256_store_si256(reinterpret_cast<__m256i *>(w_temp), shuffled_low);
+                _mm256_store_si256(reinterpret_cast<__m256i *>(&w_temp[8]), shuffled_high);
+
+                // Initialize W[0..15]
                 std::array<uint32_t, 80> w = {0};
                 for (size_t i = 0; i < 16; ++i) {
-                    w[i] = (padded_data[chunk * 64 + i * 4] << 24) | (padded_data[chunk * 64 + i * 4 + 1] << 16) |
-                           (padded_data[chunk * 64 + i * 4 + 2] << 8) | padded_data[chunk * 64 + i * 4 + 3];
+                    w[i] = w_temp[i];
                 }
 
-                for (size_t i = 16; i < 80; ++i) {
-                    w[i] = rotate_left(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-                }
+                // Expand W[16..79] using AVX2 intrinsics
+                for (size_t i = 16; i < 80; i += 8) {
+                    size_t remaining = (i + 8 > 80) ? 80 - i : 8;
 
-                uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+                    // Load previous words
+                    __m256i w_m3 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 3]));
+                    __m256i w_m8 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 8]));
+                    __m256i w_m14 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 14]));
+                    __m256i w_m16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 16]));
 
-                for (size_t i = 0; i < 80; ++i) {
-                    uint32_t f, k;
-                    if (i < 20) {
-                        f = (b & c) | ((~b) & d);
-                        k = 0x5A827999;
-                    } else if (i < 40) {
-                        f = b ^ c ^ d;
-                        k = 0x6ED9EBA1;
-                    } else if (i < 60) {
-                        f = (b & c) | (b & d) | (c & d);
-                        k = 0x8F1BBCDC;
-                    } else {
-                        f = b ^ c ^ d;
-                        k = 0xCA62C1D6;
+                    // XOR the previous words
+                    __m256i temp = _mm256_xor_si256(w_m3, w_m8);
+                    temp = _mm256_xor_si256(temp, w_m14);
+                    temp = _mm256_xor_si256(temp, w_m16);
+
+                    // Rotate left by 1
+                    __m256i rotated = _mm256_or_si256(_mm256_slli_epi32(temp, 1), _mm256_srli_epi32(temp, 31));
+
+                    // Store the rotated words back to W
+                    alignas(32) uint32_t rotated_temp[8];
+                    _mm256_store_si256(reinterpret_cast<__m256i *>(rotated_temp), rotated);
+
+                    for (size_t j = 0; j < remaining; ++j) {
+                        w[i + j] = rotated_temp[j];
                     }
-
-                    uint32_t temp = rotate_left(a, 5) + f + e + k + w[i];
-                    e = d;
-                    d = c;
-                    c = rotate_left(b, 30);
-                    b = a;
-                    a = temp;
                 }
 
+                // Initialize working variables
+                uint32_t a = h[0];
+                uint32_t b = h[1];
+                uint32_t c = h[2];
+                uint32_t d = h[3];
+                uint32_t e = h[4];
+
+                // Process the 80 rounds with loop unrolling
+                for (size_t i = 0; i < 80; i += 5) {
+                    // Round 1: 0-19
+                    if (i < 20) {
+                        for (size_t j = 0; j < 5 && (i + j) < 20; ++j) {
+                            uint32_t f = (b & c) | ((~b) & d);
+                            uint32_t k = 0x5A827999;
+                            uint32_t temp = rotate_left(a, 5) + f + e + k + w[i + j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp;
+                        }
+                    }
+                    // Round 2: 20-39
+                    else if (i < 40) {
+                        for (size_t j = 0; j < 5 && (i + j) < 40; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0x6ED9EBA1;
+                            uint32_t temp = rotate_left(a, 5) + f + e + k + w[i + j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp;
+                        }
+                    }
+                    // Round 3: 40-59
+                    else if (i < 60) {
+                        for (size_t j = 0; j < 5 && (i + j) < 60; ++j) {
+                            uint32_t f = (b & c) | (b & d) | (c & d);
+                            uint32_t k = 0x8F1BBCDC;
+                            uint32_t temp = rotate_left(a, 5) + f + e + k + w[i + j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp;
+                        }
+                    }
+                    // Round 4: 60-79
+                    else {
+                        for (size_t j = 0; j < 5 && (i + j) < 80; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0xCA62C1D6;
+                            uint32_t temp = rotate_left(a, 5) + f + e + k + w[i + j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp;
+                        }
+                    }
+                }
+
+                // Add this chunk's hash to the result so far
                 h[0] += a;
                 h[1] += b;
                 h[2] += c;
@@ -366,7 +509,9 @@ class HmacSha1 {
                 h[4] += e;
             }
 
+            // Produce the final hash value (big-endian)
             std::vector<uint8_t> hash;
+            hash.reserve(20);
             for (uint32_t val : h) {
                 hash.push_back((val >> 24) & 0xFF);
                 hash.push_back((val >> 16) & 0xFF);
@@ -376,7 +521,6 @@ class HmacSha1 {
 
             return hash;
         }
-
         static std::vector<uint8_t> sha1_avx2(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
             std::vector<uint8_t> combined(size1 + size2);
             std::memcpy(combined.data(), data1, size1);
@@ -387,11 +531,6 @@ class HmacSha1 {
 
 #if __has_include(<nmmintrin.h>)
         static std::vector<uint8_t> sha1_sse42(const uint8_t *data, size_t size) {
-            // SSE4.2를 활용한 최적화된 SHA1 구현 예제
-            // 실제 구현에서는 SSE4.2 명령어를 활용하여 데이터 블록을 병렬로 처리합니다.
-            // 여기서는 기본 구현을 호출하지만, 실제로는 SSE4.2 명령어를 활용하여 병렬 처리를 구현해야 합니다.
-
-            // 예시: 데이터 블록을 16바이트씩 처리
             std::array<uint32_t, 5> h = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
             const uint64_t bit_length = size * 8;
 
@@ -408,46 +547,126 @@ class HmacSha1 {
 
             size_t chunk_count = padded_data.size() / 64;
             for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
-                __m128i w_sse = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&padded_data[chunk * 64]));
+                // Load the 64-byte chunk into two SSE4.2 registers (16 bytes each)
+                __m128i data_low_sse = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&padded_data[chunk * 64]));
+                __m128i data_high_sse =
+                    _mm_loadu_si128(reinterpret_cast<const __m128i *>(&padded_data[chunk * 64 + 16]));
 
-                // 실제로는 SSE4.2를 활용하여 w 배열을 벡터화하여 처리
-                // 여기서는 간단히 기본 구현을 호출
+                // Convert bytes to 32-bit words (big endian) using SSE4.2 intrinsics
+                alignas(16) uint32_t w_temp[8];
+                // Shuffle bytes to form big-endian words
+                const __m128i shuffle_mask = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+
+                __m128i shuffled_low = _mm_shuffle_epi8(data_low_sse, shuffle_mask);
+                __m128i shuffled_high = _mm_shuffle_epi8(data_high_sse, shuffle_mask);
+
+                _mm_store_si128(reinterpret_cast<__m128i *>(w_temp), shuffled_low);
+                _mm_store_si128(reinterpret_cast<__m128i *>(&w_temp[4]), shuffled_high);
+
+                // Initialize W[0..15]
                 std::array<uint32_t, 80> w = {0};
-                for (size_t i = 0; i < 16; ++i) {
-                    w[i] = (padded_data[chunk * 64 + i * 4] << 24) | (padded_data[chunk * 64 + i * 4 + 1] << 16) |
-                           (padded_data[chunk * 64 + i * 4 + 2] << 8) | padded_data[chunk * 64 + i * 4 + 3];
+                for (size_t i = 0; i < 8; ++i) {
+                    w[i] = w_temp[i];
+                }
+                for (size_t i = 8; i < 16; ++i) {
+                    w[i] = w_temp[i - 8];
                 }
 
-                for (size_t i = 16; i < 80; ++i) {
-                    w[i] = rotate_left(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-                }
+                // Expand W[16..79] using SSE4.2 intrinsics
+                for (size_t i = 16; i < 80; i += 4) {
+                    size_t remaining = (i + 4 > 80) ? 80 - i : 4;
 
-                uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+                    // Load previous words
+                    __m128i w_m3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 3]));
+                    __m128i w_m8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 8]));
+                    __m128i w_m14 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 14]));
+                    __m128i w_m16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 16]));
 
-                for (size_t i = 0; i < 80; ++i) {
-                    uint32_t f, k;
-                    if (i < 20) {
-                        f = (b & c) | ((~b) & d);
-                        k = 0x5A827999;
-                    } else if (i < 40) {
-                        f = b ^ c ^ d;
-                        k = 0x6ED9EBA1;
-                    } else if (i < 60) {
-                        f = (b & c) | (b & d) | (c & d);
-                        k = 0x8F1BBCDC;
-                    } else {
-                        f = b ^ c ^ d;
-                        k = 0xCA62C1D6;
+                    // XOR the previous words
+                    __m128i temp = _mm_xor_si128(w_m3, w_m8);
+                    temp = _mm_xor_si128(temp, w_m14);
+                    temp = _mm_xor_si128(temp, w_m16);
+
+                    // Rotate left by 1
+                    __m128i rotated = _mm_or_si128(_mm_slli_epi32(temp, 1), _mm_srli_epi32(temp, 31));
+
+                    // Store the rotated words back to W
+                    alignas(16) uint32_t rotated_temp[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(rotated_temp), rotated);
+
+                    for (size_t j = 0; j < remaining; ++j) {
+                        w[i + j] = rotated_temp[j];
                     }
-
-                    uint32_t temp = rotate_left(a, 5) + f + e + k + w[i];
-                    e = d;
-                    d = c;
-                    c = rotate_left(b, 30);
-                    b = a;
-                    a = temp;
                 }
 
+                // Initialize working variables
+                uint32_t a = h[0];
+                uint32_t b = h[1];
+                uint32_t c = h[2];
+                uint32_t d = h[3];
+                uint32_t e = h[4];
+
+                // Process the 80 rounds with loop unrolling
+                for (size_t i = 0; i < 80; i += 4) {
+                    // Round 1: 0-19
+                    if (i < 20) {
+                        size_t end = (i + 4 < 20) ? i + 4 : 20;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = (b & c) | ((~b) & d);
+                            uint32_t k = 0x5A827999;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 2: 20-39
+                    else if (i < 40) {
+                        size_t end = (i + 4 < 40) ? i + 4 : 40;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0x6ED9EBA1;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 3: 40-59
+                    else if (i < 60) {
+                        size_t end = (i + 4 < 60) ? i + 4 : 60;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = (b & c) | (b & d) | (c & d);
+                            uint32_t k = 0x8F1BBCDC;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 4: 60-79
+                    else {
+                        size_t end = (i + 4 < 80) ? i + 4 : 80;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0xCA62C1D6;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                }
+
+                // Add this chunk's hash to the result so far
                 h[0] += a;
                 h[1] += b;
                 h[2] += c;
@@ -455,7 +674,9 @@ class HmacSha1 {
                 h[4] += e;
             }
 
+            // Produce the final hash value (big-endian)
             std::vector<uint8_t> hash;
+            hash.reserve(20);
             for (uint32_t val : h) {
                 hash.push_back((val >> 24) & 0xFF);
                 hash.push_back((val >> 16) & 0xFF);
@@ -476,11 +697,6 @@ class HmacSha1 {
 
 #if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_SIMULATOR))
         static std::vector<uint8_t> sha1_neon(const uint8_t *data, size_t size) {
-            // NEON을 활용한 최적화된 SHA1 구현 예제
-            // 실제 구현에서는 NEON 명령어를 활용하여 데이터 블록을 병렬로 처리합니다.
-            // 여기서는 기본 구현을 호출하지만, 실제로는 NEON 명령어를 활용하여 병렬 처리를 구현해야 합니다.
-
-            // 예시: 데이터 블록을 16바이트씩 처리
             std::array<uint32_t, 5> h = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
             const uint64_t bit_length = size * 8;
 
@@ -497,46 +713,123 @@ class HmacSha1 {
 
             size_t chunk_count = padded_data.size() / 64;
             for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
-                uint8x16_t w_neon = vld1q_u8(&padded_data[chunk * 64]);
+                // Load the 64-byte chunk into NEON registers
+                uint8x16_t data_low_neon = vld1q_u8(&padded_data[chunk * 64]);
+                uint8x16_t data_high_neon = vld1q_u8(&padded_data[chunk * 64 + 16]);
 
-                // 실제로는 NEON을 활용하여 w 배열을 벡터화하여 처리
-                // 여기서는 간단히 기본 구현을 호출
+                // Convert bytes to 32-bit words (big endian) using NEON intrinsics
+                alignas(16) uint32_t w_temp[8];
+                // Swap byte order for big endian
+                uint32x4_t w0 = vreinterpretq_u32_u8(vrev32q_u8(data_low_neon));
+                uint32x4_t w1 = vreinterpretq_u32_u8(vrev32q_u8(data_high_neon));
+
+                vst1q_u32(&w_temp[0], w0);
+                vst1q_u32(&w_temp[4], w1);
+
+                // Initialize W[0..15]
                 std::array<uint32_t, 80> w = {0};
-                for (size_t i = 0; i < 16; ++i) {
-                    w[i] = (padded_data[chunk * 64 + i * 4] << 24) | (padded_data[chunk * 64 + i * 4 + 1] << 16) |
-                           (padded_data[chunk * 64 + i * 4 + 2] << 8) | padded_data[chunk * 64 + i * 4 + 3];
+                for (size_t i = 0; i < 8; ++i) {
+                    w[i] = w_temp[i];
+                }
+                for (size_t i = 8; i < 16; ++i) {
+                    w[i] = w_temp[i - 8];
                 }
 
-                for (size_t i = 16; i < 80; ++i) {
-                    w[i] = rotate_left(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-                }
+                // Expand W[16..79] using NEON intrinsics
+                for (size_t i = 16; i < 80; i += 4) {
+                    size_t remaining = (i + 4 > 80) ? 80 - i : 4;
 
-                uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+                    // Load previous words
+                    uint32x4_t w_m3 = vld1q_u32(&w[i - 3]);
+                    uint32x4_t w_m8 = vld1q_u32(&w[i - 8]);
+                    uint32x4_t w_m14 = vld1q_u32(&w[i - 14]);
+                    uint32x4_t w_m16 = vld1q_u32(&w[i - 16]);
 
-                for (size_t i = 0; i < 80; ++i) {
-                    uint32_t f, k;
-                    if (i < 20) {
-                        f = (b & c) | ((~b) & d);
-                        k = 0x5A827999;
-                    } else if (i < 40) {
-                        f = b ^ c ^ d;
-                        k = 0x6ED9EBA1;
-                    } else if (i < 60) {
-                        f = (b & c) | (b & d) | (c & d);
-                        k = 0x8F1BBCDC;
-                    } else {
-                        f = b ^ c ^ d;
-                        k = 0xCA62C1D6;
+                    // XOR the previous words
+                    uint32x4_t temp = veorq_u32(w_m3, w_m8);
+                    temp = veorq_u32(temp, w_m14);
+                    temp = veorq_u32(temp, w_m16);
+
+                    // Rotate left by 1
+                    uint32x4_t rotated = vorrq_u32(vshlq_n_u32(temp, 1), vshrq_n_u32(temp, 31));
+
+                    // Store the rotated words back to W
+                    alignas(16) uint32_t rotated_temp[4];
+                    vst1q_u32(rotated_temp, rotated);
+
+                    for (size_t j = 0; j < remaining; ++j) {
+                        w[i + j] = rotated_temp[j];
                     }
-
-                    uint32_t temp = rotate_left(a, 5) + f + e + k + w[i];
-                    e = d;
-                    d = c;
-                    c = rotate_left(b, 30);
-                    b = a;
-                    a = temp;
                 }
 
+                // Initialize working variables
+                uint32_t a = h[0];
+                uint32_t b = h[1];
+                uint32_t c = h[2];
+                uint32_t d = h[3];
+                uint32_t e = h[4];
+
+                // Process the 80 rounds with loop unrolling
+                for (size_t i = 0; i < 80; i += 4) {
+                    // Round 1: 0-19
+                    if (i < 20) {
+                        size_t end = (i + 4 < 20) ? i + 4 : 20;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = (b & c) | ((~b) & d);
+                            uint32_t k = 0x5A827999;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 2: 20-39
+                    else if (i < 40) {
+                        size_t end = (i + 4 < 40) ? i + 4 : 40;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0x6ED9EBA1;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 3: 40-59
+                    else if (i < 60) {
+                        size_t end = (i + 4 < 60) ? i + 4 : 60;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = (b & c) | (b & d) | (c & d);
+                            uint32_t k = 0x8F1BBCDC;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                    // Round 4: 60-79
+                    else {
+                        size_t end = (i + 4 < 80) ? i + 4 : 80;
+                        for (size_t j = i; j < end; ++j) {
+                            uint32_t f = b ^ c ^ d;
+                            uint32_t k = 0xCA62C1D6;
+                            uint32_t temp_val = rotate_left(a, 5) + f + e + k + w[j];
+                            e = d;
+                            d = c;
+                            c = rotate_left(b, 30);
+                            b = a;
+                            a = temp_val;
+                        }
+                    }
+                }
+
+                // Add this chunk's hash to the result so far
                 h[0] += a;
                 h[1] += b;
                 h[2] += c;
@@ -544,7 +837,9 @@ class HmacSha1 {
                 h[4] += e;
             }
 
+            // Produce the final hash value (big-endian)
             std::vector<uint8_t> hash;
+            hash.reserve(20);
             for (uint32_t val : h) {
                 hash.push_back((val >> 24) & 0xFF);
                 hash.push_back((val >> 16) & 0xFF);
