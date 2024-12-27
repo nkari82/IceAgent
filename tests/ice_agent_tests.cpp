@@ -1,103 +1,69 @@
 // test/test_ice_agent.cpp
 
-#include <ice_agent.hpp>
 #include <asio.hpp>
+#include <ice_agent.hpp>
 #include <iostream>
 #include <thread>
 
 // Callback functions
-void on_state_change(IceConnectionState state)
-{
+void on_state_change(IceConnectionState state) {
     std::cout << "ICE State Changed: " << static_cast<int>(state) << std::endl;
 }
 
-void on_candidate(const Candidate &candidate)
-{
+void on_candidate(const Candidate &candidate) {
     std::cout << "Candidate gathered: " << candidate.to_sdp() << std::endl;
 }
 
-void on_data(const std::vector<uint8_t> &data, const asio::ip::udp::endpoint &sender)
-{
+void on_data(const std::vector<uint8_t> &data, const asio::ip::udp::endpoint &sender) {
     std::string msg(data.begin(), data.end());
-    std::cout << "Received data from " << sender.address().to_string() << ":" << sender.port() << " - " << msg << std::endl;
+    std::cout << "Received data from " << sender.address().to_string() << ":" << sender.port() << " - " << msg
+              << std::endl;
 }
 
-void on_nat_type_detected(NatType nat_type)
-{
-    std::cout << "NAT Type Detected: ";
-    switch (nat_type)
-    {
-    case NatType::FullCone:
-        std::cout << "Full Cone";
-        break;
-    case NatType::RestrictedCone:
-        std::cout << "Restricted Cone";
-        break;
-    case NatType::PortRestrictedCone:
-        std::cout << "Port Restricted Cone";
-        break;
-    case NatType::Symmetric:
-        std::cout << "Symmetric";
-        break;
-    case NatType::OpenInternet:
-        std::cout << "Open Internet";
-        break;
-    default:
-        std::cout << "Unknown";
-        break;
-    }
-    std::cout << std::endl;
-}
-
-void on_nominate(const CandidatePair &pair)
-{
+void on_nominate(const CandidatePair &pair) {
     std::cout << "Nominated Pair: " << pair.remote_candidate.to_sdp() << std::endl;
 }
 
-int main()
-{
-    try
-    {
+int main() {
+    try {
         asio::io_context io_context;
 
         // Initialize Signaling Client
         // 이 테스트에서는 signaling 서버가 필요하므로, 실제 서버를 실행 중이어야 합니다.
         // 또는 로컬에서 간단한 TCP 서버를 실행하여 테스트할 수 있습니다.
-        auto signaling_client = std::make_shared<SignalingClient>(io_context, "127.0.0.1", 5000);
+        // auto signaling_client = std::make_shared<SignalingClient>(io_context, "127.0.0.1", 5000);
 
         // Initialize IceAgent
-        IceRole role = IceRole::Controller; // 또는 IceRole::Controlled
-        IceMode mode = IceMode::Full;       // 또는 IceMode::Lite
+        IceRole role = IceRole::Controller;  // 또는 IceRole::Controlled
+        IceMode mode = IceMode::Full;        // 또는 IceMode::Lite
         std::vector<std::string> stun_servers = {"stun.l.google.com:19302"};
-        std::string turn_server = ""; // TURN 서버가 있다면 설정
+        std::string turn_server = "";  // TURN 서버가 있다면 설정
         std::string turn_username = "";
         std::string turn_password = "";
 
-        auto ice_agent = std::make_shared<IceAgent>(io_context, role, mode, stun_servers, turn_server, turn_username, turn_password);
+        auto ice_agent =
+            std::make_shared<IceAgent>(io_context, role, mode, stun_servers, turn_server, turn_username, turn_password);
 
         // Set callbacks
         ice_agent->set_on_state_change_callback(on_state_change);
         ice_agent->set_candidate_callback(on_candidate);
         ice_agent->set_data_callback(on_data);
-        ice_agent->set_nat_type_callback(on_nat_type_detected);
+        // ice_agent->set_nat_type_callback(on_nat_type_detected);
         ice_agent->set_nominate_callback(on_nominate);
-        ice_agent->set_signaling_client(signaling_client);
+        // ice_agent->set_signaling_client(signaling_client);
 
         // Set log level
-        ice_agent->set_log_level(LogLevel::DEBUG);
+        ice_agent->set_log_level(LogLevel::Debug);
 
         // Start ICE process
-        asio::co_spawn(io_context, ice_agent->start(), asio::detached);
+        ice_agent->start();
 
         // Run io_context in separate thread
-        std::thread io_thread([&io_context]()
-                              { io_context.run(); });
+        std::thread io_thread([&io_context]() { io_context.run(); });
 
         // Keep the main thread alive
         io_thread.join();
-    }
-    catch (const std::exception &ex)
-    {
+    } catch (const std::exception &ex) {
         std::cerr << "Exception in main: " << ex.what() << std::endl;
     }
 
