@@ -144,8 +144,14 @@ class HmacSha1 {
     static HMACFunction select_hmac_function() {
         switch (detect_supported_feature()) {
 #if __has_include(<immintrin.h>)
+            case FeatureIndex::AVX:
+                return hmac_avx;
             case FeatureIndex::AVX2:
                 return hmac_avx2;
+#endif
+#if __has_include(<emmintrin.h>)
+            case FeatureIndex::SSE2:
+                return hmac_sse2;
 #endif
 #if __has_include(<nmmintrin.h>)
             case FeatureIndex::SSE42:
@@ -521,11 +527,222 @@ class HmacSha1 {
 
             return hash;
         }
+
         static std::vector<uint8_t> sha1_avx2(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
             std::vector<uint8_t> combined(size1 + size2);
             std::memcpy(combined.data(), data1, size1);
             std::memcpy(combined.data() + size1, data2, size2);
             return sha1_avx2(combined.data(), combined.size());
+        }
+
+        static std::vector<uint8_t> sha1_avx(const uint8_t *data, size_t size) {
+            std::array<uint32_t, 5> h = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+            const uint64_t bit_length = size * 8;
+
+            std::vector<uint8_t> padded_data(data, data + size);
+            padded_data.push_back(0x80);
+
+            while ((padded_data.size() % 64) != 56) {
+                padded_data.push_back(0x00);
+            }
+
+            for (int i = 7; i >= 0; --i) {
+                padded_data.push_back(static_cast<uint8_t>((bit_length >> (i * 8)) & 0xFF));
+            }
+
+            size_t chunk_count = padded_data.size() / 64;
+            for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+                std::array<uint32_t, 80> w = {0};
+                // Load first 16 words
+                for (size_t i = 0; i < 16; ++i) {
+                    w[i] = (padded_data[chunk * 64 + i * 4] << 24) | (padded_data[chunk * 64 + i * 4 + 1] << 16) |
+                           (padded_data[chunk * 64 + i * 4 + 2] << 8) | padded_data[chunk * 64 + i * 4 + 3];
+                }
+
+                // SIMD 최적화를 활용한 메시지 스케줄 확장
+                for (size_t i = 16; i < 80; i += 8) {
+                    __m256i w_m3 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 3]));
+                    __m256i w_m8 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 8]));
+                    __m256i w_m14 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 14]));
+                    __m256i w_m16 = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(&w[i - 16]));
+
+                    __m256i temp = _mm256_xor_si256(w_m3, w_m8);
+                    temp = _mm256_xor_si256(temp, w_m14);
+                    temp = _mm256_xor_si256(temp, w_m16);
+
+                    // Rotate left by 1
+                    __m256i rotated = _mm256_or_si256(_mm256_slli_epi32(temp, 1), _mm256_srli_epi32(temp, 31));
+
+                    // Store the results back
+                    alignas(32) uint32_t rotated_temp[8];
+                    _mm256_store_si256(reinterpret_cast<__m256i *>(rotated_temp), rotated);
+
+                    for (size_t j = 0; j < 8 && (i + j) < 80; ++j) {
+                        w[i + j] = rotated_temp[j];
+                    }
+                }
+
+                uint32_t a = h[0];
+                uint32_t b = h[1];
+                uint32_t c = h[2];
+                uint32_t d = h[3];
+                uint32_t e = h[4];
+
+                for (size_t i = 0; i < 80; ++i) {
+                    uint32_t f, k;
+                    if (i < 20) {
+                        f = (b & c) | ((~b) & d);
+                        k = 0x5A827999;
+                    } else if (i < 40) {
+                        f = b ^ c ^ d;
+                        k = 0x6ED9EBA1;
+                    } else if (i < 60) {
+                        f = (b & c) | (b & d) | (c & d);
+                        k = 0x8F1BBCDC;
+                    } else {
+                        f = b ^ c ^ d;
+                        k = 0xCA62C1D6;
+                    }
+
+                    uint32_t temp = rotate_left(a, 5) + f + e + k + w[i];
+                    e = d;
+                    d = c;
+                    c = rotate_left(b, 30);
+                    b = a;
+                    a = temp;
+                }
+
+                h[0] += a;
+                h[1] += b;
+                h[2] += c;
+                h[3] += d;
+                h[4] += e;
+            }
+
+            // Produce the final hash value (big-endian)
+            std::vector<uint8_t> hash;
+            hash.reserve(20);
+            for (uint32_t val : h) {
+                hash.push_back((val >> 24) & 0xFF);
+                hash.push_back((val >> 16) & 0xFF);
+                hash.push_back((val >> 8) & 0xFF);
+                hash.push_back(val & 0xFF);
+            }
+
+            return hash;
+        }
+
+        static std::vector<uint8_t> sha1_avx(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
+            std::vector<uint8_t> combined(size1 + size2);
+            std::memcpy(combined.data(), data1, size1);
+            std::memcpy(combined.data() + size1, data2, size2);
+            return sha1_avx(combined.data(), combined.size());
+        }
+#endif
+
+#if __has_include(<emmintrin.h>)
+        static std::vector<uint8_t> sha1_sse2(const uint8_t *data, size_t size) {
+            std::array<uint32_t, 5> h = {0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0};
+            const uint64_t bit_length = size * 8;
+
+            std::vector<uint8_t> padded_data(data, data + size);
+            padded_data.push_back(0x80);
+
+            while ((padded_data.size() % 64) != 56) {
+                padded_data.push_back(0x00);
+            }
+
+            for (int i = 7; i >= 0; --i) {
+                padded_data.push_back(static_cast<uint8_t>((bit_length >> (i * 8)) & 0xFF));
+            }
+
+            size_t chunk_count = padded_data.size() / 64;
+            for (size_t chunk = 0; chunk < chunk_count; ++chunk) {
+                std::array<uint32_t, 80> w = {0};
+                // Load first 16 words
+                for (size_t i = 0; i < 16; ++i) {
+                    w[i] = (padded_data[chunk * 64 + i * 4] << 24) | (padded_data[chunk * 64 + i * 4 + 1] << 16) |
+                           (padded_data[chunk * 64 + i * 4 + 2] << 8) | padded_data[chunk * 64 + i * 4 + 3];
+                }
+
+                // SIMD 최적화를 활용한 메시지 스케줄 확장
+                for (size_t i = 16; i < 80; i += 4) {
+                    __m128i w_m3 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 3]));
+                    __m128i w_m8 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 8]));
+                    __m128i w_m14 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 14]));
+                    __m128i w_m16 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(&w[i - 16]));
+
+                    __m128i temp1 = _mm_xor_si128(w_m3, w_m8);
+                    __m128i temp2 = _mm_xor_si128(temp1, w_m14);
+                    __m128i temp3 = _mm_xor_si128(temp2, w_m16);
+
+                    // Rotate left by 1
+                    __m128i rotated = _mm_or_si128(_mm_slli_epi32(temp3, 1), _mm_srli_epi32(temp3, 31));
+
+                    // Store the results back
+                    alignas(16) uint32_t rotated_temp[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(rotated_temp), rotated);
+
+                    for (size_t j = 0; j < 4 && (i + j) < 80; ++j) {
+                        w[i + j] = rotated_temp[j];
+                    }
+                }
+
+                uint32_t a = h[0];
+                uint32_t b = h[1];
+                uint32_t c = h[2];
+                uint32_t d = h[3];
+                uint32_t e = h[4];
+
+                for (size_t i = 0; i < 80; ++i) {
+                    uint32_t f, k;
+                    if (i < 20) {
+                        f = (b & c) | ((~b) & d);
+                        k = 0x5A827999;
+                    } else if (i < 40) {
+                        f = b ^ c ^ d;
+                        k = 0x6ED9EBA1;
+                    } else if (i < 60) {
+                        f = (b & c) | (b & d) | (c & d);
+                        k = 0x8F1BBCDC;
+                    } else {
+                        f = b ^ c ^ d;
+                        k = 0xCA62C1D6;
+                    }
+
+                    uint32_t temp = rotate_left(a, 5) + f + e + k + w[i];
+                    e = d;
+                    d = c;
+                    c = rotate_left(b, 30);
+                    b = a;
+                    a = temp;
+                }
+
+                h[0] += a;
+                h[1] += b;
+                h[2] += c;
+                h[3] += d;
+                h[4] += e;
+            }
+
+            // Produce the final hash value (big-endian)
+            std::vector<uint8_t> hash;
+            hash.reserve(20);
+            for (uint32_t val : h) {
+                hash.push_back((val >> 24) & 0xFF);
+                hash.push_back((val >> 16) & 0xFF);
+                hash.push_back((val >> 8) & 0xFF);
+                hash.push_back(val & 0xFF);
+            }
+
+            return hash;
+        }
+
+        static std::vector<uint8_t> sha1_sse2(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
+            std::vector<uint8_t> combined(size1 + size2);
+            std::memcpy(combined.data(), data1, size1);
+            std::memcpy(combined.data() + size1, data2, size2);
+            return sha1_sse2(combined.data(), combined.size());
         }
 #endif
 
@@ -933,9 +1150,71 @@ class HmacSha1 {
 
         return result;
     }
+
+    static std::vector<uint8_t> hmac_avx(const std::string &key, const std::vector<uint8_t> &data) {
+        const size_t block_size = 64;  // SHA-1 block size
+        const size_t hash_size = 20;   // SHA-1 output size
+
+        std::vector<uint8_t> key_pad(block_size, 0);
+        if (key.size() > block_size) {
+            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
+            std::vector<uint8_t> hashed_key = SHA1::sha1_avx(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
+        } else {
+            // 키를 패딩
+            std::copy(key.begin(), key.end(), key_pad.begin());
+        }
+
+        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
+        std::vector<uint8_t> i_key_pad(block_size, 0x36);
+        for (size_t i = 0; i < block_size; ++i) {
+            o_key_pad[i] ^= key_pad[i];
+            i_key_pad[i] ^= key_pad[i];
+        }
+
+        // 내부 해시 계산
+        std::vector<uint8_t> inner_hash = SHA1::sha1_avx(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
+        // 외부 해시 계산
+        std::vector<uint8_t> result =
+            SHA1::sha1_avx(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+
+        return result;
+    }
 #endif
 
-// SSE4.2 최적화된 HMAC-SHA1 구현
+#if __has_include(<emmintrin.h>)
+    static std::vector<uint8_t> hmac_sse2(const std::string &key, const std::vector<uint8_t> &data) {
+        const size_t block_size = 64;  // SHA-1 block size
+        const size_t hash_size = 20;   // SHA-1 output size
+
+        std::vector<uint8_t> key_pad(block_size, 0);
+        if (key.size() > block_size) {
+            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
+            std::vector<uint8_t> hashed_key =
+                SHA1::sha1_sse2(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
+        } else {
+            // 키를 패딩
+            std::copy(key.begin(), key.end(), key_pad.begin());
+        }
+
+        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
+        std::vector<uint8_t> i_key_pad(block_size, 0x36);
+        for (size_t i = 0; i < block_size; ++i) {
+            o_key_pad[i] ^= key_pad[i];
+            i_key_pad[i] ^= key_pad[i];
+        }
+
+        // 내부 해시 계산
+        std::vector<uint8_t> inner_hash = SHA1::sha1_sse2(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
+        // 외부 해시 계산
+        std::vector<uint8_t> result =
+            SHA1::sha1_sse2(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+
+        return result;
+    }
+#endif
+
 #if __has_include(<nmmintrin.h>)
     static std::vector<uint8_t> hmac_sse42(const std::string &key, const std::vector<uint8_t> &data) {
         const size_t block_size = 64;  // SHA-1 block size
