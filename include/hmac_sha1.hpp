@@ -166,19 +166,15 @@ class HmacSha1 {
         }
     }
 
-    // 기본 HMAC-SHA1 구현 (비최적화)
-    static std::vector<uint8_t> hmac_generic(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
+    // 공통 HMAC-SHA1 구현
+    static std::vector<uint8_t> hmac_common(const std::string &key, const std::vector<uint8_t> &data,
+                                            std::vector<uint8_t> (*sha1_func)(const uint8_t *data, size_t size)) {
+        const size_t block_size = 64;
         std::vector<uint8_t> key_pad(block_size, 0);
         if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_generic(reinterpret_cast<const uint8_t *>(key.data()), key.size());
+            std::vector<uint8_t> hashed_key = sha1_func(reinterpret_cast<const uint8_t *>(key.data()), key.size());
             std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
         } else {
-            // 키를 패딩
             std::copy(key.begin(), key.end(), key_pad.begin());
         }
 
@@ -189,115 +185,50 @@ class HmacSha1 {
             i_key_pad[i] ^= key_pad[i];
         }
 
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
+        auto combined = [&](const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
+            std::vector<uint8_t> combined(size1 + size2);
+            std::memcpy(combined.data(), data1, size1);
+            std::memcpy(combined.data() + size1, data2, size2);
+            return sha1_func(combined.data(), combined.size());
+        };
 
+        std::vector<uint8_t> inner_hash =
+            combined(i_key_pad.data(), i_key_pad.size() + data.size(), data.data(), data.size());
+        std::vector<uint8_t> result =
+            combined(o_key_pad.data(), o_key_pad.size() + inner_hash.size(), inner_hash.data(), inner_hash.size());
         return result;
     }
 
-// AVX2 최적화된 HMAC-SHA1 구현
+    static std::vector<uint8_t> hmac_generic(const std::string &key, const std::vector<uint8_t> &data) {
+        return hmac_common(key, data, &SHA1::sha1_generic);
+    }
+
 #if __has_include(<immintrin.h>)
+    static std::vector<uint8_t> hmac_avx(const std::string &key, const std::vector<uint8_t> &data) {
+        return hmac_common(key, data, &SHA1::sha1_avx);
+    }
+
     static std::vector<uint8_t> hmac_avx2(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // Hash the key using AVX2-optimized SHA1
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_avx2(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // Pad the key with zeros
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // Compute inner hash using AVX2-optimized SHA1
-        std::vector<uint8_t> inner_hash = SHA1::sha1_avx2(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // Compute outer hash using AVX2-optimized SHA1
-        std::vector<uint8_t> result =
-            SHA1::sha1_avx2(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
+        return hmac_common(key, data, &SHA1::sha1_avx2);
     }
 #endif
 
-// SSE4.2 최적화된 HMAC-SHA1 구현
 #if __has_include(<nmmintrin.h>)
     static std::vector<uint8_t> hmac_sse42(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
+        return hmac_common(key, data, &SHA1::sha1_sse42);
+    }
+#endif
 
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // Hash the key using SSE4.2-optimized SHA1
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_sse42(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // Pad the key with zeros
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // Compute inner hash using SSE4.2-optimized SHA1
-        std::vector<uint8_t> inner_hash =
-            SHA1::sha1_sse42(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // Compute outer hash using SSE4.2-optimized SHA1
-        std::vector<uint8_t> result =
-            SHA1::sha1_sse42(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
+#if __has_include(<emmintrin.h>)
+    static std::vector<uint8_t> hmac_sse2(const std::string &key, const std::vector<uint8_t> &data) {
+        return hmac_common(key, data, &SHA1::sha1_sse2);
     }
 #endif
 
 // NEON 최적화된 HMAC-SHA1 구현
 #if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_SIMULATOR))
     static std::vector<uint8_t> hmac_neon(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // Hash the key using NEON-optimized SHA1
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_neon(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // Pad the key with zeros
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // Compute inner hash using NEON-optimized SHA1
-        std::vector<uint8_t> inner_hash = SHA1::sha1_neon(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // Compute outer hash using NEON-optimized SHA1
-        std::vector<uint8_t> result =
-            SHA1::sha1_neon(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
+        return hmac_common(key, data, &SHA1::sha1_neon);
     }
 #endif
 
@@ -632,12 +563,6 @@ class HmacSha1 {
             return hash;
         }
 
-        static std::vector<uint8_t> sha1_avx(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
-            std::vector<uint8_t> combined(size1 + size2);
-            std::memcpy(combined.data(), data1, size1);
-            std::memcpy(combined.data() + size1, data2, size2);
-            return sha1_avx(combined.data(), combined.size());
-        }
 #endif
 
 #if __has_include(<emmintrin.h>)
@@ -736,13 +661,6 @@ class HmacSha1 {
             }
 
             return hash;
-        }
-
-        static std::vector<uint8_t> sha1_sse2(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
-            std::vector<uint8_t> combined(size1 + size2);
-            std::memcpy(combined.data(), data1, size1);
-            std::memcpy(combined.data() + size1, data2, size2);
-            return sha1_sse2(combined.data(), combined.size());
         }
 #endif
 
@@ -903,13 +821,6 @@ class HmacSha1 {
 
             return hash;
         }
-
-        static std::vector<uint8_t> sha1_sse42(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
-            std::vector<uint8_t> combined(size1 + size2);
-            std::memcpy(combined.data(), data1, size1);
-            std::memcpy(combined.data() + size1, data2, size2);
-            return sha1_sse42(combined.data(), combined.size());
-        }
 #endif
 
 #if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_SIMULATOR))
@@ -1066,228 +977,11 @@ class HmacSha1 {
 
             return hash;
         }
-
-        static std::vector<uint8_t> sha1_neon(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
-            std::vector<uint8_t> combined(size1 + size2);
-            std::memcpy(combined.data(), data1, size1);
-            std::memcpy(combined.data() + size1, data2, size2);
-            return sha1_neon(combined.data(), combined.size());
-        }
-
 #endif
-        // SHA1 함수 오버로드: 두 개의 데이터 블록을 결합하여 SHA1 해싱
-        static std::vector<uint8_t> sha1(const uint8_t *data1, size_t size1, const uint8_t *data2, size_t size2) {
-            std::vector<uint8_t> combined(size1 + size2);
-            std::memcpy(combined.data(), data1, size1);
-            std::memcpy(combined.data() + size1, data2, size2);
-            return sha1_generic(combined.data(), combined.size());
-        }
-
        private:
         static uint32_t rotate_left(uint32_t value, size_t bits) { return (value << bits) | (value >> (32 - bits)); }
     };
-
-    // 커스텀 HMAC-SHA1 구현
-    static std::vector<uint8_t> hmac_generic(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_generic(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-
-#if __has_include(<immintrin.h>)
-    static std::vector<uint8_t> hmac_avx2(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_avx2(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1_avx2(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1_avx2(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-
-    static std::vector<uint8_t> hmac_avx(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key = SHA1::sha1_avx(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1_avx(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1_avx(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-#endif
-
-#if __has_include(<emmintrin.h>)
-    static std::vector<uint8_t> hmac_sse2(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_sse2(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1_sse2(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1_sse2(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-#endif
-
-#if __has_include(<nmmintrin.h>)
-    static std::vector<uint8_t> hmac_sse42(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_sse42(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash =
-            SHA1::sha1_sse42(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1_sse42(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-#endif
-
-// NEON 최적화된 HMAC-SHA1 구현
-#if defined(__ANDROID__) || (defined(__APPLE__) && (TARGET_OS_IPHONE || TARGET_OS_SIMULATOR))
-    static std::vector<uint8_t> hmac_neon(const std::string &key, const std::vector<uint8_t> &data) {
-        const size_t block_size = 64;  // SHA-1 block size
-        const size_t hash_size = 20;   // SHA-1 output size
-
-        std::vector<uint8_t> key_pad(block_size, 0);
-        if (key.size() > block_size) {
-            // 키가 블록 사이즈보다 큰 경우 SHA1 해싱
-            std::vector<uint8_t> hashed_key =
-                SHA1::sha1_neon(reinterpret_cast<const uint8_t *>(key.data()), key.size());
-            std::copy(hashed_key.begin(), hashed_key.end(), key_pad.begin());
-        } else {
-            // 키를 패딩
-            std::copy(key.begin(), key.end(), key_pad.begin());
-        }
-
-        std::vector<uint8_t> o_key_pad(block_size, 0x5c);
-        std::vector<uint8_t> i_key_pad(block_size, 0x36);
-        for (size_t i = 0; i < block_size; ++i) {
-            o_key_pad[i] ^= key_pad[i];
-            i_key_pad[i] ^= key_pad[i];
-        }
-
-        // 내부 해시 계산
-        std::vector<uint8_t> inner_hash = SHA1::sha1_neon(i_key_pad.data(), i_key_pad.size(), data.data(), data.size());
-        // 외부 해시 계산
-        std::vector<uint8_t> result =
-            SHA1::sha1_neon(o_key_pad.data(), o_key_pad.size(), inner_hash.data(), inner_hash.size());
-
-        return result;
-    }
-#endif
-
 #endif  // !__has_include(<openssl/hmac.h>)
-
-   private:
-    // SHA1 클래스는 HMAC-SHA1 구현에 사용됩니다.
-    // OpenSSL을 사용할 때는 별도의 구현이 필요 없으므로 이 클래스는 OpenSSL 미사용 시에만 사용됩니다.
 };
 
 #endif  // HMAC_SHA1_HPP
