@@ -798,13 +798,14 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
         std::chrono::milliseconds timeout = initial_timeout;
         for (int attempt = 0; attempt < max_tries; ++attempt) {
-            // STUN 요청 전송
-            response_mutex_.lock();
-            ResponseData &response =
-                pending_responses_
-                    .emplace_hint(pending_responses_.begin(), txn_id, (asio::steady_timer(io_context_), std::nullopt))
-                    ->second;
-            response_mutex_.unlock();
+            ResponseData *response{nullptr};
+            {
+                std::lock_guard<std::mutex> lock(response_mutex_);
+                response = &pending_responses_
+                                .emplace_hint(pending_responses_.begin(), txn_id,
+                                              (asio::steady_timer(io_context_), std::nullopt))
+                                ->second;
+            }
 
             co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
             log(LogLevel::Debug, "Sent STUN request to " + dest.address().to_string() + ":" +
@@ -812,27 +813,24 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
             // 타이머 대기
             asio::error_code ec;
-            response.timer.expires_after(timeout);
-            co_await response.timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+            response->timer.expires_after(timeout);
+            co_await response->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
             {
                 std::lock_guard<std::mutex> lock(response_mutex_);
-                if (pending_responses_.find(txn_id) == pending_responses_.end()) {
-                    // 지수 백오프
-                    timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-                    log(LogLevel::Debug, "STUN retransmit attempt " + std::to_string(attempt + 1) +
-                                             " failed. Retrying with timeout " + std::to_string(timeout.count()) +
-                                             "ms.");
-                    continue;  // 응답이 없다.
-                }
+                pending_responses_.erase(txn_id);
             }
 
-            // 응답이 도착했을 때
-            if (!response.data.has_value())
+            if (!response->data.has_value()) {
+                // 지수 백오프
+                timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+                log(LogLevel::Debug, "STUN retransmit attempt " + std::to_string(attempt + 1) +
+                                         " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
                 continue;
+            }
 
             try {
-                StunMessage resp = response.data.value();
+                StunMessage resp = response->data.value();
                 if (resp.get_transaction_id() == txn_id) {
                     switch (resp.get_type()) {
                         case StunMessageType::BINDING_RESPONSE_SUCCESS:
@@ -847,7 +845,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                 fingerprint_ok = resp.verify_fingerprint();
                             }
                             if (!integrity_ok || !fingerprint_ok) {
-                                response.data = std::nullopt;
+                                response->data = std::nullopt;
                             }
                             break;
                         }
@@ -859,7 +857,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 // 오류 발생 시 무시
             }
 
-            co_return response.data;
+            co_return response->data;
         }
 
         log(LogLevel::Warning, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) +
