@@ -97,5 +97,8 @@
   "editor.tabSize": 4,
   "editor.insertSpaces": true,
   "editor.formatOnSave": true,
-  "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, IndentWidth: 4, ColumnLimit: 120, AllowShortIfStatementsOnASingleLine: false }"
+  "C_Cpp.clang_format_style": "{ BasedOnStyle: Google, IndentWidth: 4, ColumnLimit: 120, AllowShortIfStatementsOnASingleLine: false }",
+  "terminal.integrated.env.windows": {
+    "LANG": "en_US.UTF-8"
+  }
 }

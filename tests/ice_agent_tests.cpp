@@ -37,7 +37,7 @@ int main() {
         IceRole role = IceRole::Controller;  // 또는 IceRole::Controlled
         IceMode mode = IceMode::Full;        // 또는 IceMode::Lite
         std::vector<std::string> stun_servers = {"stun.l.google.com:19302"};
-        std::string turn_server = "";  // TURN 서버가 있다면 설정
+        std::vector<std::string> turn_server;  // TURN 서버가 있다면 설정
         std::string turn_username = "";
         std::string turn_password = "";
 

@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <format>
 
 #include "stun_message.hpp"
 
@@ -573,7 +574,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         auto results6 = co_await resolver.async_resolve(asio::ip::udp::v6(), "::", "0", asio::use_awaitable);
 
         auto add_candidate = [&](const asio::ip::udp::endpoint &ep) {
-            const auto &c = local_candidates_.emplace_back((ep, CandidateType::Host));
+            const auto& c = local_candidates_.emplace_back(Candidate{ ep, CandidateType::Host });
             if (candidate_callback_) {
                 candidate_callback_(c);
             }
@@ -599,7 +600,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     auto mapped_opt = resp.get_mapped_address();  // 필요에 따라 구현
                     if (mapped_opt.has_value()) {
                         const auto &c =
-                            local_candidates_.emplace_back((mapped_opt.value(), CandidateType::ServerReflexive));
+                            local_candidates_.emplace_back(Candidate{ mapped_opt.value(), CandidateType::ServerReflexive });
                         if (candidate_callback_) {
                             candidate_callback_(c);
                         }
@@ -803,7 +804,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 std::lock_guard<std::mutex> lock(response_mutex_);
                 response = &pending_responses_
                                 .emplace_hint(pending_responses_.begin(), txn_id,
-                                              (asio::steady_timer(io_context_), std::nullopt))
+                                    ResponseData{ asio::steady_timer(io_context_), std::nullopt })
                                 ->second;
             }
 
@@ -879,6 +880,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             log(LogLevel::Error, "Failed to send error response to {}: {}", sender.address().to_string(), ex.what());
         }
 #endif
+        co_return;
     }
 
     // Nominate a candidate pair
@@ -1180,7 +1182,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     // (level 1)
-    asio::awaitable<void> handle_binding_indication(const StunMessage &ind, const asio::ip::udp::endpoint &sender) {}
+    asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) { co_return; }
 
     // Handle inbound signaling messages (e.g., SDP)
     asio::awaitable<void> handle_incoming_signaling_messages() {
@@ -1300,8 +1302,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         if (static_cast<int>(lvl) < static_cast<int>(log_level_))
             return;
 
-        std::string formatted_msg = std::format(msg_template, std::forward<decltype(args)>(args)...);
-        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << formatted_msg << std::endl;
+        //std::string formatted_msg = std::format(msg_template, std::forward<decltype(args)>(args)...);
+        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << msg_template << std::endl;
     }
 
     // Convert LogLevel to string
@@ -1453,6 +1455,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     asio::awaitable<void> start_signaling_communication() {
         signaling_server_connected_ = true;
         // 이후에 ICE 시작 로직을 호출하거나 필요한 초기화 수행
+        co_return;
     }
 
     // 시그널링 서버에 SDP 전송
