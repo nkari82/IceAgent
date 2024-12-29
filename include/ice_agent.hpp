@@ -1,8 +1,6 @@
-#pragma once
+﻿#pragma once
 #include <algorithm>
 #include <asio.hpp>
-#include <asio/awaitable.hpp>
-#include <asio/experimental/awaitable_operators.hpp>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -25,14 +23,14 @@ enum class IceRole { Controller, Controlled };
 enum class IceOption { None = 1 << 0, IceLite = 1 << 1, Ice2 = 1 << 2, Trickle = 1 << 3 };
 
 enum class IceConnectionState {
-    New,        // 어떤 액션이 취해지기 전의 초기 상태입니다.
-    Gathering,  // 지역 후보자를 수집합니다.
-    Checking,   // 로컬 후보와 원격 후보 간의 연결성 검사를 수행합니다.
-    Connected,  // 하나 이상의 후보 쌍이 성공했지만 검사가 아직 진행 중일 수 있습니다.
-    Completed,  // 모든 후보 쌍이 확인되었으며 하나 이상의 쌍이 성공했습니다.
-    Failed,     // 유효한 후보 쌍을 설정할 수 없습니다.
+    New,           // 어떤 액션이 취해지기 전의 초기 상태입니다.
+    Gathering,     // 지역 후보자를 수집합니다.
+    Checking,      // 로컬 후보와 원격 후보 간의 연결성 검사를 수행합니다.
+    Connected,     // 하나 이상의 후보 쌍이 성공했지만 검사가 아직 진행 중일 수 있습니다.
+    Completed,     // 모든 후보 쌍이 확인되었으며 하나 이상의 쌍이 성공했습니다.
+    Failed,        // 유효한 후보 쌍을 설정할 수 없습니다.
     Disconnected,  // 이전에 연결되었던 경로가 끊어진 상태로, 재시도를 통해 복구를 시도할 수 있습니다.
-    Closed  // ICE 프로세스가 완전히 종료되어 더 이상 동작하지 않는 상태입니다.
+    Closed         // ICE 프로세스가 완전히 종료되어 더 이상 동작하지 않는 상태입니다.
 };
 
 enum class LogLevel { Debug = 0, Info, Warning, Error };
@@ -226,7 +224,7 @@ using NominateCallback = std::function<void(const CandidatePair &)>;
 // ICE Attributes
 struct IceAttributes {
     std::string ufrag;  // ICE의 ufrag는 상대방과의 연결을 식별하기 위해 사용됩니다.
-    std::string pwd;  // 메시지 무결성과 인증(예: STUN 메시지의 MESSAGE-INTEGRITY 계산)에 사용됩니다.
+    std::string pwd;    // 메시지 무결성과 인증(예: STUN 메시지의 MESSAGE-INTEGRITY 계산)에 사용됩니다.
     IceRole role;
     uint32_t options;
     uint64_t tie_breaker;
@@ -457,6 +455,13 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
    private:
+    struct ResponseData {
+        asio::steady_timer timer;  // 응답 대기를 위한 타이머
+        std::optional<StunMessage> data;
+    };
+
+    using ResponseMap = std::unordered_map<StunMessage::Key, ResponseData, StunMessage::Key::Hasher>;
+
     // Members
     asio::io_context &io_context_;
     asio::strand<asio::io_context::executor_type> strand_;
@@ -499,6 +504,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     // ICE Attributes
     IceAttributes local_ice_attributes_;
     IceAttributes remote_ice_attributes_;
+
+    ResponseMap pending_responses_;  // #TODO 리소스 정리
+    std::mutex response_mutex_;
 
     // ---------- Internal Functions ----------
 
@@ -580,7 +588,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         for (const auto &stun_ep : stun_endpoints_) {  // 해상된 STUN 엔드포인트 순회
             try {
                 // 메시지 무결성 없이 바인딩 요청 STUN 메시지 생성
-                StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
+                StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
                 req.add_fingerprint();
 
                 // STUN 요청 전송 및 응답 대기
@@ -719,7 +727,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
         // Create STUN Binding Request using local ICE credentials
-        StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
+        StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
         // Add necessary attributes using local ICE credentials
         req.add_attribute(StunAttributeType::PRIORITY, serialize_uint32(pair.local_candidate.priority));
         std::string uname = local_ice_attributes_.ufrag;  // Use local ufrag only
@@ -777,8 +785,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         bool expect_response =
             (request.get_type() == StunMessageType::BINDING_REQUEST || request.get_type() == StunMessageType::ALLOCATE);
 
-        using namespace asio::experimental::awaitable_operators;
-
         auto data = request.serialize();
         auto txn_id = request.get_transaction_id();
 
@@ -793,70 +799,67 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         std::chrono::milliseconds timeout = initial_timeout;
         for (int attempt = 0; attempt < max_tries; ++attempt) {
             // STUN 요청 전송
+            response_mutex_.lock();
+            ResponseData &response =
+                pending_responses_
+                    .emplace_hint(pending_responses_.begin(), txn_id, (asio::steady_timer(io_context_), std::nullopt))
+                    ->second;
+            response_mutex_.unlock();
+
             co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
             log(LogLevel::Debug, "Sent STUN request to " + dest.address().to_string() + ":" +
                                      std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
 
-            // 응답 타이머 설정
-            asio::steady_timer timer(strand_);
-            timer.expires_after(timeout);
+            // 타이머 대기
+            asio::error_code ec;
+            response.timer.expires_after(timeout);
+            co_await response.timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-            std::vector<uint8_t> buf(2048);
-            asio::ip::udp::endpoint sender;
-
-            std::optional<StunMessage> response = std::nullopt;
-
-            // STUN 응답 수신 또는 타이머 만료 중 하나를 기다림
-            co_await (([&]() -> asio::awaitable<void> {
-                          try {
-                              std::size_t bytes = co_await udp_socket_.async_receive_from(asio::buffer(buf), sender,
-                                                                                          asio::use_awaitable);
-                              std::vector<uint8_t> received_data(buf.begin(), buf.begin() + bytes);
-                              StunMessage resp = StunMessage::parse(received_data);
-                              if (resp.get_transaction_id() == txn_id) {
-                                  switch (resp.get_type()) {
-                                      case StunMessageType::BINDING_RESPONSE_SUCCESS:
-                                      case StunMessageType::BINDING_RESPONSE_ERROR:
-                                      case StunMessageType::ALLOCATE_RESPONSE_SUCCESS:
-                                      case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
-                                          // 메시지 무결성 및 핑거프린트 검증
-                                          bool integrity_ok = true;
-                                          bool fingerprint_ok = true;
-                                          if (!remote_pwd.empty()) {
-                                              integrity_ok = resp.verify_message_integrity(remote_pwd);
-                                              fingerprint_ok = resp.verify_fingerprint();
-                                          }
-                                          if (integrity_ok && fingerprint_ok) {
-                                              response = resp;
-                                          }
-                                          break;
-                                      }
-                                      default:
-                                          break;
-                                  }
-                              }
-                          } catch (...) {
-                              // 오류 발생 시 무시
-                          }
-                      }()) ||
-                      ([&]() -> asio::awaitable<void> {
-                          try {
-                              co_await timer.async_wait(asio::use_awaitable);
-                          } catch (...) {
-                              // 타이머 취소 시 무시
-                          }
-                      }()));
-
-            if (response.has_value()) {
-                log(LogLevel::Debug, "Received valid STUN response from " + sender.address().to_string() + ":" +
-                                         std::to_string(sender.port()));
-                co_return response;
+            {
+                std::lock_guard<std::mutex> lock(response_mutex_);
+                if (pending_responses_.find(txn_id) == pending_responses_.end()) {
+                    // 지수 백오프
+                    timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+                    log(LogLevel::Debug, "STUN retransmit attempt " + std::to_string(attempt + 1) +
+                                             " failed. Retrying with timeout " + std::to_string(timeout.count()) +
+                                             "ms.");
+                    continue;  // 응답이 없다.
+                }
             }
 
-            // 지수 백오프
-            timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-            log(LogLevel::Debug, "STUN retransmit attempt " + std::to_string(attempt + 1) +
-                                     " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
+            // 응답이 도착했을 때
+            if (!response.data.has_value())
+                continue;
+
+            try {
+                StunMessage resp = response.data.value();
+                if (resp.get_transaction_id() == txn_id) {
+                    switch (resp.get_type()) {
+                        case StunMessageType::BINDING_RESPONSE_SUCCESS:
+                        case StunMessageType::BINDING_RESPONSE_ERROR:
+                        case StunMessageType::ALLOCATE_RESPONSE_SUCCESS:
+                        case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
+                            // 메시지 무결성 및 핑거프린트 검증
+                            bool integrity_ok = true;
+                            bool fingerprint_ok = true;
+                            if (!remote_pwd.empty()) {
+                                integrity_ok = resp.verify_message_integrity(remote_pwd);
+                                fingerprint_ok = resp.verify_fingerprint();
+                            }
+                            if (!integrity_ok || !fingerprint_ok) {
+                                response.data = std::nullopt;
+                            }
+                            break;
+                        }
+                        default:
+                            break;
+                    }
+                }
+            } catch (...) {
+                // 오류 발생 시 무시
+            }
+
+            co_return response.data;
         }
 
         log(LogLevel::Warning, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) +
@@ -866,6 +869,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     asio::awaitable<void> send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req,
                                               StunErrorCode code, const std::string &reason_template, auto &&...args) {
+#if 0
         try {
             StunMessage error_resp(StunMessageType::BINDING_RESPONSE_ERROR, req.get_transaction_id());
             error_resp.add_error_code(code, std::format(reason_template, std::forward<decltype(args)>(args)...));
@@ -876,6 +880,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         } catch (const std::exception &ex) {
             log(LogLevel::Error, "Failed to send error response to {}: {}", sender.address().to_string(), ex.what());
         }
+#endif
     }
 
     // Nominate a candidate pair
@@ -884,7 +889,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
         if (local_ice_attributes_.role == IceRole::Controller) {
             // Create and send BINDING_INDICATION with USE-CANDIDATE attribute
-            StunMessage ind(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
+            StunMessage ind(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
             ind.add_attribute(StunAttributeType::USE_CANDIDATE, std::vector<uint8_t>{});
             ind.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
             ind.add_message_integrity(remote_ice_attributes_.pwd);
@@ -934,7 +939,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             co_return false;
         }
         // BINDING_REQUEST
-        StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
+        StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
         req.add_attribute(StunAttributeType::USERNAME, local_ice_attributes_.ufrag);  // Use local ufrag only
         if (local_ice_attributes_.role == IceRole::Controller) {
             req.add_attribute(StunAttributeType::ICE_CONTROLLING, serialize_uint64(local_ice_attributes_.tie_breaker));
@@ -968,7 +973,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             co_await timer.async_wait(asio::use_awaitable);
             try {
                 // Create TURN Refresh request (similar to Allocate but with REFRESH attribute)
-                StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
                 // Add necessary attributes
                 refresh_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
                 refresh_req.add_attribute(StunAttributeType::REALM, turn_realm_);  // Replace with actual realm
@@ -996,7 +1001,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // 데이터 수신 시작 및 사용자 데이터 처리
     asio::awaitable<void> start_data_receive() {
-        while (current_state_ == IceConnectionState::Connected || current_state_ == IceConnectionState::Completed) {
+        while (current_state_ != IceConnectionState::Closed) {
             std::vector<uint8_t> buf(2048);  // 수신 데이터 버퍼
             asio::ip::udp::endpoint sender;  // 송신자 엔드포인트
             size_t bytes = 0;
@@ -1016,29 +1021,44 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
                 try {
                     // 수신된 데이터를 STUN 메시지로 파싱 시도
-                    StunMessage sm = StunMessage::parse(buf);
+                    if (IsStunMessage(buf)) {
+                        StunMessage sm = StunMessage::parse(buf);
 
-                    // STUN 메시지로 처리
-                    co_await handle_inbound_stun(sm, sender);
+                        {
+                            std::lock_guard<std::mutex> lock(response_mutex_);
+                            auto it = pending_responses_.find(sm.get_transaction_id());
+                            if (it != pending_responses_.end()) {
+                                auto &response = it->second;
+                                response.data = sm;
+                                response.timer.cancel();
+                                continue;
+                            }
+                        }
+
+                        // STUN 메시지로 처리
+                        co_await handle_inbound_stun(sm, sender);
+                    } else {
+                        // 노미네이트된 원격 후보자로부터 온 데이터인지 확인
+                        if (nominated_pair_.has_value() &&
+                            sender == nominated_pair_.value().remote_candidate.endpoint) {
+                            // 응용 프로그램 콜백을 통해 데이터 전달
+                            if (data_callback_) {
+                                data_callback_(buf, sender);
+                                log(LogLevel::Debug, "Received application data from nominated endpoint: " +
+                                                         sender.address().to_string() + ":" +
+                                                         std::to_string(sender.port()));
+                            }
+                        } else {
+                            // 비노미네이트된 엔드포인트로부터 온 데이터 무시 및 경고 로그
+                            log(LogLevel::Warning,
+                                "Received application data from unknown endpoint: " + sender.address().to_string() +
+                                    ":" + std::to_string(sender.port()));
+                        }
+                    }
                 } catch (const std::exception &ex) {
                     // STUN 메시지 파싱 실패 시, 응용 프로그램 데이터로 처리
                     // 추가: 로그에 예외 정보 포함
                     log(LogLevel::Debug, std::string("Failed to parse STUN message: ") + ex.what());
-
-                    // 노미네이트된 원격 후보자로부터 온 데이터인지 확인
-                    if (nominated_pair_.has_value() && sender == nominated_pair_.value().remote_candidate.endpoint) {
-                        // 응용 프로그램 콜백을 통해 데이터 전달
-                        if (data_callback_) {
-                            data_callback_(buf, sender);
-                            log(LogLevel::Debug,
-                                "Received application data from nominated endpoint: " + sender.address().to_string() +
-                                    ":" + std::to_string(sender.port()));
-                        }
-                    } else {
-                        // 비노미네이트된 엔드포인트로부터 온 데이터 무시 및 경고 로그
-                        log(LogLevel::Warning, "Received application data from unknown endpoint: " +
-                                                   sender.address().to_string() + ":" + std::to_string(sender.port()));
-                    }
                 }
             }
         }
@@ -1359,7 +1379,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             do {
                 try {
                     // STUN Allocate 요청 생성
-                    StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::generate_transaction_id());
+                    StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
                     alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT, serialize_uint32(17));  // UDP
                     if (!turn_realm_.empty() && !turn_nonce_.empty()) {
                         std::string username = turn_username_ + ":" + turn_realm_;

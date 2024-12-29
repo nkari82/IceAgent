@@ -1,4 +1,4 @@
-#ifndef CRC32_HPP
+﻿#ifndef CRC32_HPP
 #define CRC32_HPP
 
 #include <array>

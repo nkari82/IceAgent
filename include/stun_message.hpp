@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <algorithm>
 #include <array>
@@ -135,26 +135,45 @@ inline std::string get_error_reason(StunErrorCode code) {
 // -------------------- STUN MESSAGE --------------------
 class StunMessage {
    public:
+    struct Key {
+        std::array<uint8_t, 12> data{0};
+        struct Hasher {
+            std::size_t operator()(const Key &key) const {
+                std::size_t hash = 0;
+                for (auto byte : key.data) {
+                    hash ^= std::hash<uint8_t>{}(byte) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+                }
+                return hash;
+            }
+        };
+
+        // Static method to generate a random transaction ID
+        static Key generate() {
+            Key txn_id;
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<> dis(0, 255);
+            for (auto &byte : txn_id) {
+                byte = static_cast<uint8_t>(dis(gen));
+            }
+            return txn_id;
+        }
+
+        bool operator==(const Key &other) const { return data == other.data; }
+
+        inline std::array<uint8_t, 12>::iterator begin() { return data.begin(); }
+        inline std::array<uint8_t, 12>::iterator end() { return data.end(); }
+        inline std::array<uint8_t, 12>::const_iterator cbegin() const { return data.cbegin(); }
+        inline std::array<uint8_t, 12>::const_iterator cend() const { return data.cend(); }
+        size_t size() const { return data.size(); }
+        uint8_t operator[](size_t i) const { return data[i]; }
+    };
+
     // Constructors
-    StunMessage() : type_(StunMessageType::BINDING_REQUEST), message_length_(0) { transaction_id_.fill(0); }
+    StunMessage() : type_(StunMessageType::BINDING_REQUEST), message_length_(0) {}
 
-    StunMessage(StunMessageType type, const std::vector<uint8_t> &transaction_id) : type_(type), message_length_(0) {
-        if (transaction_id.size() != 12) {
-            throw std::invalid_argument("Transaction ID must be 12 bytes");
-        }
-        std::copy(transaction_id.begin(), transaction_id.end(), transaction_id_.begin());
-    }
-
-    // Static method to generate a random transaction ID
-    static std::vector<uint8_t> generate_transaction_id() {
-        std::vector<uint8_t> txn_id(12);
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        std::uniform_int_distribution<> dis(0, 255);
-        for (auto &byte : txn_id) {
-            byte = static_cast<uint8_t>(dis(gen));
-        }
-        return txn_id;
+    StunMessage(StunMessageType type, const Key &transaction_id) : type_(type), message_length_(0) {
+        std::copy(transaction_id.cbegin(), transaction_id.cend(), transaction_id_.begin());
     }
 
     // Add attribute
@@ -279,7 +298,7 @@ class StunMessage {
         buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
 
         // Transaction ID
-        buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
+        buffer.insert(buffer.end(), transaction_id_.cbegin(), transaction_id_.cend());
 
         // Attributes
         for (const auto &attr : attributes_) {
@@ -347,9 +366,7 @@ class StunMessage {
 
     // Getters
     StunMessageType get_type() const { return type_; }
-    std::vector<uint8_t> get_transaction_id() const {
-        return std::vector<uint8_t>(transaction_id_.begin(), transaction_id_.end());
-    }
+    const Key &get_transaction_id() const { return transaction_id_; }
 
     // Check if attribute exists
     bool has_attribute(StunAttributeType attr_type) const {
@@ -591,7 +608,7 @@ class StunMessage {
 
     StunMessageType type_;
     uint16_t message_length_;
-    std::array<uint8_t, 12> transaction_id_;
+    Key transaction_id_;
     std::vector<Attribute> attributes_;
 
     // Serialize message without FINGERPRINT (used internally)
@@ -625,7 +642,7 @@ class StunMessage {
         buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
 
         // Transaction ID
-        buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
+        buffer.insert(buffer.end(), transaction_id_.cbegin(), transaction_id_.cend());
 
         // Attributes
         for (const auto &attr : attributes_) {
@@ -688,7 +705,7 @@ class StunMessage {
         buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
 
         // Transaction ID
-        buffer.insert(buffer.end(), transaction_id_.begin(), transaction_id_.end());
+        buffer.insert(buffer.end(), transaction_id_.data.begin(), transaction_id_.data.end());
 
         // Attributes up to MESSAGE-INTEGRITY
         for (const auto &attr : attributes_) {
