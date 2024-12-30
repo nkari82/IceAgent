@@ -260,7 +260,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         local_ice_attributes_ = generate_ice_attributes();
         local_ice_attributes_.role = role;
 
-        // Resolve STUN servers and store endpoints
+        // #TODO Resolve STUN servers and store endpoints(비동기 resolve)
         asio::ip::udp::resolver resolver(io_context);
         for (const auto &s : stun_servers_) {
             size_t pos = s.find(':');
@@ -280,7 +280,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             }
         }
 
-        // Resolve TURN servers and store endpoints
+        // #TODO Resolve TURN servers and store endpoints(비동기 resolve)
         for (const auto &s : turn_servers_) {
             size_t pos = s.find(':');
             if (pos != std::string::npos) {
@@ -303,30 +303,28 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         // Initialize TURN allocation endpoint (initially unset)
         relay_endpoint_ = asio::ip::udp::endpoint();
 
-        // Open UDP socket (dual-stack)
         std::error_code ec;
-        udp_socket_.open(asio::ip::udp::v6(), ec);
+        // IPv6 소켓 열기
+        if (!(ec = udp_socket_.open(asio::ip::udp::v6(), ec))) {
+            // Dual Stack 활성화
+            asio::ip::v6_only option(false);
+            udp_socket_.set_option(option);
+
+            // 소켓 바인딩 (모든 인터페이스 및 랜덤 포트)
+            asio::ip::udp::endpoint endpoint(asio::ip::udp::v6(), 0);
+            udp_socket_.bind(endpoint, ec);
+        }
+
         if (!ec) {
-            asio::ip::v6_only opt(false);
-            udp_socket_.set_option(opt, ec);
-        }
-        if (ec) {
-            // Fallback to IPv4 if IPv6 fails
-            udp_socket_.open(asio::ip::udp::v4(), ec);
-        }
-        if (!ec) {
-            udp_socket_.bind(asio::ip::udp::endpoint(udp_socket_.local_endpoint().protocol(), 0), ec);
-            if (!ec) {
-                log(LogLevel::Debug, "UDP Socket bound to {}:{}" + udp_socket_.local_endpoint().address().to_string(),
-                    std::to_string(udp_socket_.local_endpoint().port()));
-            }
-        }
-        if (ec) {
+            // 성공적으로 바인딩된 경우 로컬 엔드포인트 출력
+            log(LogLevel::Info, "UDP socket bound to: {}:{}", udp_socket_.local_endpoint().address().to_string(),
+                std::to_string(udp_socket_.local_endpoint().port()));
+        } else {
             log(LogLevel::Error, "Failed to bind UDP socket: {}", ec.message());
             transition_to_state(IceConnectionState::Failed);
         }
 
-        // Initialize TCP components for signaling server
+        // #TODO Initialize TCP components for signaling server(비동기 resolve)
         if (!signaling_server_address_.empty() && signaling_server_port_ != 0) {
             asio::ip::tcp::resolver tcp_resolver(io_context);
             try {
