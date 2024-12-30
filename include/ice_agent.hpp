@@ -268,12 +268,16 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 std::string host = s.substr(0, pos);
                 std::string port_str = s.substr(pos + 1);
                 try {
-                    auto results = resolver.resolve(asio::ip::udp::v4(), host, port_str);
+                    auto results = resolver.resolve(host,      // 도메인 이름
+                                                    port_str,  // 서비스(포트 번호)
+                                                    asio::ip::udp::resolver::flags::address_configured  // Dual Stack
+                    );
                     for (const auto &r : results) {
                         stun_endpoints_.push_back(r.endpoint());
                         log(LogLevel::Debug, "Resolved STUN server: {}:{}", r.endpoint().address().to_string(),
                             std::to_string(r.endpoint().port()));
                     }
+
                 } catch (const std::exception &ex) {
                     log(LogLevel::Warning, "Failed to resolve STUN server '{}:{}'", s, ex.what());
                 }
