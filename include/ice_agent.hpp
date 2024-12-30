@@ -245,7 +245,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
              const std::string &signaling_server_address = "", unsigned short signaling_server_port = 0)
         : io_context_(io_context),
           strand_(io_context.get_executor()),
-          udp_socket_(strand_),
+          udp_socket_(io_context),
           tcp_socket_(strand_),
           mode_(mode),
           stun_servers_(stun_servers),
@@ -284,7 +284,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
 #else
         udp_socket_.open(asio::ip::udp::v4(), ec);
-        asio::ip::udp::endpoint endpoint(asio::ip::udp::v4(), 54320);
+        asio::ip::udp::endpoint endpoint(asio::ip::udp::v4(), 0);
         udp_socket_.bind(endpoint, ec);
         asio::socket_base::reuse_address option(true);
         udp_socket_.set_option(option);
@@ -614,8 +614,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             try {
                 // 메시지 무결성 없이 바인딩 요청 STUN 메시지 생성
                 StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
-                req.add_change_request(false, false);  // RFC 5780 Section 7.1
-                // req.add_fingerprint();
+                req.add_fingerprint();
+                // req.add_change_request(false, false);  // RFC 5780 Section 7.1
 
                 // STUN 요청 전송 및 응답 대기
                 auto resp_opt = co_await send_stun_request(stun_ep, req);

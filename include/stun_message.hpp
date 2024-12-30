@@ -319,6 +319,7 @@ class StunMessage {
     // Serialize the entire message
     std::vector<uint8_t> serialize() const {
         std::vector<uint8_t> buffer;
+        buffer.reserve(20);
 
         // Header: Type (2 bytes), Length (2 bytes), Magic Cookie (4 bytes), Transaction ID (12 bytes)
         uint16_t type_network = htons_custom(static_cast<uint16_t>(type_));
@@ -329,7 +330,7 @@ class StunMessage {
         uint16_t message_length = 0;
         for (const auto &attr : attributes_) {
             message_length += 4;  // Type (2 bytes) + Length (2 bytes)
-            message_length += attr.value.size();
+            message_length += static_cast<uint16_t>(attr.value.size());
             // Padding to 4-byte boundary
             if (attr.value.size() % 4 != 0) {
                 message_length += 4 - (attr.value.size() % 4);
@@ -341,10 +342,11 @@ class StunMessage {
         buffer.push_back(static_cast<uint8_t>(length_network & 0xFF));
 
         // Magic Cookie
-        buffer.push_back((STUN_MAGIC_COOKIE >> 24) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 16) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 8) & 0xFF);
-        buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
+        uint32_t magic_cookie = STUN_MAGIC_COOKIE;  // htonl_custom(STUN_MAGIC_COOKIE);  // 1118048801
+        buffer.push_back((magic_cookie >> 24) & 0xFF);
+        buffer.push_back((magic_cookie >> 16) & 0xFF);
+        buffer.push_back((magic_cookie >> 8) & 0xFF);
+        buffer.push_back(magic_cookie & 0xFF);
 
         // Transaction ID
         buffer.insert(buffer.end(), transaction_id_.cbegin(), transaction_id_.cend());
