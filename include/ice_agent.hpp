@@ -4,6 +4,7 @@
 #include <atomic>
 #include <bitset>
 #include <chrono>
+#include <format>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -12,7 +13,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <format>
 
 #include "stun_message.hpp"
 
@@ -271,11 +271,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     auto results = resolver.resolve(asio::ip::udp::v4(), host, port_str);
                     for (const auto &r : results) {
                         stun_endpoints_.push_back(r.endpoint());
-                        log(LogLevel::Debug, "Resolved STUN server: " + r.endpoint().address().to_string() + ":" +
-                                                 std::to_string(r.endpoint().port()));
+                        log(LogLevel::Debug, "Resolved STUN server: {}:{}", r.endpoint().address().to_string(),
+                            std::to_string(r.endpoint().port()));
                     }
                 } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to resolve STUN server '" + s + "': " + ex.what());
+                    log(LogLevel::Warning, "Failed to resolve STUN server '{}:{}'", s, ex.what());
                 }
             }
         }
@@ -291,11 +291,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     auto results = resolver_turn.resolve(asio::ip::udp::v4(), host, port_str);
                     for (const auto &r : results) {
                         turn_endpoints_.push_back(r.endpoint());
-                        log(LogLevel::Debug, "Resolved TURN server: " + r.endpoint().address().to_string() + ":" +
-                                                 std::to_string(r.endpoint().port()));
+                        log(LogLevel::Debug, "Resolved TURN server: {}:{}" + r.endpoint().address().to_string(),
+                            std::to_string(r.endpoint().port()));
                     }
                 } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to resolve TURN server '" + s + "': " + ex.what());
+                    log(LogLevel::Warning, "Failed to resolve TURN server '{}:{}'", s, ex.what());
                 }
             }
         }
@@ -317,12 +317,12 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         if (!ec) {
             udp_socket_.bind(asio::ip::udp::endpoint(udp_socket_.local_endpoint().protocol(), 0), ec);
             if (!ec) {
-                log(LogLevel::Debug, "UDP Socket bound to " + udp_socket_.local_endpoint().address().to_string() + ":" +
-                                         std::to_string(udp_socket_.local_endpoint().port()));
+                log(LogLevel::Debug, "UDP Socket bound to {}:{}" + udp_socket_.local_endpoint().address().to_string(),
+                    std::to_string(udp_socket_.local_endpoint().port()));
             }
         }
         if (ec) {
-            log(LogLevel::Error, "Failed to bind UDP socket: " + ec.message());
+            log(LogLevel::Error, "Failed to bind UDP socket: {}", ec.message());
             transition_to_state(IceConnectionState::Failed);
         }
 
@@ -344,7 +344,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                             }
                         }));
             } catch (const std::exception &ex) {
-                log(LogLevel::Error, "Exception resolving signaling server: " + std::string(ex.what()));
+                log(LogLevel::Error, "Exception resolving signaling server: {}", std::string(ex.what()));
                 transition_to_state(IceConnectionState::Failed);
             }
         }
@@ -420,7 +420,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         }
                     }
                 } catch (const std::exception &ex) {
-                    log(LogLevel::Error, std::string("start() exception: ") + ex.what());
+                    log(LogLevel::Error, "start() exception: {}", ex.what());
                     transition_to_state(IceConnectionState::Failed);
                 }
             },
@@ -450,7 +450,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
         udp_socket_.async_send_to(asio::buffer(data), target, [this](std::error_code ec, std::size_t) {
             if (ec) {
-                log(LogLevel::Error, "send_data failed: " + ec.message());
+                log(LogLevel::Error, "send_data failed: {}", ec.message());
             }
         });
     }
@@ -519,7 +519,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         if (state_callback_) {
             state_callback_(new_state);
         }
-        log(LogLevel::Info, "ICE State => " + ice_state_to_string(new_state));
+        log(LogLevel::Info, "ICE State => {}", ice_state_to_string(new_state));
         return true;
     }
 
@@ -574,11 +574,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         auto results6 = co_await resolver.async_resolve(asio::ip::udp::v6(), "::", "0", asio::use_awaitable);
 
         auto add_candidate = [&](const asio::ip::udp::endpoint &ep) {
-            const auto& c = local_candidates_.emplace_back(Candidate{ ep, CandidateType::Host });
+            const auto &c = local_candidates_.emplace_back(Candidate{ep, CandidateType::Host});
             if (candidate_callback_) {
                 candidate_callback_(c);
             }
-            log(LogLevel::Debug, "Gathered local candidate: " + c.to_sdp());
+            log(LogLevel::Debug, "Gathered local candidate: {}", c.to_sdp());
         };
         for (auto &r : results4) add_candidate(r.endpoint());
         for (auto &r : results6) add_candidate(r.endpoint());
@@ -599,8 +599,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     // 응답에서 매핑된 주소 추출
                     auto mapped_opt = resp.get_mapped_address();  // 필요에 따라 구현
                     if (mapped_opt.has_value()) {
-                        const auto &c =
-                            local_candidates_.emplace_back(Candidate{ mapped_opt.value(), CandidateType::ServerReflexive });
+                        const auto &c = local_candidates_.emplace_back(
+                            Candidate{mapped_opt.value(), CandidateType::ServerReflexive});
                         if (candidate_callback_) {
                             candidate_callback_(c);
                         }
@@ -765,13 +765,13 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 }
             } else {
                 entry.state = CandidatePairState::Failed;
-                log(LogLevel::Debug, "Connectivity check failed for pair: " + pair.local_candidate.to_sdp() + " <-> " +
-                                         pair.remote_candidate.to_sdp());
+                log(LogLevel::Debug, "Connectivity check failed for pair: {} <-> {}", pair.local_candidate.to_sdp(),
+                    pair.remote_candidate.to_sdp());
             }
         } catch (const std::exception &ex) {
             entry.state = CandidatePairState::Failed;
-            log(LogLevel::Warning, "Connectivity check exception for pair: " + pair.local_candidate.to_sdp() + " <-> " +
-                                       pair.remote_candidate.to_sdp() + " | " + ex.what());
+            log(LogLevel::Warning, "Connectivity check exception for pair: {} <-> {} | {}",
+                pair.local_candidate.to_sdp(), pair.remote_candidate.to_sdp(), ex.what());
         }
     }
 
@@ -792,8 +792,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         if (!expect_response) {
             // 응답을 기다리지 않고 메시지 전송
             co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-            log(LogLevel::Debug, "Sent STUN message to " + dest.address().to_string() + ":" +
-                                     std::to_string(dest.port()) + " | Not expecting response");
+            log(LogLevel::Debug, "Sent STUN message to {}:{} | Not expecting response", dest.address().to_string(),
+                std::to_string(dest.port()));
             co_return std::nullopt;
         }
 
@@ -804,13 +804,13 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 std::lock_guard<std::mutex> lock(response_mutex_);
                 response = &pending_responses_
                                 .emplace_hint(pending_responses_.begin(), txn_id,
-                                    ResponseData{ asio::steady_timer(io_context_), std::nullopt })
+                                              ResponseData{asio::steady_timer(io_context_), std::nullopt})
                                 ->second;
             }
 
             co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-            log(LogLevel::Debug, "Sent STUN request to " + dest.address().to_string() + ":" +
-                                     std::to_string(dest.port()) + " | Attempt: " + std::to_string(attempt + 1));
+            log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
+                std::to_string(dest.port()), std::to_string(attempt + 1));
 
             // 타이머 대기
             asio::error_code ec;
@@ -825,8 +825,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             if (!response->data.has_value()) {
                 // 지수 백오프
                 timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-                log(LogLevel::Debug, "STUN retransmit attempt " + std::to_string(attempt + 1) +
-                                         " failed. Retrying with timeout " + std::to_string(timeout.count()) + "ms.");
+                log(LogLevel::Debug, "STUN retransmit attempt {} failed. Retrying with timeout {}ms",
+                    std::to_string(attempt + 1), std::to_string(timeout.count()));
                 continue;
             }
 
@@ -861,8 +861,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             co_return response->data;
         }
 
-        log(LogLevel::Warning, "STUN request to " + dest.address().to_string() + ":" + std::to_string(dest.port()) +
-                                   " failed after " + std::to_string(max_tries) + " attempts.");
+        log(LogLevel::Warning, "STUN request to {}:{} failed after {} attempts.", dest.address().to_string(),
+            std::to_string(dest.port()), std::to_string(max_tries));
         co_return std::nullopt;
     }
 
@@ -960,7 +960,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 log(LogLevel::Warning, "Consent binding request timed out.");
             }
         } catch (const std::exception &ex) {
-            log(LogLevel::Error, std::string("Consent binding request exception: ") + ex.what());
+            log(LogLevel::Error, "Consent binding request exception: {}", ex.what());
         }
         co_return ok;
     }
@@ -994,7 +994,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 }
             } catch (const std::exception &ex) {
                 transition_to_state(IceConnectionState::Failed);
-                log(LogLevel::Error, std::string("TURN refresh failed: ") + ex.what());
+                log(LogLevel::Error, "TURN refresh failed: {}", ex.what());
             }
         }
     }
@@ -1012,7 +1012,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             } catch (const std::exception &ex) {
                 // 예외 발생 시 Failed 상태로 전환 및 로그 기록
                 transition_to_state(IceConnectionState::Failed);
-                log(LogLevel::Error, std::string("Data receive failed: ") + ex.what());
+                log(LogLevel::Error, "Data receive failed: {}", ex.what());
                 break;
             }
 
@@ -1044,21 +1044,19 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                             // 응용 프로그램 콜백을 통해 데이터 전달
                             if (data_callback_) {
                                 data_callback_(buf, sender);
-                                log(LogLevel::Debug, "Received application data from nominated endpoint: " +
-                                                         sender.address().to_string() + ":" +
-                                                         std::to_string(sender.port()));
+                                log(LogLevel::Debug, "Received application data from nominated endpoint: {}:{}",
+                                    sender.address().to_string(), std::to_string(sender.port()));
                             }
                         } else {
                             // 비노미네이트된 엔드포인트로부터 온 데이터 무시 및 경고 로그
-                            log(LogLevel::Warning,
-                                "Received application data from unknown endpoint: " + sender.address().to_string() +
-                                    ":" + std::to_string(sender.port()));
+                            log(LogLevel::Warning, "Received application data from unknown endpoint: {}:{}",
+                                sender.address().to_string(), std::to_string(sender.port()));
                         }
                     }
                 } catch (const std::exception &ex) {
                     // STUN 메시지 파싱 실패 시, 응용 프로그램 데이터로 처리
                     // 추가: 로그에 예외 정보 포함
-                    log(LogLevel::Debug, std::string("Failed to parse STUN message: ") + ex.what());
+                    log(LogLevel::Debug, "Failed to parse STUN message: {}", ex.what());
                 }
             }
         }
@@ -1182,7 +1180,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     // (level 1)
-    asio::awaitable<void> handle_binding_indication(const StunMessage& ind, const asio::ip::udp::endpoint& sender) { co_return; }
+    asio::awaitable<void> handle_binding_indication(const StunMessage &ind, const asio::ip::udp::endpoint &sender) {
+        co_return;
+    }
 
     // Handle inbound signaling messages (e.g., SDP)
     asio::awaitable<void> handle_incoming_signaling_messages() {
@@ -1230,7 +1230,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             if (candidate_callback_) {
                 candidate_callback_(cand);
             }
-            log(LogLevel::Debug, "new candidate: {}", cand);
+            log(LogLevel::Debug, "new candidate: {}", cand.to_sdp());
 
             // If trickle ICE is enabled or Full Ice, handle additional candidates as they arrive
             if (mode_ == IceMode::Full || local_ice_attributes_.has_option(IceOption::Trickle)) {
@@ -1302,8 +1302,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         if (static_cast<int>(lvl) < static_cast<int>(log_level_))
             return;
 
-        //std::string formatted_msg = std::format(msg_template, std::forward<decltype(args)>(args)...);
-        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << msg_template << std::endl;
+        std::string formatted_msg =
+            std::vformat(msg_template, std::make_format_args(std::forward<decltype(args)>(args)...));
+        std::cout << "[IceAgent][" << log_level_to_string(lvl) << "] " << formatted_msg << std::endl;
     }
 
     // Convert LogLevel to string
@@ -1437,8 +1438,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         }
                     }
                 } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to allocate TURN relay from " + turn_ep.address().to_string() + ":" +
-                                               std::to_string(turn_ep.port()) + " | " + ex.what());
+                    log(LogLevel::Warning, "Failed to allocate TURN relay from {}:{} | {}",
+                        turn_ep.address().to_string(), std::to_string(turn_ep.port()), ex.what());
                     break;  // 현재 TURN 서버 시도 중단, 다음 서버로 이동
                 }
             } while (retry++ > 1);
