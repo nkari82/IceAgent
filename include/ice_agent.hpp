@@ -260,49 +260,12 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         local_ice_attributes_ = generate_ice_attributes();
         local_ice_attributes_.role = role;
 
+        asio::ip::udp::resolver udp_resolver(io_context_);
         // #TODO Resolve STUN servers and store endpoints(비동기 resolve)
-        asio::ip::udp::resolver resolver(io_context);
-        for (const auto &s : stun_servers_) {
-            size_t pos = s.find(':');
-            if (pos != std::string::npos) {
-                std::string host = s.substr(0, pos);
-                std::string port_str = s.substr(pos + 1);
-                try {
-                    auto results = resolver.resolve(host,      // 도메인 이름
-                                                    port_str,  // 서비스(포트 번호)
-                                                    asio::ip::udp::resolver::flags::address_configured  // Dual Stack
-                    );
-                    for (const auto &r : results) {
-                        stun_endpoints_.push_back(r.endpoint());
-                        log(LogLevel::Debug, "Resolved STUN server: {}:{}", r.endpoint().address().to_string(),
-                            std::to_string(r.endpoint().port()));
-                    }
-
-                } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to resolve STUN server '{}:{}'", s, ex.what());
-                }
-            }
-        }
+        resolve(stun_endpoints_, udp_resolver, stun_servers);
 
         // #TODO Resolve TURN servers and store endpoints(비동기 resolve)
-        for (const auto &s : turn_servers_) {
-            size_t pos = s.find(':');
-            if (pos != std::string::npos) {
-                std::string host = s.substr(0, pos);
-                std::string port_str = s.substr(pos + 1);
-                try {
-                    asio::ip::udp::resolver resolver_turn(io_context);
-                    auto results = resolver_turn.resolve(asio::ip::udp::v4(), host, port_str);
-                    for (const auto &r : results) {
-                        turn_endpoints_.push_back(r.endpoint());
-                        log(LogLevel::Debug, "Resolved TURN server: {}:{}" + r.endpoint().address().to_string(),
-                            std::to_string(r.endpoint().port()));
-                    }
-                } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to resolve TURN server '{}:{}'", s, ex.what());
-                }
-            }
-        }
+        resolve(turn_endpoints_, udp_resolver, turn_servers);
 
         // Initialize TURN allocation endpoint (initially unset)
         relay_endpoint_ = asio::ip::udp::endpoint();
@@ -348,6 +311,31 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             } catch (const std::exception &ex) {
                 log(LogLevel::Error, "Exception resolving signaling server: {}", std::string(ex.what()));
                 transition_to_state(IceConnectionState::Failed);
+            }
+        }
+    }
+
+    template <typename ENDPOINT, typename RESOLVER>
+    void resolve(std::vector<ENDPOINT> &endpoints, const RESOLVER &resolver, const std::vector<std::string> &servers) {
+        for (const auto &s : servers) {
+            size_t pos = s.find(':');
+            if (pos != std::string::npos) {
+                std::string host = s.substr(0, pos);
+                std::string port_str = s.substr(pos + 1);
+                try {
+                    auto results = resolver.resolve(host,                                // 도메인 이름
+                                                    port_str,                            // 서비스(포트 번호)
+                                                    RESOLVER::flags::address_configured  // Dual Stack
+                    );
+                    for (const auto &r : results) {
+                        endpoints.push_back(r.endpoint());
+                        log(LogLevel::Debug, "Resolved server: {}:{}", r.endpoint().address().to_string(),
+                            std::to_string(r.endpoint().port()));
+                    }
+
+                } catch (const std::exception &ex) {
+                    log(LogLevel::Warning, "Failed to resolve server '{}:{}'", s, ex.what());
+                }
             }
         }
     }
