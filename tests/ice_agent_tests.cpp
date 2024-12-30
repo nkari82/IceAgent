@@ -59,10 +59,12 @@ int main() {
         ice_agent->start();
 
         // Run io_context in separate thread
-        std::thread io_thread([&io_context]() { io_context.run(); });
+        std::thread io_thread0([&io_context]() { io_context.run(); });
+        std::thread io_thread1([&io_context]() { io_context.run(); });
 
         // Keep the main thread alive
-        io_thread.join();
+        io_thread0.join();
+        io_thread1.join();
     } catch (const std::exception &ex) {
         std::cerr << "Exception in main: " << ex.what() << std::endl;
     }

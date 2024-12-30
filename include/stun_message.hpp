@@ -38,6 +38,10 @@ enum class StunMessageType : uint16_t {
 enum class StunAttributeType : uint16_t {
     MAPPED_ADDRESS = 0x0001,
     XOR_MAPPED_ADDRESS = 0x0020,
+    RESPONSE_ADDRESS = 0x0002,  // RFC3489
+    CHANGE_REQUEST = 0x0003,    // RFC3489
+    SOURCE_ADDRESS = 0x0004,    // RFC3489
+    CHANGE_ADDRESS = 0x0005,    // RFC3489
     PRIORITY = 0x0024,
     USERNAME = 0x0006,
     MESSAGE_INTEGRITY = 0x0008,
@@ -265,6 +269,51 @@ class StunMessage {
         error_value.insert(error_value.end(), padding, 0);
 
         add_attribute(StunAttributeType::ERROR_CODE, error_value);
+    }
+
+    void add_response_address(const asio::ip::udp::endpoint &endpoint) {
+        add_attribute(StunAttributeType::RESPONSE_ADDRESS, endpoint);
+    }
+
+    void add_change_request(bool change_ip, bool change_port) {
+        uint32_t flags = 0;
+        if (change_ip) {
+            flags |= 0x04;  // Bit 2: Change IP
+        }
+        if (change_port) {
+            flags |= 0x02;  // Bit 1: Change Port
+        }
+        add_attribute(StunAttributeType::CHANGE_REQUEST, flags);
+    }
+
+    void add_source_address(const asio::ip::udp::endpoint &endpoint) {
+        add_attribute(StunAttributeType::SOURCE_ADDRESS, endpoint);
+    }
+
+    void add_change_address(const asio::ip::udp::endpoint &endpoint) {
+        add_attribute(StunAttributeType::CHANGE_ADDRESS, endpoint);
+    }
+
+    std::optional<asio::ip::udp::endpoint> get_response_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::RESPONSE_ADDRESS);
+    }
+
+    std::optional<std::pair<bool, bool>> get_change_request() const {
+        auto val = get_attribute_as_uint32(StunAttributeType::CHANGE_REQUEST);
+        if (val) {
+            bool change_ip = (*val & 0x04) != 0;
+            bool change_port = (*val & 0x02) != 0;
+            return std::make_pair(change_ip, change_port);
+        }
+        return std::nullopt;  // 속성이 없는 경우
+    }
+
+    std::optional<asio::ip::udp::endpoint> get_source_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::SOURCE_ADDRESS);
+    }
+
+    std::optional<asio::ip::udp::endpoint> get_change_address() const {
+        return get_attribute_as_mapped_address(StunAttributeType::CHANGE_ADDRESS);
     }
 
     // Serialize the entire message
