@@ -271,9 +271,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         relay_endpoint_ = asio::ip::udp::endpoint();
 
         std::error_code ec;
-        // IPv6 소켓 열기
+
+        // Dual Stack IPv6 소켓 열기
         if (!(ec = udp_socket_.open(asio::ip::udp::v6(), ec))) {
-            // Dual Stack 활성화
             asio::ip::v6_only option(false);
             udp_socket_.set_option(option);
 
@@ -316,7 +316,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     template <typename ENDPOINT, typename RESOLVER>
-    void resolve(std::vector<ENDPOINT> &endpoints, const RESOLVER &resolver, const std::vector<std::string> &servers) {
+    void resolve(std::vector<ENDPOINT> &endpoints, RESOLVER &resolver, const std::vector<std::string> &servers) {
         for (const auto &s : servers) {
             size_t pos = s.find(':');
             if (pos != std::string::npos) {
@@ -328,6 +328,20 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                                     RESOLVER::flags::address_configured  // Dual Stack
                     );
                     for (const auto &r : results) {
+                        if (r.endpoint().address().is_v4()) {
+                            // IPv4-Mapped IPv6 주소의 기본 형식: ::ffff:<IPv4>
+                            std::array<uint8_t, 16> bytes = {0};  // IPv6 주소 초기화
+                            bytes[10] = 0xff;                     // 상위 6바이트는 0
+                            bytes[11] = 0xff;                     // 상위 6바이트는 0
+
+                            // IPv4 바이트를 마지막 4바이트에 복사
+                            auto ipv4_bytes = r.endpoint().address().to_v4().to_bytes();
+                            std::copy(ipv4_bytes.begin(), ipv4_bytes.end(), bytes.begin() + 12);
+                            endpoints.push_back(
+                                asio::ip::udp::endpoint(asio::ip::address_v6(bytes), r.endpoint().port()));
+                        } else {
+                            endpoints.push_back(r.endpoint());
+                        }
                         endpoints.push_back(r.endpoint());
                         log(LogLevel::Debug, "Resolved server: {}:{}", r.endpoint().address().to_string(),
                             std::to_string(r.endpoint().port()));
@@ -447,6 +461,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
    private:
     struct ResponseData {
+        ResponseData(asio::io_context &io_context) : timer(io_context) {}
         asio::steady_timer timer;  // 응답 대기를 위한 타이머
         std::optional<StunMessage> data;
     };
@@ -787,43 +802,36 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             co_return std::nullopt;
         }
 
+        response_mutex_.lock();
+        ResponseData &response =
+            pending_responses_.emplace_hint(pending_responses_.begin(), txn_id, ResponseData(io_context_))->second;
+        response_mutex_.unlock();
+
+        std::optional<StunMessage> message;
         std::chrono::milliseconds timeout = initial_timeout;
-        for (int attempt = 0; attempt < max_tries; ++attempt) {
-            ResponseData *response{nullptr};
-            {
-                std::lock_guard<std::mutex> lock(response_mutex_);
-                response = &pending_responses_
-                                .emplace_hint(pending_responses_.begin(), txn_id,
-                                              ResponseData{asio::steady_timer(io_context_), std::nullopt})
-                                ->second;
-            }
-
-            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
-            log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
-                std::to_string(dest.port()), std::to_string(attempt + 1));
-
-            // 타이머 대기
-            asio::error_code ec;
-            response->timer.expires_after(timeout);
-            co_await response->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
-
-            {
-                std::lock_guard<std::mutex> lock(response_mutex_);
-                pending_responses_.erase(txn_id);
-            }
-
-            if (!response->data.has_value()) {
-                // 지수 백오프
-                timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
-                log(LogLevel::Debug, "STUN retransmit attempt {} failed. Retrying with timeout {}ms",
-                    std::to_string(attempt + 1), std::to_string(timeout.count()));
-                continue;
-            }
-
+        for (int32_t attempt = 0; attempt < max_tries; ++attempt) {
             try {
-                StunMessage resp = response->data.value();
-                if (resp.get_transaction_id() == txn_id) {
-                    switch (resp.get_type()) {
+                co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+                log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
+                    std::to_string(dest.port()), std::to_string(attempt + 1));
+
+                // 타이머 대기
+                asio::error_code ec;
+                response.timer.expires_after(timeout);
+                co_await response.timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+                message = std::move(response.data);
+                if (!message) {
+                    // 지수 백오프
+                    timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
+                    log(LogLevel::Debug, "STUN retransmit attempt {} failed. Retrying with timeout {}ms",
+                        std::to_string(attempt + 1), std::to_string(timeout.count()));
+                    continue;
+                }
+
+                const auto &value = message.value();
+                if (value.get_transaction_id() == txn_id) {
+                    switch (value.get_type()) {
                         case StunMessageType::BINDING_RESPONSE_SUCCESS:
                         case StunMessageType::BINDING_RESPONSE_ERROR:
                         case StunMessageType::ALLOCATE_RESPONSE_SUCCESS:
@@ -832,11 +840,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                             bool integrity_ok = true;
                             bool fingerprint_ok = true;
                             if (!remote_pwd.empty()) {
-                                integrity_ok = resp.verify_message_integrity(remote_pwd);
-                                fingerprint_ok = resp.verify_fingerprint();
+                                integrity_ok = value.verify_message_integrity(remote_pwd);
+                                fingerprint_ok = value.verify_fingerprint();
                             }
                             if (!integrity_ok || !fingerprint_ok) {
-                                response->data = std::nullopt;
+                                message = std::nullopt;
                             }
                             break;
                         }
@@ -845,15 +853,15 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     }
                 }
             } catch (...) {
-                // 오류 발생 시 무시
             }
-
-            co_return response->data;
         }
 
-        log(LogLevel::Warning, "STUN request to {}:{} failed after {} attempts.", dest.address().to_string(),
-            std::to_string(dest.port()), std::to_string(max_tries));
-        co_return std::nullopt;
+        {
+            std::lock_guard<std::mutex> lock(response_mutex_);
+            pending_responses_.erase(txn_id);
+        }
+
+        co_return message;
     }
 
     asio::awaitable<void> send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req,
