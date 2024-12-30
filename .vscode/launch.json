@@ -22,7 +22,7 @@
                     "value": "Something something"
                 }
             ],
-            "externalConsole": true
+            "console": "externalTerminal"
         }
     ]
 }
