@@ -85,8 +85,6 @@ inline uint32_t htonl_custom(uint32_t hostlong) { return asio::detail::socket_op
 inline uint32_t ntohl_custom(uint32_t netlong) { return asio::detail::socket_ops::host_to_network_long(netlong); }
 
 inline uint64_t htonll_custom(uint64_t hostlonglong) {
-    // Convert host byte order to network byte order (big endian)
-    // Since htonll is not standard, implement manually
     uint64_t net = 0;
     for (int i = 0; i < 8; ++i) {
         net = (net << 8) | ((hostlonglong >> (56 - 8 * i)) & 0xFF);
@@ -95,8 +93,6 @@ inline uint64_t htonll_custom(uint64_t hostlonglong) {
 }
 
 inline uint64_t ntohll_custom(uint64_t netlonglong) {
-    // Convert network byte order to host byte order (big endian)
-    // Implement manually
     uint64_t host = 0;
     for (int i = 0; i < 8; ++i) {
         host = (host << 8) | ((netlonglong >> (56 - 8 * i)) & 0xFF);
@@ -232,7 +228,8 @@ class StunMessage {
 
     void add_fingerprint() {
         // Calculate CRC32 over the entire message up to this point
-        std::vector<uint8_t> data = serialize_without_fingerprint();
+        std::vector<uint8_t> data = serialize_without_specific_attributes(
+            {StunAttributeType::FINGERPRINT, StunAttributeType::MESSAGE_INTEGRITY});
         uint32_t crc = CRC32::calculate(data);
         uint32_t fingerprint = crc ^ 0x5354554E;  // XOR with 0x5354554E
 
@@ -242,7 +239,7 @@ class StunMessage {
 
     void add_message_integrity(const std::string &key) {
         // Serialize the message up to MESSAGE-INTEGRITY attribute
-        std::vector<uint8_t> data = serialize_for_integrity();
+        std::vector<uint8_t> data = serialize_without_specific_attributes({StunAttributeType::MESSAGE_INTEGRITY});
 
         // Truncate to first 20 bytes as per RFC 5389
         std::vector<uint8_t> hmac_vec = HmacSha1::calculate(key, data);
@@ -317,60 +314,7 @@ class StunMessage {
     }
 
     // Serialize the entire message
-    std::vector<uint8_t> serialize() const {
-        std::vector<uint8_t> buffer;
-        buffer.reserve(20);
-
-        // Header: Type (2 bytes), Length (2 bytes), Magic Cookie (4 bytes), Transaction ID (12 bytes)
-        uint16_t type_network = htons_custom(static_cast<uint16_t>(type_));
-        buffer.push_back(static_cast<uint8_t>(type_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(type_network & 0xFF));
-
-        // Calculate total message length (attributes only)
-        uint16_t message_length = 0;
-        for (const auto &attr : attributes_) {
-            message_length += 4;  // Type (2 bytes) + Length (2 bytes)
-            message_length += static_cast<uint16_t>(attr.value.size());
-            // Padding to 4-byte boundary
-            if (attr.value.size() % 4 != 0) {
-                message_length += 4 - (attr.value.size() % 4);
-            }
-        }
-
-        uint16_t length_network = htons_custom(message_length);
-        buffer.push_back(static_cast<uint8_t>(length_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(length_network & 0xFF));
-
-        // Magic Cookie
-        uint32_t magic_cookie = STUN_MAGIC_COOKIE;  // htonl_custom(STUN_MAGIC_COOKIE);  // 1118048801
-        buffer.push_back((magic_cookie >> 24) & 0xFF);
-        buffer.push_back((magic_cookie >> 16) & 0xFF);
-        buffer.push_back((magic_cookie >> 8) & 0xFF);
-        buffer.push_back(magic_cookie & 0xFF);
-
-        // Transaction ID
-        buffer.insert(buffer.end(), transaction_id_.cbegin(), transaction_id_.cend());
-
-        // Attributes
-        for (const auto &attr : attributes_) {
-            uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network & 0xFF));
-
-            uint16_t attr_length_network = htons_custom(static_cast<uint16_t>(attr.value.size()));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network & 0xFF));
-
-            buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
-
-            // Padding to 4-byte boundary
-            if (attr.value.size() % 4 != 0) {
-                buffer.insert(buffer.end(), 4 - (attr.value.size() % 4), 0);
-            }
-        }
-
-        return buffer;
-    }
+    std::vector<uint8_t> serialize() const { return serialize_without_specific_attributes({}); }
 
     // Parse a raw buffer into a StunMessage
     static StunMessage parse(const std::vector<uint8_t> &data) {
@@ -662,115 +606,69 @@ class StunMessage {
     Key transaction_id_;
     std::vector<Attribute> attributes_;
 
-    // Serialize message without FINGERPRINT (used internally)
-    std::vector<uint8_t> serialize_without_fingerprint() const {
+   private:
+    void append_uint16(std::vector<uint8_t> &buffer, uint16_t value) const {
+        buffer.push_back(static_cast<uint8_t>(value >> 8));
+        buffer.push_back(static_cast<uint8_t>(value & 0xFF));
+    }
+
+    // Helper method to append uint32 to buffer in network byte order
+    void append_uint32(std::vector<uint8_t> &buffer, uint32_t value) const {
+        buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+        buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+        buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+        buffer.push_back(static_cast<uint8_t>(value & 0xFF));
+    }
+
+    // Helper method to calculate total message length
+    uint16_t calculate_message_length() const {
+        uint16_t length = 0;
+        for (const auto &attr : attributes_) {
+            length += 4;  // Type (2 bytes) + Length (2 bytes)
+            length += static_cast<uint16_t>(attr.value.size());
+            // Padding to 4-byte boundary
+            if (attr.value.size() % 4 != 0) {
+                length += 4 - (attr.value.size() % 4);
+            }
+        }
+        return length;
+    }
+
+    std::vector<uint8_t> serialize_without_specific_attributes(
+        const std::vector<StunAttributeType> &excluded_attrs) const {
         std::vector<uint8_t> buffer;
+        buffer.reserve(20 + attributes_.size() * 4);  // 예측된 크기로 예약
 
         // Header: Type (2 bytes), Length (2 bytes), Magic Cookie (4 bytes), Transaction ID (12 bytes)
-        uint16_t type_network = htons_custom(static_cast<uint16_t>(type_));
-        buffer.push_back(static_cast<uint8_t>(type_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(type_network & 0xFF));
-
+        append_uint16(buffer, static_cast<uint16_t>(type_));
         // Calculate total message length (attributes only)
         uint16_t message_length = 0;
         for (const auto &attr : attributes_) {
+            if (std::find(excluded_attrs.begin(), excluded_attrs.end(), attr.type) != excluded_attrs.end()) {
+                continue;  // 제외된 속성은 직렬화하지 않음
+            }
             message_length += 4;  // Type (2 bytes) + Length (2 bytes)
-            message_length += attr.value.size();
+            message_length += static_cast<uint16_t>(attr.value.size());
             // Padding to 4-byte boundary
             if (attr.value.size() % 4 != 0) {
                 message_length += 4 - (attr.value.size() % 4);
             }
         }
-
-        uint16_t length_network = htons_custom(message_length);
-        buffer.push_back(static_cast<uint8_t>(length_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(length_network & 0xFF));
+        append_uint16(buffer, message_length);
 
         // Magic Cookie
-        buffer.push_back((STUN_MAGIC_COOKIE >> 24) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 16) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 8) & 0xFF);
-        buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
-
-        // Transaction ID
-        buffer.insert(buffer.end(), transaction_id_.cbegin(), transaction_id_.cend());
-
-        // Attributes
-        for (const auto &attr : attributes_) {
-            if (attr.type == StunAttributeType::FINGERPRINT) {
-                continue;  // Exclude FINGERPRINT
-            }
-            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
-                continue;  // Exclude MESSAGE-INTEGRITY for HMAC calculation
-            }
-            uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network & 0xFF));
-
-            uint16_t attr_length_network = htons_custom(static_cast<uint16_t>(attr.value.size()));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network & 0xFF));
-
-            buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
-
-            // Padding to 4-byte boundary
-            if (attr.value.size() % 4 != 0) {
-                buffer.insert(buffer.end(), 4 - (attr.value.size() % 4), 0);
-            }
-        }
-
-        return buffer;
-    }
-
-    // Serialize message up to MESSAGE-INTEGRITY (used for HMAC)
-    std::vector<uint8_t> serialize_for_integrity() const {
-        std::vector<uint8_t> buffer;
-
-        // Header: Type (2 bytes), Length (2 bytes), Magic Cookie (4 bytes), Transaction ID (12 bytes)
-        uint16_t type_network = htons_custom(static_cast<uint16_t>(type_));
-        buffer.push_back(static_cast<uint8_t>(type_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(type_network & 0xFF));
-
-        // Calculate total message length (attributes only, excluding MESSAGE-INTEGRITY and beyond)
-        uint16_t message_length = 0;
-        for (const auto &attr : attributes_) {
-            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
-                break;  // Stop before MESSAGE-INTEGRITY
-            }
-            message_length += 4;  // Type (2 bytes) + Length (2 bytes)
-            message_length += attr.value.size();
-            // Padding to 4-byte boundary
-            if (attr.value.size() % 4 != 0) {
-                message_length += 4 - (attr.value.size() % 4);
-            }
-        }
-
-        uint16_t length_network = htons_custom(message_length);
-        buffer.push_back(static_cast<uint8_t>(length_network >> 8));
-        buffer.push_back(static_cast<uint8_t>(length_network & 0xFF));
-
-        // Magic Cookie
-        buffer.push_back((STUN_MAGIC_COOKIE >> 24) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 16) & 0xFF);
-        buffer.push_back((STUN_MAGIC_COOKIE >> 8) & 0xFF);
-        buffer.push_back(STUN_MAGIC_COOKIE & 0xFF);
+        append_uint32(buffer, STUN_MAGIC_COOKIE);
 
         // Transaction ID
         buffer.insert(buffer.end(), transaction_id_.data.begin(), transaction_id_.data.end());
 
-        // Attributes up to MESSAGE-INTEGRITY
+        // Attributes
         for (const auto &attr : attributes_) {
-            if (attr.type == StunAttributeType::MESSAGE_INTEGRITY) {
-                break;
+            if (std::find(excluded_attrs.begin(), excluded_attrs.end(), attr.type) != excluded_attrs.end()) {
+                continue;  // 제외된 속성은 직렬화하지 않음
             }
-            uint16_t attr_type_network = htons_custom(static_cast<uint16_t>(attr.type));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_type_network & 0xFF));
-
-            uint16_t attr_length_network = htons_custom(static_cast<uint16_t>(attr.value.size()));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network >> 8));
-            buffer.push_back(static_cast<uint8_t>(attr_length_network & 0xFF));
-
+            append_uint16(buffer, static_cast<uint16_t>(attr.type));
+            append_uint16(buffer, static_cast<uint16_t>(attr.value.size()));
             buffer.insert(buffer.end(), attr.value.begin(), attr.value.end());
 
             // Padding to 4-byte boundary

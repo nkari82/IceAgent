@@ -272,8 +272,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
         std::error_code ec;
 
-// Dual Stack IPv6 소켓 열기
-#if 0
+        // Dual Stack IPv6 소켓 열기
         if (!(ec = udp_socket_.open(asio::ip::udp::v6(), ec))) {
             asio::ip::v6_only option(false);
             udp_socket_.set_option(option);
@@ -282,13 +281,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             asio::ip::udp::endpoint endpoint(asio::ip::udp::v6(), 0);
             udp_socket_.bind(endpoint, ec);
         }
-#else
-        udp_socket_.open(asio::ip::udp::v4(), ec);
-        asio::ip::udp::endpoint endpoint(asio::ip::udp::v4(), 0);
-        udp_socket_.bind(endpoint, ec);
-        asio::socket_base::reuse_address option(true);
-        udp_socket_.set_option(option);
-#endif
 
         if (!ec) {
             // 성공적으로 바인딩된 경우 로컬 엔드포인트 출력
@@ -336,7 +328,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                                     RESOLVER::flags::address_configured  // Dual Stack
                     );
                     for (const auto &r : results) {
-#if 0
                         if (r.endpoint().address().is_v4()) {
                             // IPv4-Mapped IPv6 주소의 기본 형식: ::ffff:<IPv4>
                             std::array<uint8_t, 16> bytes = {0};  // IPv6 주소 초기화
@@ -351,9 +342,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         } else {
                             endpoints.push_back(r.endpoint());
                         }
-#else
-                        endpoints.push_back(r.endpoint());
-#endif
+
                         log(LogLevel::Debug, "Resolved server: {}:{}", r.endpoint().address().to_string(),
                             std::to_string(r.endpoint().port()));
                     }
@@ -399,7 +388,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     local_candidates_.clear();
                     relay_endpoint_ = asio::ip::udp::endpoint();
 
-                    // asio::co_spawn(io_context_, start_data_receive(), asio::detached);
+#if 1
+                    asio::co_spawn(io_context_, start_data_receive(), asio::detached);
+#endif
 
                     // 후보자 수집
                     co_await gather_candidates();
@@ -614,16 +605,14 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             try {
                 // 메시지 무결성 없이 바인딩 요청 STUN 메시지 생성
                 StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
-                req.add_fingerprint();
-                // req.add_change_request(false, false);  // RFC 5780 Section 7.1
 
                 // STUN 요청 전송 및 응답 대기
                 auto resp_opt = co_await send_stun_request(stun_ep, req);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
                     // 응답에서 매핑된 주소 추출
-                    auto mapped_opt = resp.get_mapped_address();  // 필요에 따라 구현
-                    if (mapped_opt.has_value()) {
+                    auto mapped_opt = resp.get_xor_mapped_address();  // 필요에 따라 구현
+                    if (mapped_opt.has_value()) {                     // #TODO ipv4면 mapped ipv4로 변환.
                         const auto &c = local_candidates_.emplace_back(
                             Candidate{mapped_opt.value(), CandidateType::ServerReflexive});
                         if (candidate_callback_) {
@@ -806,10 +795,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500), int max_tries = 7) {
         asio::error_code ec;
 
-#if 1
-        co_await udp_socket_.async_connect(dest, asio::redirect_error(asio::use_awaitable, ec));
-#endif
-
         // 메시지 타입에 따라 응답을 기다릴지 결정
         bool expect_response =
             (request.get_type() == StunMessageType::BINDING_REQUEST || request.get_type() == StunMessageType::ALLOCATE);
@@ -834,28 +819,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         std::chrono::milliseconds timeout = initial_timeout;
         for (int32_t attempt = 0; attempt < max_tries; ++attempt) {
             try {
-                co_await udp_socket_.async_send_to(asio::buffer(data), dest,
-                                                   asio::redirect_error(asio::use_awaitable, ec));
+                auto [ec, sent] =
+                    co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::as_tuple(asio::use_awaitable));
                 if (ec)
                     break;
 
-#if 1
-                // test
-                std::vector<uint8_t> buf(2048);  // 수신 데이터 버퍼
-                asio::ip::udp::endpoint sender;  // 송신자 엔드포인트
-                size_t bytes = 0;
-
-                try {
-                    // 비동기적으로 데이터 수신
-                    bytes = co_await udp_socket_.async_receive_from(asio::buffer(buf), sender,
-                                                                    asio::redirect_error(asio::use_awaitable, ec));
-                } catch (const std::exception &ex) {
-                    // 예외 발생 시 Failed 상태로 전환 및 로그 기록
-                    transition_to_state(IceConnectionState::Failed);
-                    log(LogLevel::Error, "Data receive failed: {}", ex.what());
-                    break;
-                }
-#endif
                 log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
                     std::to_string(dest.port()), std::to_string(attempt + 1));
 
@@ -895,6 +863,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                             break;
                     }
                 }
+                break;
             } catch (const std::system_error &err) {
                 log(LogLevel::Error, "STUN request failed: {}", err.what());
             }
