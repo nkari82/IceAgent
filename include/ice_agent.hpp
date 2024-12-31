@@ -316,6 +316,23 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
+    template <typename ENDPOINT>
+    ENDPOINT convert_to_mapped_v6(const ENDPOINT &ep) {
+        if (ep.address().is_v6())
+            return ep;
+
+        // IPv4-Mapped IPv6 주소의 기본 형식: ::ffff:<IPv4>
+        std::array<uint8_t, 16> bytes = {0};  // IPv6 주소 초기화
+        bytes[10] = 0xff;                     // 상위 6바이트는 0
+        bytes[11] = 0xff;                     // 상위 6바이트는 0
+
+        // IPv4 바이트를 마지막 4바이트에 복사
+        auto ipv4_bytes = ep.address().to_v4().to_bytes();
+        std::copy(ipv4_bytes.begin(), ipv4_bytes.end(), bytes.begin() + 12);
+
+        return ENDPOINT(asio::ip::address_v6(bytes), ep.port());
+    }
+
     template <typename ENDPOINT, typename RESOLVER>
     void resolve(std::vector<ENDPOINT> &endpoints, RESOLVER &resolver, const std::vector<std::string> &servers) {
         for (const auto &s : servers) {
@@ -329,21 +346,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                                     RESOLVER::flags::address_configured  // Dual Stack
                     );
                     for (const auto &r : results) {
-                        if (r.endpoint().address().is_v4()) {
-                            // IPv4-Mapped IPv6 주소의 기본 형식: ::ffff:<IPv4>
-                            std::array<uint8_t, 16> bytes = {0};  // IPv6 주소 초기화
-                            bytes[10] = 0xff;                     // 상위 6바이트는 0
-                            bytes[11] = 0xff;                     // 상위 6바이트는 0
-
-                            // IPv4 바이트를 마지막 4바이트에 복사
-                            auto ipv4_bytes = r.endpoint().address().to_v4().to_bytes();
-                            std::copy(ipv4_bytes.begin(), ipv4_bytes.end(), bytes.begin() + 12);
-                            endpoints.push_back(
-                                asio::ip::udp::endpoint(asio::ip::address_v6(bytes), r.endpoint().port()));
-                        } else {
-                            endpoints.push_back(r.endpoint());
-                        }
-
+                        endpoints.push_back(convert_to_mapped_v6(r.endpoint()));
                         log(LogLevel::Debug, "Resolved server: {}:{}", r.endpoint().address().to_string(),
                             std::to_string(r.endpoint().port()));
                     }
@@ -383,7 +386,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 try {
                     // 상태 초기화
                     nominated_pair_ = std::nullopt;
-                    // #TODO check_list 동기화
+
                     check_list_.clear();
                     remote_candidates_.clear();
                     local_candidates_.clear();
@@ -618,11 +621,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 auto resp_opt = co_await send_stun_request(stun_ep, req);
                 if (resp_opt.has_value()) {
                     StunMessage resp = resp_opt.value();
-                    // 응답에서 매핑된 주소 추출
-                    auto mapped_opt = resp.get_xor_mapped_address();  // 필요에 따라 구현
-                    if (mapped_opt.has_value()) {                     // #TODO ipv4면 mapped ipv4로 변환.
+                    auto mapped_opt =
+                        resp.get_xor_mapped_address();  // #FIXME rfc스펙에 따라 get_mapped_address일 수 있음.
+                    if (mapped_opt.has_value()) {
                         const auto &c = local_candidates_.emplace_back(
-                            Candidate{mapped_opt.value(), CandidateType::ServerReflexive});
+                            Candidate{convert_to_mapped_v6(mapped_opt.value()), CandidateType::ServerReflexive});
                         if (candidate_callback_) {
                             candidate_callback_(c);
                         }
@@ -1296,7 +1299,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // (strand) Sort candidate pairs based on priority
     void sort_candidate_pairs() {
-        std::sort(check_list_.begin(), check_list_.end(),  // TODO check_list 동기화
+        std::sort(check_list_.begin(), check_list_.end(),
                   [&](auto &a, auto &b) { return a.pair.priority > b.pair.priority; });
     }
 
