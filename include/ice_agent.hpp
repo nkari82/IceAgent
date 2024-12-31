@@ -656,34 +656,26 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             const size_t max_concurrency = 5;
 
             while (next_pair < check_list_.size() || active_tasks > 0) {
+                std::vector<asio::awaitable<bool>> tasks;
                 while (active_tasks < max_concurrency && next_pair < check_list_.size()) {
                     CheckListEntry &entry = check_list_[next_pair++];
 
-                    std::vector<asio::awaitable<void>> tasks;
                     // 새 항목(New) 또는 실패(Failed) 상태인 경우 작업을 시작
                     if ((entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) &&
                         active_tasks < max_concurrency) {
                         entry.state = CandidatePairState::InProgress;
                         active_tasks.fetch_add(1, std::memory_order_relaxed);  // 작업 증가
 
-#if 0
-                        asio::co_spawn(io_context_, perform_single_connectivity_check(entry),
-                                       [&](std::exception_ptr eptr) {
-                                           if (!eptr && entry.state == CandidatePairState::Succeeded) {
-                                               transition_to_state(IceConnectionState::Connected);
-                                           }
-                                           active_tasks.fetch_sub(1, std::memory_order_relaxed);  // 작업 감소
-                                       });
-#else
-                        tasks.push_back(perform_single_connectivity_check(entry));
-#endif
+                        tasks.push_back(
+                            asio::co_spawn(io_context_, perform_single_connectivity_check(entry), asio::use_awaitable));
                     }
                 }
 
-                // auto group = asio::experimental::make_parallel_group();
+                for (auto &task : tasks) {
+                    if (co_await std::move(task))
+                        transition_to_state(IceConnectionState::Connected);
+                }
 
-                // 활성 작업이 완료되거나 새 항목이 추가되기를 대기
-                // (5개가 검사중이면 완료될 때 까지 이 부분은 비효율적이다)
                 co_await asio::post(strand_, asio::use_awaitable);
             }
         }
@@ -740,9 +732,9 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     // Perform a single connectivity check
-    asio::awaitable<void> perform_single_connectivity_check(CheckListEntry &entry) {
+    asio::awaitable<bool> perform_single_connectivity_check(CheckListEntry &entry) {
         if (entry.state == CandidatePairState::Frozen) {
-            co_return;  // Skip frozen pairs
+            co_return false;  // Skip frozen pairs
         }
         const auto &pair = entry.pair;
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
@@ -793,6 +785,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             log(LogLevel::Warning, "Connectivity check exception for pair: {} <-> {} | {}",
                 pair.local_candidate.to_sdp(), pair.remote_candidate.to_sdp(), ex.what());
         }
+
+        co_return (entry.state == CandidatePairState::Succeeded);
     }
 
     // Send STUN request with optional message integrity verification
