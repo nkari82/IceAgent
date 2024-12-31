@@ -1,6 +1,4 @@
-// include/hmac_sha1.hpp
-
-#ifndef HMAC_SHA1_HPP
+﻿#ifndef HMAC_SHA1_HPP
 #define HMAC_SHA1_HPP
 
 #include <algorithm>
@@ -19,7 +17,7 @@
 #endif
 
 // Include headers based on platform and available features
-#ifdef defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__)
 #if __has_include(<cpuid.h>)
 #include <cpuid.h>
 #endif
@@ -37,13 +35,13 @@
 #endif
 #endif
 
-#ifdef defined(__ANDROID__)
+#if defined(__ANDROID__)
 #if __has_include(<arm_neon.h>)
 #include <arm_neon.h>  // For NEON
 #endif
 #endif
 
-#ifdef defined(__APPLE__)
+#if defined(__APPLE__)
 #if __has_include(<TargetConditionals.h>)
 #include <TargetConditionals.h>  // For detecting Apple platforms
 #endif

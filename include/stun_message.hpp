@@ -30,7 +30,7 @@ enum class StunMessageType : uint16_t {
     BINDING_INDICATION = 0x0011,
     ALLOCATE = 0x0003,
     ALLOCATE_RESPONSE_SUCCESS = 0x0103,
-    ALLOCATE_RESPONSE_ERROR = 0x0113,
+    ALLOCATE_RESPONSE_ERROR = 0x0113
     // 추가 STUN/TURN 메시지 타입
 };
 
@@ -54,7 +54,7 @@ enum class StunAttributeType : uint16_t {
     NONCE = 0x0015,
     REQUESTED_TRANSPORT = 0x0019,
     RELAYED_ADDRESS = 0x0016,
-    REFRESH = 0x802C,
+    REFRESH = 0x802C
     // 기타 속성 타입
 };
 
@@ -680,48 +680,3 @@ class StunMessage {
         return buffer;
     }
 };
-
-// -------------------- EXAMPLE USAGE --------------------
-
-// Below is an example of how to use the StunMessage class.
-// This is for demonstration purposes and should be placed in your implementation files.
-
-/*
-#include "stun_message.hpp"
-
-int main(){
-    try{
-        // Create a Binding Request
-        StunMessage binding_request(StunMessageType::BINDING_REQUEST, StunMessage::generate_transaction_id());
-
-        // Add attributes if needed
-        binding_request.add_fingerprint();
-
-        // Serialize the message
-        std::vector<uint8_t> serialized = binding_request.serialize();
-
-        // Print serialized message
-        std::cout << "Serialized STUN Binding Request: ";
-        for(auto byte : serialized){
-            printf("%02X ", byte);
-        }
-        std::cout << std::endl;
-
-        // Parse the message back
-        StunMessage parsed = StunMessage::parse(serialized);
-
-        // Verify FINGERPRINT
-        if(parsed.verify_fingerprint()){
-            std::cout << "Fingerprint verified successfully." << std::endl;
-        }
-        else{
-            std::cout << "Fingerprint verification failed." << std::endl;
-        }
-    }
-    catch(const std::exception& ex){
-        std::cerr << "Exception: " << ex.what() << std::endl;
-    }
-
-    return 0;
-}
-*/

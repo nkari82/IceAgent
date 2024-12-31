@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <algorithm>
 #include <asio.hpp>
+#include <asio/experimental/parallel_group.hpp>
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -658,12 +659,14 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                 while (active_tasks < max_concurrency && next_pair < check_list_.size()) {
                     CheckListEntry &entry = check_list_[next_pair++];
 
+                    std::vector<asio::awaitable<void>> tasks;
                     // 새 항목(New) 또는 실패(Failed) 상태인 경우 작업을 시작
                     if ((entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) &&
                         active_tasks < max_concurrency) {
                         entry.state = CandidatePairState::InProgress;
                         active_tasks.fetch_add(1, std::memory_order_relaxed);  // 작업 증가
 
+#if 0
                         asio::co_spawn(io_context_, perform_single_connectivity_check(entry),
                                        [&](std::exception_ptr eptr) {
                                            if (!eptr && entry.state == CandidatePairState::Succeeded) {
@@ -671,9 +674,16 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                                            }
                                            active_tasks.fetch_sub(1, std::memory_order_relaxed);  // 작업 감소
                                        });
+#else
+                        tasks.push_back(perform_single_connectivity_check(entry));
+#endif
                     }
                 }
+
+                // auto group = asio::experimental::make_parallel_group();
+
                 // 활성 작업이 완료되거나 새 항목이 추가되기를 대기
+                // (5개가 검사중이면 완료될 때 까지 이 부분은 비효율적이다)
                 co_await asio::post(strand_, asio::use_awaitable);
             }
         }
