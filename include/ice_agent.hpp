@@ -389,13 +389,20 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     relay_endpoint_ = asio::ip::udp::endpoint();
 
 #if 1
-                    asio::co_spawn(io_context_, start_data_receive(), asio::detached);
+                    asio::co_spawn(strand_, start_data_receive(), asio::detached);
 #endif
 
                     // 후보자 수집
                     co_await gather_candidates();
 
-#if 0
+#if 1
+                    // signaling서버가 있다면 signaling 처리.
+
+                    if (mode_ == IceMode::Full) {
+                        create_check_list();
+                        co_await perform_connectivity_checks();
+                    }
+#else
                     // 수집된 후보자를 시그널링을 통해 전송
                     if (signaling_server_connected_) {
                         std::string sdp = create_sdp();
@@ -494,7 +501,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     std::vector<Candidate> local_candidates_;
     std::vector<Candidate> remote_candidates_;
     std::vector<CheckListEntry> check_list_;
-    std::atomic<bool> connectivity_check_in_progress_{false};  // 중복 호출 방지 변수
+    bool connectivity_check_in_progress_{false};
 
     asio::ip::udp::endpoint relay_endpoint_;  // Allocated relay endpoint
 
@@ -636,59 +643,48 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // (io_context) 연결성 검사 수행 #TODO (perform_connectivity_checks 동시에 처리해야함.)
+    // 연결성 검사 수행 (level1 strand, level2 strand)
     asio::awaitable<void> perform_connectivity_checks() {
-        if (connectivity_check_in_progress_.exchange(true)) {
+        if (std::exchange(connectivity_check_in_progress_, true)) {
             co_return;  // 이미 실행 중이면 종료
         }
 
-        size_t next_pair = 0;                 // 단순히 증가만 하므로 atomic 필요 없음
-        std::atomic<size_t> active_tasks{0};  // 경합 방지를 위해 atomic 사용
-        const size_t max_concurrency = 5;
-
         try {
-            while (true) {
-                bool progress = false;
+            size_t next_pair = 0;                 // 단순히 증가만 하므로 atomic 필요 없음
+            std::atomic<size_t> active_tasks{0};  // 경합 방지를 위해 atomic 사용
+            const size_t max_concurrency = 5;
 
-                while (active_tasks < max_concurrency) {
-                    if (next_pair >= check_list_.size()) {
-                        break;
-                    }
-
-                    // #TODO check_list 동기화
+            while (next_pair < check_list_.size() || active_tasks > 0) {
+                while (active_tasks < max_concurrency && next_pair < check_list_.size()) {
                     CheckListEntry &entry = check_list_[next_pair++];
-                    if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
+
+                    // 새 항목(New) 또는 실패(Failed) 상태인 경우 작업을 시작
+                    if ((entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) &&
+                        active_tasks < max_concurrency) {
                         entry.state = CandidatePairState::InProgress;
                         active_tasks.fetch_add(1, std::memory_order_relaxed);  // 작업 증가
-                        progress = true;
 
-                        // #FIXME 하나씩 스폰되는게 맞아
                         asio::co_spawn(io_context_, perform_single_connectivity_check(entry),
-                                       [&, index = next_pair - 1](std::exception_ptr eptr) {
-                                           if (!eptr && check_list_[index].state == CandidatePairState::Succeeded) {
+                                       [&](std::exception_ptr eptr) {
+                                           if (!eptr && entry.state == CandidatePairState::Succeeded) {
                                                transition_to_state(IceConnectionState::Connected);
                                            }
                                            active_tasks.fetch_sub(1, std::memory_order_relaxed);  // 작업 감소
                                        });
                     }
                 }
-
-                // 새 항목 추가 확인
-                if (next_pair < check_list_.size()) {
-                    progress = true;  // 새 항목이 추가되었으므로 다시 시도
-                }
-
-                if (!progress && active_tasks == 0) {
-                    break;  // 더 이상 처리할 항목이 없고 활성 작업이 없으면 종료
-                }
+                // 활성 작업이 완료되거나 새 항목이 추가되기를 대기
+                co_await asio::post(strand_, asio::use_awaitable);
             }
-        } catch (...) {
+        }
+
+        catch (...) {
             transition_to_state(IceConnectionState::Failed);
         }
-        connectivity_check_in_progress_ = false;  // 실행 완료 표시
+        std::exchange(connectivity_check_in_progress_, false);  // 실행 완료 표시
     }
 
-    // (strand)
+    // (level1 strand)
     void create_check_list() {
         check_list_.clear();
         for (auto &rc : remote_candidates_) {
@@ -1006,7 +1002,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         }
     }
 
-    // 데이터 수신 시작 및 사용자 데이터 처리
+    // 데이터 수신 시작 및 사용자 데이터 처리 (level2 (strand로 보호))
     asio::awaitable<void> start_data_receive() {
         while (current_state_ != IceConnectionState::Closed) {
             std::vector<uint8_t> buf(2048);  // 수신 데이터 버퍼
@@ -1042,13 +1038,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                             }
                         }
 
-                        // STUN 메시지로 처리
                         co_await handle_inbound_stun(sm, sender);
                     } else {
                         // 노미네이트된 원격 후보자로부터 온 데이터인지 확인
                         if (nominated_pair_.has_value() &&
                             sender == nominated_pair_.value().remote_candidate.endpoint) {
-                            // 응용 프로그램 콜백을 통해 데이터 전달
                             if (data_callback_) {
                                 data_callback_(buf, sender);
                                 log(LogLevel::Debug, "Received application data from nominated endpoint: {}:{}",
@@ -1061,8 +1055,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         }
                     }
                 } catch (const std::exception &ex) {
-                    // STUN 메시지 파싱 실패 시, 응용 프로그램 데이터로 처리
-                    // 추가: 로그에 예외 정보 포함
                     log(LogLevel::Debug, "Failed to parse STUN message: {}", ex.what());
                 }
             }
@@ -1251,7 +1243,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     sort_candidate_pairs();
                 } else {
                     create_check_list();
-                    asio::co_spawn(io_context_, perform_connectivity_checks(), asio::detached);
+                    asio::co_spawn(strand_, perform_connectivity_checks(), asio::detached);
                 }
             }
         }
