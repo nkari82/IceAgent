@@ -579,19 +579,16 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             }
             sort_candidate_pairs();
 
-            size_t next_pair = 0;
-            std::atomic<size_t> active_tasks{0};
             const size_t max_concurrency = 5;
-
-            while (next_pair < check_list_.size() || active_tasks > 0) {
-                std::vector<asio::awaitable<bool>> tasks;
-                while (active_tasks < max_concurrency && next_pair < check_list_.size()) {
+            size_t next_pair = 0;
+            std::vector<asio::awaitable<bool>> tasks;
+            while (next_pair < check_list_.size()) {
+                while (tasks.size() < max_concurrency && next_pair < check_list_.size()) {
                     CheckListEntry &entry = check_list_[next_pair++];
-
-                    if ((entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) &&
-                        active_tasks < max_concurrency) {
+                    // #FIXME 새로 추가된 Candidate는 Frozen 상태 이므로 perform_single_connectivity_check에서 단순
+                    // return한다.
+                    if (entry.state == CandidatePairState::New || entry.state == CandidatePairState::Failed) {
                         entry.state = CandidatePairState::InProgress;
-                        active_tasks.fetch_add(1, std::memory_order_relaxed);
 
                         tasks.push_back(
                             asio::co_spawn(io_context_, perform_single_connectivity_check(entry), asio::use_awaitable));
@@ -603,8 +600,8 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     if (succeeded) {
                         transition_to_state(IceConnectionState::Connected);
                     }
-                    active_tasks.fetch_sub(1, std::memory_order_relaxed);
                 }
+                tasks.clear();
 
                 co_await asio::post(strand_, asio::use_awaitable);
             }
@@ -709,49 +706,29 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             co_return std::nullopt;
         }
 
+        ResponseData *response{nullptr};
         {
             std::lock_guard<std::mutex> lock(response_mutex_);
-            pending_responses_.emplace(txn_id, ResponseData(io_context_));
+            auto [it, _] = pending_responses_.try_emplace(txn_id, io_context_);
+            response = &it->second;
         }
+
         std::optional<StunMessage> message;
         std::chrono::milliseconds timeout = initial_timeout;
 
         for (int attempt = 0; attempt < max_tries; ++attempt) {
-            auto [error_code, sent] =
-                co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::as_tuple(asio::use_awaitable));
-            if (error_code) {
-                break;
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(response_mutex_);
-                auto it = pending_responses_.find(txn_id);
-                if (it == pending_responses_.end()) {
-                    break;
-                }
-                auto &response = it->second;
-                response.timer.expires_after(timeout);
+            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::redirect_error(asio::use_awaitable, ec));
+            if (ec) {
+                continue;
             }
 
             log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
                 std::to_string(dest.port()), std::to_string(attempt + 1));
 
-            {
-                std::unique_lock<std::mutex> lock(response_mutex_);
-                auto it = pending_responses_.find(txn_id);
-                if (it == pending_responses_.end()) {
-                    break;
-                }
-                auto &response = it->second;
-                lock.unlock();
+            response->timer.expires_after(timeout);
+            co_await response->timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-                asio::error_code timer_ec;
-                co_await response.timer.async_wait(asio::redirect_error(asio::use_awaitable, timer_ec));
-
-                lock.lock();
-                message = std::move(response.data);
-            }
-
+            message = std::move(response->data);
             if (!message) {
                 timeout = std::min(timeout * 2, std::chrono::milliseconds(1600));
                 log(LogLevel::Debug, "STUN retransmit attempt {} failed. Retrying with timeout {}ms",
@@ -794,7 +771,18 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     // STUN Error Response (필요 시 사용할 수 있음)
     asio::awaitable<void> send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req,
                                               StunErrorCode code, const std::string &reason_template, auto &&...args) {
-        // 실제로 에러 응답을 보내고 싶다면 여기서 구현
+#if 0
+        try {
+            StunMessage error_resp(StunMessageType::BINDING_RESPONSE_ERROR, req.get_transaction_id());
+            error_resp.add_error_code(code, std::format(reason_template, std::forward<decltype(args)>(args)...));
+            error_resp.add_fingerprint();
+            co_await send_stun_request(sender, error_resp);
+            log(LogLevel::Warning, "Sent error response: {} ({}) to {}", get_error_reason(code), reason,
+                sender.address().to_string());
+        } catch (const std::exception &ex) {
+            log(LogLevel::Error, "Failed to send error response to {}: {}", sender.address().to_string(), ex.what());
+        }
+#endif
         co_return;
     }
 
@@ -1122,20 +1110,21 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             local_ice_attributes_.role = IceRole::Controlled;
         } else {
             uint64_t local_id = 0;
-            if (udp_socket_.local_endpoint().address().is_v4()) {
-                for (auto byte : udp_socket_.local_endpoint().address().to_v4().to_bytes()) {
+            auto local_ep = udp_socket_.local_endpoint();
+            auto remote_ep = udp_socket_.remote_endpoint();
+            if (local_ep.address().is_v4()) {
+                for (auto byte : local_ep.address().to_v4().to_bytes()) {
                     local_id = (local_id << 8) | byte;
                 }
-                local_id += udp_socket_.local_endpoint().port();
+                local_id += local_ep.port();
             }
 
             uint64_t remote_id = 0;
-            if (!udp_socket_.remote_endpoint().address().is_unspecified() &&
-                udp_socket_.remote_endpoint().address().is_v4()) {
-                for (auto byte : udp_socket_.remote_endpoint().address().to_v4().to_bytes()) {
+            if (!remote_ep.address().is_unspecified() && remote_ep.address().is_v4()) {
+                for (auto byte : remote_ep.address().to_v4().to_bytes()) {
                     remote_id = (remote_id << 8) | byte;
                 }
-                remote_id += udp_socket_.remote_endpoint().port();
+                remote_id += remote_ep.port();
             }
 
             if (local_id > remote_id) {
