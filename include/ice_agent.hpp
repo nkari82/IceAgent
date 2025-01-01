@@ -1067,14 +1067,14 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             resp.add_fingerprint();
 
             // 9. Send the Binding Response
-            co_await send_stun_message(sender, resp);
+            co_await send_stun_request(sender, resp);
         } catch (const std::exception &ex) {
             // Handle unexpected exceptions gracefully
             // Log the error and send a generic error response
             // Assuming a logging mechanism is in place
             // log_error("Exception in handle_binding_request: {}", ex.what());
-            send_error_response(sender, req, StunErrorCode::SERVER_ERROR, "Internal Server Error from {}",
-                                sender.address().to_string());
+            send_error_response(sender, req, StunErrorCode::SERVER_ERROR, "Internal Server Error from {}:{}",
+                                sender.address().to_string(), ex.what());
         }
 
         co_return;
@@ -1277,7 +1277,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         alloc_req.add_fingerprint();
                     }
 
-                    auto resp_opt = co_await send_stun_message(turn_ep, alloc_req, turn_password_,
+                    auto resp_opt = co_await send_stun_request(turn_ep, alloc_req, turn_password_,
                                                                std::chrono::milliseconds(1000), 3);
                     if (resp_opt.has_value()) {
                         StunMessage resp = resp_opt.value();
