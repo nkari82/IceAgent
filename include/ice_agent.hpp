@@ -16,6 +16,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -339,6 +340,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                     local_candidates_.clear();
                     relay_endpoint_ = asio::ip::udp::endpoint();
 
+                    // #FIXME (once)
                     asio::co_spawn(strand_, start_data_receive(), asio::detached);
 
                     // 후보 수집
@@ -532,6 +534,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         for (const auto &stun_ep : stun_endpoints_) {
             try {
                 StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
+                req.add_fingerprint();
 
                 auto resp_opt = co_await send_stun_request(stun_ep, req);
                 if (resp_opt.has_value()) {
@@ -556,9 +559,41 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // RFC 8445 5.1.1.2 - 릴레이 후보 수집(TURN, RFC 5766 활용)
     asio::awaitable<void> gather_relay_candidates() {
-        if (!turn_endpoints_.empty()) {
-            co_await allocate_turn_relay();
+        if (turn_endpoints_.empty())
+            co_return;
+
+        // 병렬 실행할 코루틴 목록
+        using task_t = decltype(asio::co_spawn(io_context_, allocate_turn_relay_one(nullptr), asio::deferred));
+
+        std::vector<task_t> tasks;
+        tasks.reserve(turn_endpoints_.size());
+        for (auto &ep : turn_endpoints_) {
+            tasks.push_back(asio::co_spawn(io_context_, allocate_turn_relay_one(&ep), asio::deferred));
         }
+
+        auto [orders, ex, results] = co_await asio::experimental::make_parallel_group(std::move(tasks))
+                                         .async_wait(asio::experimental::wait_for_one_success(), asio::deferred);
+
+        std::optional<asio::ip::udp::endpoint> endpoint_opt =
+            std::find_if(results.begin(), results.end(), [](const auto &r) {
+                return r.has_value();
+            })->value_or(asio::ip::udp::endpoint());
+
+        if (endpoint_opt.has_value()) {
+            // 첫 번째로 성공한 TURN 서버에서 Relay 획득
+            Candidate c(endpoint_opt.value(), CandidateType::Relay);
+            relay_endpoint_ = endpoint_opt.value();
+            local_candidates_.push_back(c);
+            if (candidate_callback_) {
+                candidate_callback_(c);
+            }
+            log(LogLevel::Debug, "Allocated TURN relay from server: {}:{}", relay_endpoint_.address().to_string(),
+                std::to_string(relay_endpoint_.port()));
+        } else {
+            // 모든 서버가 실패
+            log(LogLevel::Warning, "Failed to allocate TURN relay from all servers (parallel).");
+        }
+
         co_return;
     }
 
@@ -691,7 +726,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return (entry->state == CandidatePairState::Succeeded);
     }
 
-    // STUN 요청/응답 (#FIXME request와 allocate만 처리)
+    // STUN 요청/응답
     asio::awaitable<std::optional<StunMessage>> send_stun_request(
         const asio::ip::udp::endpoint &dest, const StunMessage &request, const std::string &remote_pwd = "",
         std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500), int max_tries = 7) {
@@ -702,7 +737,6 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         auto data = request.serialize();
 
         if (!expect_response) {
-            udp_socket_.async_send_to(asio::buffer(data), dest, [](std::error_code, size_t) {});
             log(LogLevel::Debug, "Sent STUN message to {}:{} | Not expecting response", dest.address().to_string(),
                 std::to_string(dest.port()));
             co_return std::nullopt;
@@ -868,33 +902,21 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // TURN refresh
     asio::awaitable<void> perform_turn_refresh() {
-        size_t last_successful_index = 0;  // 마지막으로 성공한 TURN 서버 인덱스
         while (current_state_ == IceConnectionState::Connected && !relay_endpoint_.address().is_unspecified()) {
             asio::steady_timer timer(strand_);
             timer.expires_after(std::chrono::seconds(300));
             co_await timer.async_wait(asio::use_awaitable);
 
-            bool success = false;
-
+            bool success{false};
             // 우선 마지막으로 성공한 서버를 시도
             for (size_t i = 0; i < turn_endpoints_.size(); ++i) {
-                size_t index = (last_successful_index + i) % turn_endpoints_.size();
-                const auto &turn_ep = turn_endpoints_[index];
+                const auto &turn_ep = turn_endpoints_[i];
                 try {
-                    StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
-                    refresh_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-                    refresh_req.add_attribute(StunAttributeType::REALM, turn_realm_);
-                    refresh_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
-                    refresh_req.add_attribute(StunAttributeType::REFRESH);
-                    refresh_req.add_message_integrity(turn_password_);
-                    refresh_req.add_fingerprint();
-
-                    auto resp_opt = co_await send_stun_request(turn_ep, refresh_req, turn_password_,
-                                                               std::chrono::milliseconds(1000), 5);
-                    if (resp_opt.has_value()) {
+                    auto endpoint = co_await allocate_turn_relay_one(&turn_ep);
+                    if (endpoint.has_value()) {
+                        relay_endpoint_ = endpoint.value();
                         log(LogLevel::Debug, "TURN allocation refreshed using server: {}:{}",
                             turn_ep.address().to_string(), std::to_string(turn_ep.port()));
-                        last_successful_index = index;  // 성공한 서버 인덱스 업데이트
                         success = true;
                         break;  // 성공하면 다음 서버로 넘어가지 않음
                     }
@@ -1276,75 +1298,55 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         return out;
     }
 
-    asio::awaitable<void> allocate_turn_relay() {
-        if (turn_endpoints_.empty()) {
-            log(LogLevel::Warning, "No TURN servers available for allocation.");
-            co_return;
-        }
-        for (const auto &turn_ep : turn_endpoints_) {
-            uint32_t retry{0};
-            do {
-                try {
-                    StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
-                    alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT,
-                                            serialize_uint32(17));  // UDP
+    asio::awaitable<std::optional<asio::ip::udp::endpoint>> allocate_turn_relay_one(
+        const asio::ip::udp::endpoint *turn_ep) {
+        uint32_t next{0};
+        do {
+            try {
+                StunMessage alloc_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
+                alloc_req.add_attribute(StunAttributeType::REQUESTED_TRANSPORT,
+                                        serialize_uint32(17));  // UDP
 
-                    if (!turn_realm_.empty() && !turn_nonce_.empty()) {
-                        std::string username = turn_username_ + ":" + turn_realm_;
-                        alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
-                        alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
-                        alloc_req.add_attribute(StunAttributeType::USERNAME, username);
-                        alloc_req.add_message_integrity(turn_password_);
-                        alloc_req.add_fingerprint();
-                    }
-
-                    auto resp_opt = co_await send_stun_request(turn_ep, alloc_req, turn_password_,
-                                                               std::chrono::milliseconds(1000), 3);
-                    if (resp_opt.has_value()) {
-                        StunMessage resp = resp_opt.value();
-                        switch (resp.get_type()) {
-                            case StunMessageType::ALLOCATE_RESPONSE_SUCCESS: {
-                                auto relay_opt = resp.get_relayed_address();
-                                if (relay_opt.has_value()) {
-                                    relay_endpoint_ = relay_opt.value();
-                                    log(LogLevel::Debug, "Allocated TURN relay: {}:{}",
-                                        relay_endpoint_.address().to_string(), std::to_string(relay_endpoint_.port()));
-
-                                    Candidate c(relay_endpoint_, CandidateType::Relay);
-                                    local_candidates_.push_back(c);
-                                    if (candidate_callback_) {
-                                        candidate_callback_(c);
-                                    }
-                                    co_return;
-                                }
-                                break;
-                            }
-                            case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
-                                auto realm_opt = resp.get_attribute_as_string(StunAttributeType::REALM);
-                                auto nonce_opt = resp.get_attribute_as_string(StunAttributeType::NONCE);
-                                if (realm_opt.has_value() && nonce_opt.has_value()) {
-                                    turn_realm_ = realm_opt.value();
-                                    turn_nonce_ = nonce_opt.value();
-                                } else {
-                                    log(LogLevel::Warning, "TURN Allocate response missing REALM or NONCE.");
-                                }
-                                break;
-                            }
-                            default:
-                                log(LogLevel::Warning, "Unexpected STUN message type.");
-                                break;
-                        }
-                    }
-                } catch (const std::exception &ex) {
-                    log(LogLevel::Warning, "Failed to allocate TURN relay from {}:{} | {}",
-                        turn_ep.address().to_string(), std::to_string(turn_ep.port()), ex.what());
-                    break;
+                if (!turn_realm_.empty() && !turn_nonce_.empty()) {
+                    std::string username = turn_username_ + ":" + turn_realm_;
+                    alloc_req.add_attribute(StunAttributeType::REALM, turn_realm_);
+                    alloc_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
+                    alloc_req.add_attribute(StunAttributeType::USERNAME, username);
+                    alloc_req.add_message_integrity(turn_password_);
                 }
-            } while (retry++ > 1);
-        }
+                alloc_req.add_fingerprint();
 
-        log(LogLevel::Warning, "Failed to allocate TURN relay from all TURN servers.");
-        co_return;
+                auto resp_opt =
+                    co_await send_stun_request(*turn_ep, alloc_req, turn_password_, std::chrono::milliseconds(1000), 3);
+                if (resp_opt.has_value()) {
+                    StunMessage resp = resp_opt.value();
+                    switch (resp.get_type()) {
+                        case StunMessageType::ALLOCATE_RESPONSE_SUCCESS: {
+                            co_return resp.get_relayed_address();
+                        }
+                        case StunMessageType::ALLOCATE_RESPONSE_ERROR: {
+                            auto realm_opt = resp.get_attribute_as_string(StunAttributeType::REALM);
+                            auto nonce_opt = resp.get_attribute_as_string(StunAttributeType::NONCE);
+                            if (realm_opt.has_value() && nonce_opt.has_value()) {
+                                turn_realm_ = realm_opt.value();
+                                turn_nonce_ = nonce_opt.value();
+                            } else {
+                                log(LogLevel::Warning, "TURN Allocate response missing REALM or NONCE.");
+                            }
+                            break;
+                        }
+                        default:
+                            log(LogLevel::Warning, "Unexpected STUN message type.");
+                            break;
+                    }
+                }
+            } catch (const std::exception &ex) {
+                log(LogLevel::Warning, "Failed to allocate TURN relay from {}:{} | {}", turn_ep->address().to_string(),
+                    std::to_string(turn_ep->port()), ex.what());
+                break;
+            }
+        } while (next++ > 1);
+        co_return std::nullopt;
     }
 
     asio::awaitable<void> start_signaling_communication() {

@@ -411,8 +411,7 @@ class StunMessage {
     }
 
     // Get attribute as optional XOR-MAPPED_ADDRESS
-    std::optional<asio::ip::udp::endpoint> get_attribute_as_xor_mapped_address(
-        StunAttributeType attr_type, const asio::ip::udp::endpoint &request_endpoint) const {
+    std::optional<asio::ip::udp::endpoint> get_attribute_as_xor_mapped_address(StunAttributeType attr_type) const {
         for (const auto &attr : attributes_) {
             if (attr.type == attr_type) {
                 if (attr.value.size() < 8) {
@@ -491,12 +490,12 @@ class StunMessage {
         return get_attribute_as_mapped_address(StunAttributeType::MAPPED_ADDRESS);
     }
 
-    std::optional<asio::ip::udp::endpoint> get_relayed_address() const {
-        return get_attribute_as_mapped_address(StunAttributeType::RELAYED_ADDRESS);
+    std::optional<asio::ip::udp::endpoint> get_xor_mapped_address() const {
+        return get_attribute_as_xor_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
     }
 
-    std::optional<asio::ip::udp::endpoint> get_xor_mapped_address() const {
-        return get_attribute_as_mapped_address(StunAttributeType::XOR_MAPPED_ADDRESS);
+    std::optional<asio::ip::udp::endpoint> get_relayed_address() const {
+        return get_attribute_as_xor_mapped_address(StunAttributeType::RELAYED_ADDRESS);
     }
 
     std::optional<std::pair<StunErrorCode, std::string>> get_error_code() const {
