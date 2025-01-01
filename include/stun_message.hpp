@@ -169,10 +169,8 @@ class StunMessage {
         uint8_t operator[](size_t i) const { return data[i]; }
     };
 
-    // Constructors
-    StunMessage() : type_(StunMessageType::BINDING_REQUEST), message_length_(0) {}
-
-    StunMessage(StunMessageType type, const Key &transaction_id) : type_(type), message_length_(0) {
+    StunMessage() = default;
+    StunMessage(StunMessageType type, const Key &transaction_id = Key::generate()) : type_(type), message_length_(0) {
         std::copy(transaction_id.cbegin(), transaction_id.cend(), transaction_id_.begin());
     }
 

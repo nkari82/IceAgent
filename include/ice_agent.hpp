@@ -688,7 +688,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return (entry.state == CandidatePairState::Succeeded);
     }
 
-    // STUN 요청/응답
+    // STUN 요청/응답 (#FIXME request와 allocate만 처리)
     asio::awaitable<std::optional<StunMessage>> send_stun_request(
         const asio::ip::udp::endpoint &dest, const StunMessage &request, const std::string &remote_pwd = "",
         std::chrono::milliseconds initial_timeout = std::chrono::milliseconds(500), int max_tries = 7) {
@@ -697,15 +697,15 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             (request.get_type() == StunMessageType::BINDING_REQUEST || request.get_type() == StunMessageType::ALLOCATE);
 
         auto data = request.serialize();
-        auto txn_id = request.get_transaction_id();
 
         if (!expect_response) {
-            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::use_awaitable);
+            udp_socket_.async_send_to(asio::buffer(data), dest, [](std::error_code, size_t) {});
             log(LogLevel::Debug, "Sent STUN message to {}:{} | Not expecting response", dest.address().to_string(),
                 std::to_string(dest.port()));
             co_return std::nullopt;
         }
 
+        auto txn_id = request.get_transaction_id();
         ResponseData *response{nullptr};
         {
             std::lock_guard<std::mutex> lock(response_mutex_);
@@ -717,10 +717,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         std::chrono::milliseconds timeout = initial_timeout;
 
         for (int attempt = 0; attempt < max_tries; ++attempt) {
-            co_await udp_socket_.async_send_to(asio::buffer(data), dest, asio::redirect_error(asio::use_awaitable, ec));
-            if (ec) {
-                continue;
-            }
+            udp_socket_.async_send_to(asio::buffer(data), dest, [](std::error_code, size_t) {});
 
             log(LogLevel::Debug, "Sent STUN request to {}:{} | Attempt: {}", dest.address().to_string(),
                 std::to_string(dest.port()), std::to_string(attempt + 1));
@@ -768,22 +765,24 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return message;
     }
 
-    // STUN Error Response (필요 시 사용할 수 있음)
-    asio::awaitable<void> send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req,
-                                              StunErrorCode code, const std::string &reason_template, auto &&...args) {
-#if 0
+    // STUN Error Response
+    void send_error_response(const asio::ip::udp::endpoint &sender, const StunMessage &req, StunErrorCode code,
+                             const std::string &reason_template, auto &&...args) {
         try {
-            StunMessage error_resp(StunMessageType::BINDING_RESPONSE_ERROR, req.get_transaction_id());
-            error_resp.add_error_code(code, std::format(reason_template, std::forward<decltype(args)>(args)...));
-            error_resp.add_fingerprint();
-            co_await send_stun_request(sender, error_resp);
+            StunMessage resp(StunMessageType::BINDING_RESPONSE_ERROR, req.get_transaction_id());
+            std::string reason =
+                std::vformat(reason_template, std::make_format_args(std::forward<decltype(args)>(args)...));
+            resp.add_error_code(code, reason);
+            resp.add_fingerprint();
+
+            auto data = resp.serialize();
+            udp_socket_.async_send_to(asio::buffer(data), sender, [](std::error_code, size_t) {});
+
             log(LogLevel::Warning, "Sent error response: {} ({}) to {}", get_error_reason(code), reason,
                 sender.address().to_string());
         } catch (const std::exception &ex) {
             log(LogLevel::Error, "Failed to send error response to {}: {}", sender.address().to_string(), ex.what());
         }
-#endif
-        co_return;
     }
 
     // Candidate Pair Nomination
@@ -961,86 +960,127 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     }
 
     asio::awaitable<void> handle_binding_request(const StunMessage &req, const asio::ip::udp::endpoint &sender) {
-        StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
+        try {
+            // 1. USERNAME Attribute Validation
+            auto uname_opt = req.get_attribute_as_string(StunAttributeType::USERNAME);
+            if (!uname_opt.has_value()) {
+                send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Missing USERNAME from {}",
+                                    sender.address().to_string());
+                co_return;
+            }
 
-        auto uname_opt = req.get_attribute_as_string(StunAttributeType::USERNAME);
-        if (!uname_opt.has_value()) {
-            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Missing USERNAME from {}",
-                                         sender.address().to_string());
-            co_return;
-        }
-        std::string uname = uname_opt.value();
-        size_t delim = uname.find(':');
-        if (delim == std::string::npos) {
-            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Invalid USERNAME format from {}",
-                                         sender.address().to_string());
-            co_return;
-        }
-        std::string rcv_ufrag = uname.substr(0, delim);
-        std::string snd_ufrag = uname.substr(delim + 1);
+            const std::string &uname = uname_opt.value();
+            std::size_t delim_pos = uname.find(':');
+            if (delim_pos == std::string::npos) {
+                send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Invalid USERNAME format from {}",
+                                    sender.address().to_string());
+                co_return;
+            }
 
-        if (rcv_ufrag != local_ice_attributes_.ufrag) {
-            co_await send_error_response(sender, req, StunErrorCode::UNAUTHORIZED, "Incorrect receiver ufrag from {}",
-                                         sender.address().to_string());
-            co_return;
-        }
+            // USERNAME format: local_ufrag:remote_ufrag
+            std::string rcv_ufrag = uname.substr(0, delim_pos);
+            std::string snd_ufrag = uname.substr(delim_pos + 1);
 
-        if (req.has_attribute(StunAttributeType::MESSAGE_INTEGRITY) &&
-            !req.verify_message_integrity(local_ice_attributes_.pwd)) {
-            co_await send_error_response(sender, req, StunErrorCode::UNAUTHORIZED, "Invalid MESSAGE-INTEGRITY from {}",
-                                         sender.address().to_string());
-            co_return;
-        }
+            // Validate receiver ufrag
+            if (rcv_ufrag != local_ice_attributes_.ufrag) {
+                send_error_response(sender, req, StunErrorCode::UNAUTHORIZED, "Incorrect receiver ufrag from {}",
+                                    sender.address().to_string());
+                co_return;
+            }
 
-        if (!req.verify_fingerprint()) {
-            co_await send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Invalid FINGERPRINT from {}",
-                                         sender.address().to_string());
-            co_return;
-        }
+            // Optional: Validate sender ufrag if expected ufrags are maintained
+            // This can prevent spoofing by ensuring snd_ufrag matches a known remote ufrag
+            // For simplicity, assume any snd_ufrag is acceptable here
 
-        auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
-        auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
+            // 2. MESSAGE-INTEGRITY Attribute Validation
+            if (req.has_attribute(StunAttributeType::MESSAGE_INTEGRITY)) {
+                if (!req.verify_message_integrity(local_ice_attributes_.pwd)) {
+                    send_error_response(sender, req, StunErrorCode::UNAUTHORIZED, "Invalid MESSAGE-INTEGRITY from {}",
+                                        sender.address().to_string());
+                    co_return;
+                }
+            } else {
+                // MESSAGE-INTEGRITY is mandatory if PRIORITY or ICE attributes are present
+                // Depending on implementation specifics, you might enforce its presence
+                // Here, we allow it to be optional
+            }
 
-        if (ice_controlling_opt.has_value() || ice_controlled_opt.has_value()) {
-            uint64_t remote_tie_breaker =
-                ice_controlling_opt.has_value() ? ice_controlling_opt.value() : ice_controlled_opt.value();
-            negotiate_role(remote_tie_breaker);
-        }
-
-        asio::ip::udp::endpoint mapped = sender;
-        auto xor_mapped_opt = req.get_xor_mapped_address();
-        if (xor_mapped_opt.has_value()) {
-            mapped = xor_mapped_opt.value();
-            resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, mapped);
-        } else {
-            resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, mapped);
-        }
-
-        auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
-        if (priority_opt.has_value()) {
-            Candidate prflx_candidate(mapped, CandidateType::PeerReflexive);
-            prflx_candidate.priority = priority_opt.value();
-            add_remote_candidate(prflx_candidate);
-        }
-
-        if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
-            for (auto &entry : check_list_) {
-                if (entry.pair.remote_candidate.endpoint == sender && entry.state == CandidatePairState::Succeeded &&
-                    !entry.is_nominated) {
-                    co_await nominate_pair(entry);
-                    transition_to_state(IceConnectionState::Completed);
-                    break;
+            // 3. FINGERPRINT Attribute Validation
+            if (req.has_attribute(StunAttributeType::FINGERPRINT)) {
+                if (!req.verify_fingerprint()) {
+                    send_error_response(sender, req, StunErrorCode::BAD_REQUEST, "Invalid FINGERPRINT from {}",
+                                        sender.address().to_string());
+                    co_return;
                 }
             }
-        }
 
-        resp.add_message_integrity(local_ice_attributes_.pwd);
-        resp.add_fingerprint();
-        co_await send_stun_request(sender, resp);
+            // 4. ICE-CONTROLLING and ICE-CONTROLLED Attributes Handling
+            auto ice_controlling_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLING);
+            auto ice_controlled_opt = req.get_attribute_as_uint64(StunAttributeType::ICE_CONTROLLED);
+
+            if (ice_controlling_opt.has_value() || ice_controlled_opt.has_value()) {
+                uint64_t remote_tie_breaker =
+                    ice_controlling_opt.has_value() ? ice_controlling_opt.value() : ice_controlled_opt.value();
+
+                negotiate_role(remote_tie_breaker);
+            }
+
+            // 5. Binding Response Creation
+            StunMessage resp(StunMessageType::BINDING_RESPONSE_SUCCESS, req.get_transaction_id());
+
+            // Determine whether to include XOR-MAPPED-ADDRESS or MAPPED-ADDRESS
+            // RFC8445 prefers XOR-MAPPED-ADDRESS
+            if (req.has_attribute(StunAttributeType::XOR_MAPPED_ADDRESS)) {
+                resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, sender);
+            } else if (req.has_attribute(StunAttributeType::MAPPED_ADDRESS)) {
+                resp.add_attribute(StunAttributeType::MAPPED_ADDRESS, sender);
+            } else {
+                // If neither attribute is present in the request, per RFC 5389,
+                // XOR-MAPPED-ADDRESS should be included
+                resp.add_attribute(StunAttributeType::XOR_MAPPED_ADDRESS, sender);
+            }
+
+            // 6. PRIORITY Attribute Handling
+            auto priority_opt = req.get_attribute_as_uint32(StunAttributeType::PRIORITY);
+            if (priority_opt.has_value()) {
+                // Calculate Peer-Reflexive priority if necessary
+                // Here, we use the provided priority directly
+                Candidate prflx_candidate(sender, CandidateType::PeerReflexive);
+                prflx_candidate.priority = priority_opt.value();
+                add_remote_candidate(prflx_candidate);
+            }
+
+            // 7. USE-CANDIDATE Attribute Handling
+            if (req.has_attribute(StunAttributeType::USE_CANDIDATE)) {
+                for (auto &entry : check_list_) {
+                    if (entry.pair.remote_candidate.endpoint == sender &&
+                        entry.state == CandidatePairState::Succeeded && !entry.is_nominated) {
+                        co_await nominate_pair(entry);
+                        transition_to_state(IceConnectionState::Completed);
+                        break;
+                    }
+                }
+            }
+
+            // 8. Add MESSAGE-INTEGRITY and FINGERPRINT to Response
+            resp.add_message_integrity(local_ice_attributes_.pwd);
+            resp.add_fingerprint();
+
+            // 9. Send the Binding Response
+            co_await send_stun_message(sender, resp);
+        } catch (const std::exception &ex) {
+            // Handle unexpected exceptions gracefully
+            // Log the error and send a generic error response
+            // Assuming a logging mechanism is in place
+            // log_error("Exception in handle_binding_request: {}", ex.what());
+            send_error_response(sender, req, StunErrorCode::SERVER_ERROR, "Internal Server Error from {}",
+                                sender.address().to_string());
+        }
 
         co_return;
     }
 
+    // #FIXME 이게 필요가 있나??
     asio::awaitable<void> handle_binding_indication(const StunMessage &ind, const asio::ip::udp::endpoint &sender) {
         co_return;
     }
@@ -1237,7 +1277,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         alloc_req.add_fingerprint();
                     }
 
-                    auto resp_opt = co_await send_stun_request(turn_ep, alloc_req, turn_password_,
+                    auto resp_opt = co_await send_stun_message(turn_ep, alloc_req, turn_password_,
                                                                std::chrono::milliseconds(1000), 3);
                     if (resp_opt.has_value()) {
                         StunMessage resp = resp_opt.value();
