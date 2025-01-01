@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <asio.hpp>
+#include <asio/experimental/awaitable_operators.hpp>
 #include <asio/experimental/parallel_group.hpp>
 #include <atomic>
 #include <bitset>
@@ -581,8 +582,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
             const size_t max_concurrency = 5;
             size_t next_pair = 0;
-            std::vector<asio::awaitable<bool>> tasks;
+
+            using task_t =
+                decltype(asio::co_spawn(io_context_, perform_single_connectivity_check(nullptr), asio::deferred));
             while (next_pair < check_list_.size()) {
+                std::vector<task_t> tasks;
                 while (tasks.size() < max_concurrency && next_pair < check_list_.size()) {
                     CheckListEntry &entry = check_list_[next_pair++];
                     // #FIXME 새로 추가된 Candidate는 Frozen 상태 이므로 perform_single_connectivity_check에서 단순
@@ -591,18 +595,17 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
                         entry.state = CandidatePairState::InProgress;
 
                         tasks.push_back(
-                            asio::co_spawn(io_context_, perform_single_connectivity_check(entry), asio::use_awaitable));
+                            asio::co_spawn(io_context_, perform_single_connectivity_check(&entry), asio::deferred));
                     }
                 }
 
-                for (auto &task : tasks) {
-                    bool succeeded = co_await std::move(task);
-                    if (succeeded) {
-                        transition_to_state(IceConnectionState::Connected);
-                    }
+                // https://www.boost.org/doc/libs/1_82_0/boost/asio/experimental/awaitable_operators.hpp
+                auto [orders, ex, results] = co_await asio::experimental::make_parallel_group(std::move(tasks))
+                                                 .async_wait(asio::experimental::wait_for_all(), asio::deferred);
+                bool any_success = std::any_of(results.begin(), results.end(), [](const bool &r) { return r; });
+                if (any_success) {
+                    transition_to_state(IceConnectionState::Connected);
                 }
-                tasks.clear();
-
                 co_await asio::post(strand_, asio::use_awaitable);
             }
 
@@ -640,11 +643,11 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
         co_return;
     }
 
-    asio::awaitable<bool> perform_single_connectivity_check(CheckListEntry &entry) {
-        if (entry.state == CandidatePairState::Frozen) {
+    asio::awaitable<bool> perform_single_connectivity_check(CheckListEntry *entry) {
+        if (entry->state == CandidatePairState::Frozen) {
             co_return false;
         }
-        const auto &pair = entry.pair;
+        const auto &pair = entry->pair;
         bool is_relay = (pair.remote_candidate.type == CandidateType::Relay);
 
         StunMessage req(StunMessageType::BINDING_REQUEST, StunMessage::Key::generate());
@@ -671,21 +674,21 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
             resp_opt = co_await send_stun_request(dest, req, remote_ice_attributes_.pwd);
 
             if (resp_opt.has_value()) {
-                entry.state = CandidatePairState::Succeeded;
+                entry->state = CandidatePairState::Succeeded;
                 StunMessage resp = resp_opt.value();
                 auto mapped_opt = resp.get_mapped_address();
                 if (mapped_opt.has_value()) {
                     add_remote_candidate({mapped_opt.value(), CandidateType::PeerReflexive});
                 }
             } else {
-                entry.state = CandidatePairState::Failed;
+                entry->state = CandidatePairState::Failed;
             }
         } catch (const std::exception &ex) {
-            entry.state = CandidatePairState::Failed;
+            entry->state = CandidatePairState::Failed;
             log(LogLevel::Warning, "Connectivity check exception for pair: {} <-> {} | {}",
                 pair.local_candidate.to_sdp(), pair.remote_candidate.to_sdp(), ex.what());
         }
-        co_return (entry.state == CandidatePairState::Succeeded);
+        co_return (entry->state == CandidatePairState::Succeeded);
     }
 
     // STUN 요청/응답 (#FIXME request와 allocate만 처리)
