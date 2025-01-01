@@ -321,7 +321,7 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
     // Set Log Level
     void set_log_level(LogLevel level) { log_level_ = level; }
 
-    // Start ICE Process
+    // Start ICE Process #FIXME (안전하게 종료.)
     void start() {
         if (current_state_ != IceConnectionState::New) {
             log(LogLevel::Warning, "ICE is already started");
