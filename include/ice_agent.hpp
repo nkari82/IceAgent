@@ -865,28 +865,46 @@ class IceAgent : public std::enable_shared_from_this<IceAgent> {
 
     // TURN refresh
     asio::awaitable<void> perform_turn_refresh() {
+        size_t last_successful_index = 0;  // 마지막으로 성공한 TURN 서버 인덱스
         while (current_state_ == IceConnectionState::Connected && !relay_endpoint_.address().is_unspecified()) {
             asio::steady_timer timer(strand_);
             timer.expires_after(std::chrono::seconds(300));
             co_await timer.async_wait(asio::use_awaitable);
-            try {
-                StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
-                refresh_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
-                refresh_req.add_attribute(StunAttributeType::REALM, turn_realm_);
-                refresh_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
-                refresh_req.add_attribute(StunAttributeType::REFRESH);
-                refresh_req.add_message_integrity(turn_password_);
-                refresh_req.add_fingerprint();
 
-                auto resp_opt = co_await send_stun_request(turn_endpoints_[0], refresh_req, turn_password_,
-                                                           std::chrono::milliseconds(1000), 5);
-                if (!resp_opt.has_value()) {
-                    throw std::runtime_error("TURN allocation refresh timed out.");
+            bool success = false;
+
+            // 우선 마지막으로 성공한 서버를 시도
+            for (size_t i = 0; i < turn_endpoints_.size(); ++i) {
+                size_t index = (last_successful_index + i) % turn_endpoints_.size();
+                const auto &turn_ep = turn_endpoints_[index];
+                try {
+                    StunMessage refresh_req(StunMessageType::ALLOCATE, StunMessage::Key::generate());
+                    refresh_req.add_attribute(StunAttributeType::USERNAME, turn_username_);
+                    refresh_req.add_attribute(StunAttributeType::REALM, turn_realm_);
+                    refresh_req.add_attribute(StunAttributeType::NONCE, turn_nonce_);
+                    refresh_req.add_attribute(StunAttributeType::REFRESH);
+                    refresh_req.add_message_integrity(turn_password_);
+                    refresh_req.add_fingerprint();
+
+                    auto resp_opt = co_await send_stun_request(turn_ep, refresh_req, turn_password_,
+                                                               std::chrono::milliseconds(1000), 5);
+                    if (resp_opt.has_value()) {
+                        log(LogLevel::Debug, "TURN allocation refreshed using server: {}:{}",
+                            turn_ep.address().to_string(), std::to_string(turn_ep.port()));
+                        last_successful_index = index;  // 성공한 서버 인덱스 업데이트
+                        success = true;
+                        break;  // 성공하면 다음 서버로 넘어가지 않음
+                    }
+                } catch (const std::exception &ex) {
+                    log(LogLevel::Warning, "TURN refresh failed for server {}:{} | {}", turn_ep.address().to_string(),
+                        std::to_string(turn_ep.port()), ex.what());
                 }
-                log(LogLevel::Debug, "TURN allocation refreshed.");
-            } catch (const std::exception &ex) {
+            }
+
+            if (!success) {
                 transition_to_state(IceConnectionState::Failed);
-                log(LogLevel::Error, "TURN refresh failed: {}", ex.what());
+                log(LogLevel::Error, "TURN refresh failed for all servers.");
+                co_return;
             }
         }
         co_return;
